@@ -1,0 +1,7 @@
+resources:
+  - namespace.yaml
+  - gateway.yaml
+  - auth.yaml
+  - patient-flow.yaml
+  - cds.yaml
+  - ingress.yaml

@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cds
+  namespace: medicore
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: cds }
+  template:
+    metadata:
+      labels: { app: cds }
+    spec:
+      containers:
+        - name: cds
+          image: medicore/cds:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8083
+          env:
+            - name: ENV
+              value: "prod"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cds
+  namespace: medicore
+spec:
+  selector:
+    app: cds
+  ports:
+    - port: 8083
+      targetPort: 8083
