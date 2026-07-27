@@ -67,7 +67,8 @@ honest: “designed” is not the same as “proven in your cluster”.
 | R8 | Supply-chain / CVE drift | Med | CI `pip-audit` + `npm audit` |
 | R9 | No formal pen-test | High (org) | External assessment before PHI |
 | R10 | Audit index is lossy under overload (bounded queue) | Med | Alert on `/audit/stats` dropped/failed; backfill from log stream |
-| R11 | Non-Patient reads are not attributed to a patient | Med | Resolve `subject` on the FHIR read path before indexing |
+| R12 | Unfiltered searches are not attributed per result | Med | Attribute each entry in the returned bundle |
+| ~~R11~~ | ~~Non-Patient reads are not attributed to a patient~~ | — | **Closed**: the read path resolves `subject`/`patient` and records the patient ref |
 
 ## AuthZ model (current)
 
@@ -121,8 +122,22 @@ bad, blocking a clinician mid-resuscitation is worse. `GET /audit/stats`
 exposes `dropped` / `failed`; both should be alerted on, since the searchable
 trail is incomplete until they are backfilled from the log stream.
 
-Known gap: a direct read of a non-Patient resource (e.g.
-`GET /fhir/observation/obs-1`) records that resource's reference, not the
-patient it belongs to, because the gateway does not resolve `subject` on the
-read path. Searches match a patient's own reference plus anything explicitly
-filtered by that patient.
+**Patient attribution.** A read of a non-Patient resource (e.g.
+`GET /fhir/observation/obs-1`) is an access to a patient's record, but only
+the resource body knows whose. The gateway resolves `subject` / `patient` from
+the response and records the patient ref alongside the resource ref, so the
+access is findable in that patient's trail. A search matches a patient's own
+reference, anything explicitly filtered by that patient, and any resource
+resolved to them.
+
+Deliberately *not* attributed: subjects that are a Group/Device/Location (not
+a person), and contained (`#x`) or `urn:uuid:` references, which identify a
+resource inside a bundle rather than a patient id the rest of the system
+would recognise. Attributing those would put unrelated accesses into
+someone's disclosure accounting. Resolution is best-effort and cannot fail a
+clinical read.
+
+Remaining gap: **searches** are attributed only when filtered by an
+identifying parameter. A search by name or date range that returns ten
+patients records the query shape, not the ten patients it disclosed.
+Closing that means attributing each entry in the result bundle.

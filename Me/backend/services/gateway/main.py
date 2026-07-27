@@ -39,7 +39,12 @@ from backend.common.idempotency import (
 from backend.common.idempotency import (
     store as idem_store,
 )
-from backend.common.middleware import audit_reference, set_audit_sink
+from backend.common.middleware import (
+    audit_reference,
+    note_audit_patient,
+    patient_id_from_resource,
+    set_audit_sink,
+)
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
 from backend.services.gateway.observations import (
@@ -253,10 +258,12 @@ def _validate_id(resource_id: str) -> str:
     return resource_id
 
 
-async def _read(resource: str, resource_id: str) -> dict[str, Any]:
+async def _read(
+    resource: str, resource_id: str, request: Request | None = None
+) -> dict[str, Any]:
     _validate_id(resource_id)
     try:
-        return await fhir.read(resource, resource_id)
+        result = await fhir.read(resource, resource_id)
     except FHIRError as exc:
         # Preserve upstream 404s instead of masking everything as a 502.
         if exc.status_code == 404:
@@ -278,6 +285,14 @@ async def _read(resource: str, resource_id: str) -> dict[str, Any]:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Upstream clinical data service unavailable",
         ) from exc
+
+    # Attribute the access to the patient the resource belongs to. Reading an
+    # Observation is an access to that patient's record, but only the resource
+    # body knows whose. Without this the audit trail records an opaque
+    # observation id that no patient-scoped search will ever match.
+    if request is not None:
+        note_audit_patient(request, patient_id_from_resource(result))
+    return result
 
 
 async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
@@ -332,17 +347,17 @@ async def search_patients(
 
 @app.get("/fhir/patient/{patient_id}")
 async def get_patient(
-    patient_id: str, user: User = Depends(clinician_or_admin)
+    patient_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Patient", patient_id)
+    return await _read("Patient", patient_id, request)
 
 
 # Kept for backwards compatibility with earlier docs/clients.
 @app.get("/fhir/patient/{patient_id}/protected")
 async def get_patient_protected(
-    patient_id: str, user: User = Depends(clinician_or_admin)
+    patient_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Patient", patient_id)
+    return await _read("Patient", patient_id, request)
 
 
 @app.get("/fhir/encounter/search")
@@ -354,9 +369,9 @@ async def search_encounters(
 
 @app.get("/fhir/encounter/{encounter_id}")
 async def get_encounter(
-    encounter_id: str, user: User = Depends(clinician_or_admin)
+    encounter_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Encounter", encounter_id)
+    return await _read("Encounter", encounter_id, request)
 
 
 @app.get("/fhir/observation/search")
@@ -368,9 +383,9 @@ async def search_observations(
 
 @app.get("/fhir/observation/{obs_id}")
 async def get_observation(
-    obs_id: str, user: User = Depends(clinician_or_admin)
+    obs_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Observation", obs_id)
+    return await _read("Observation", obs_id, request)
 
 
 @app.get("/fhir/allergyintolerance/search")
@@ -382,9 +397,9 @@ async def search_allergies(
 
 @app.get("/fhir/allergyintolerance/{allergy_id}")
 async def get_allergy(
-    allergy_id: str, user: User = Depends(clinician_or_admin)
+    allergy_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("AllergyIntolerance", allergy_id)
+    return await _read("AllergyIntolerance", allergy_id, request)
 
 
 @app.get("/fhir/condition/search")
@@ -396,9 +411,9 @@ async def search_conditions(
 
 @app.get("/fhir/condition/{condition_id}")
 async def get_condition(
-    condition_id: str, user: User = Depends(clinician_or_admin)
+    condition_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Condition", condition_id)
+    return await _read("Condition", condition_id, request)
 
 
 @app.get("/fhir/medicationrequest/search")
@@ -410,9 +425,9 @@ async def search_medication_requests(
 
 @app.get("/fhir/medicationrequest/{med_id}")
 async def get_medication_request(
-    med_id: str, user: User = Depends(clinician_or_admin)
+    med_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("MedicationRequest", med_id)
+    return await _read("MedicationRequest", med_id, request)
 
 
 # --------------------------------------------------------------------------

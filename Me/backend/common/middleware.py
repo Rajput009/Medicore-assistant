@@ -101,6 +101,82 @@ def set_audit_sink(sink: Callable[[dict[str, Any]], Any] | None) -> None:
     _sink = sink
 
 
+# A FHIR id is constrained by the spec to this character set, so anything else
+# in the final path segment of a reference is not an id we should record.
+_REFERENCE_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# Fields that carry the patient a clinical resource belongs to. ``subject`` is
+# the general case; ``patient`` appears on a handful of R4 resource types.
+_SUBJECT_FIELDS = ("subject", "patient")
+
+
+def patient_id_from_resource(resource: Any) -> str | None:
+    """Extract the patient id a FHIR resource belongs to, if any.
+
+    Answers "whose record is this?" for a resource that is not itself a
+    Patient. Without it, reading ``Observation/obs-1`` records the
+    observation's reference and the access never shows up in that patient's
+    audit trail — the access happened, but the accounting misses it.
+
+    Handles the reference shapes a real server emits::
+
+        {"subject": {"reference": "Patient/123"}}
+        {"subject": {"reference": "https://ehr.example/fhir/Patient/123"}}
+        {"patient":  {"reference": "Patient/123"}}
+
+    Returns ``None`` — never raises — when the resource carries no usable
+    patient reference. A contained or ``urn:uuid:`` reference is deliberately
+    not resolved: it identifies a resource inside the bundle, not a patient
+    id the rest of the system would recognise.
+    """
+    if not isinstance(resource, dict):
+        return None
+
+    # A Patient resource is its own subject.
+    if resource.get("resourceType") == "Patient":
+        raw_id = resource.get("id")
+        if isinstance(raw_id, str) and _REFERENCE_ID.match(raw_id):
+            return raw_id
+        return None
+
+    for field in _SUBJECT_FIELDS:
+        node = resource.get(field)
+        if not isinstance(node, dict):
+            continue
+        reference = node.get("reference")
+        if not isinstance(reference, str) or not reference:
+            continue
+        # Only Patient references identify a patient; a subject may legitimately
+        # be a Group, Device or Location, and recording those as a patient
+        # would put unrelated accesses in someone's disclosure accounting.
+        if "Patient/" not in reference:
+            continue
+        candidate = reference.rsplit("Patient/", 1)[-1].split("/")[0].split("?")[0]
+        # "." and ".." are legal FHIR id characters, so a traversal segment
+        # like "Patient/../../etc/passwd" slips past the id pattern. This value
+        # is written to an audit column and echoed back by search, so reject
+        # anything that is only dots.
+        if candidate.strip(".") and _REFERENCE_ID.match(candidate):
+            return candidate
+    return None
+
+
+def note_audit_patient(request: Request, patient_id: str | None) -> None:
+    """Attribute the current request to a patient, for the audit record.
+
+    Called by handlers that only learn the patient after reading the upstream
+    resource. The middleware picks this up when it emits, so the access lands
+    in that patient's trail rather than being filed under an opaque resource
+    id nobody can search for.
+    """
+    if not patient_id:
+        return
+    try:
+        request.state.audit_patient_id = patient_id
+    except Exception:  # pragma: no cover - state is always assignable
+        pass
+
+
 class AuditLogMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, service: str | None = None):
         super().__init__(app)
@@ -204,6 +280,14 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         return response
 
     def _emit(self, request: Request, record: dict[str, Any], level: int = logging.INFO) -> None:
+        # Handlers that resolve the patient from the upstream resource annotate
+        # request.state; only known once the response exists, hence here rather
+        # than in _describe_target. An explicit query filter already identified
+        # the patient, so it wins over a resolved one.
+        resolved = getattr(request.state, "audit_patient_id", None)
+        if resolved and not record.get("patient_ref"):
+            record["patient_ref"] = self._reference(str(resolved))
+
         user = getattr(request.state, "user", None)
         if isinstance(user, dict):
             if user.get("sub"):

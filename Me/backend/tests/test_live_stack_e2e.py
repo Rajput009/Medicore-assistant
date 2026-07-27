@@ -79,10 +79,31 @@ class _FhirHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    # An Observation belonging to patient 123, so the audit trail's patient
+    # attribution (a resource that is not itself a Patient) can be exercised.
+    observations = {
+        "obs-1": {
+            "resourceType": "Observation",
+            "id": "obs-1",
+            "status": "final",
+            "subject": {"reference": "Patient/123"},
+            "code": {"text": "Heart rate"},
+            "valueQuantity": {"value": 88, "unit": "/min"},
+        }
+    }
+
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path.startswith("/oauth2/token"):
             self._json(405, {"error": "use POST"})
+            return
+        if path.startswith("/fhir/Observation/"):
+            oid = path.rsplit("/", 1)[-1]
+            doc = self.observations.get(oid)
+            if not doc:
+                self._json(404, {"resourceType": "OperationOutcome", "issue": []})
+                return
+            self._json(200, doc)
             return
         if path.startswith("/fhir/Patient/"):
             pid = path.rsplit("/", 1)[-1]
@@ -601,6 +622,31 @@ class TestLiveAuditSearch:
         assert any(item["actor_sub"] == "dr.audited" for item in body["items"])
         # The response identifies the record by hash, never by raw MRN.
         assert body["subject_ref"].startswith("sha256:")
+
+    def test_an_observation_read_is_findable_under_its_patient(self, live_stack):
+        """SECURITY.md R11: reading a non-Patient resource is an access to
+        that patient's record and must appear in their trail, not only under
+        an opaque observation id."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.obs", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        code, _, obs = _http(
+            "GET", f"{live_stack['gateway']}/fhir/observation/obs-1", token=clinician
+        )
+        assert code == 200
+        assert obs["resourceType"] == "Observation"
+
+        admin = self._admin_token()
+        # Searching by the *patient* must surface the observation read.
+        body = self._search(live_stack, "patient=123&actor=dr.obs", admin)
+        assert body["total"] >= 1
+        assert any(
+            item["path"] == "/fhir/observation/{id}" for item in body["items"]
+        ), body["items"]
 
     def test_accessor_summary_names_the_clinician(self, live_stack):
         _, _, login = _http(
