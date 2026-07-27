@@ -400,6 +400,38 @@ The author is taken from the verified session, never from the request body.
 Reads and writes are audited against the patient like any other PHI access,
 and the note text itself is never logged.
 
+## Chart assistant (grounded Q&A)
+
+`POST /assist/ask` answers questions about one patient's chart with citations:
+
+```bash
+curl -X POST -H "Authorization: Bearer <clinician_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"patient_id": "MRN-123", "question": "what allergies are recorded?"}' \
+  "http://localhost:8080/assist/ask"
+```
+
+Every finding names the resources it came from, and an uncited claim is
+rejected server-side rather than displayed. `GET /assist/capabilities`
+publishes what it can and cannot do.
+
+**It calls no model, deliberately.** No LLM is configured and egress is
+default-deny; routing PHI to a third-party model needs a BAA and an egress
+change. The default answerer copies values out of retrieved FHIR resources, so
+it cannot invent a result. `AnswerComposer` is the seam where a model-backed
+implementation drops in — and `validate_answer` holds it to the same
+citation requirement.
+
+Three refusals are worth knowing about:
+
+- **Advice** — "should I give penicillin?" is refused *before* retrieval, so
+  an out-of-scope question never becomes a disclosure.
+- **Unrecognised questions** — refused with the list of answerable topics,
+  rather than guessed at and answered wrongly.
+- **Failed lookups** — reported as failures. "Allergy list could not be
+  retrieved" is never rendered as "no allergies", which is the single most
+  dangerous thing this feature could say.
+
 ## Clinical workflow notes
 
 **Ward / department scope.** Access tokens may carry `wards` and

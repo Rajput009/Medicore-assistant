@@ -352,6 +352,51 @@ export const handlers = [
     )
   }),
 
+  /** Grounded chart Q&A. */
+  http.post('/api/assist/ask', async ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const body = (await request.json()) as { patient_id: string; question: string }
+    const q = (body.question || '').toLowerCase()
+
+    if (/should i|can i|recommend/.test(q)) {
+      return HttpResponse.json({
+        patient_id: body.patient_id,
+        intents: [],
+        findings: [],
+        caveats: [
+          'This assistant reports recorded data; it does not give clinical advice or recommend treatment.',
+        ],
+        answered: false,
+        disclaimer: "Assembled from this patient\u2019s recorded data. It is not a diagnosis.",
+        retrieved: {},
+      })
+    }
+
+    return HttpResponse.json({
+      patient_id: body.patient_id,
+      intents: ['allergies'],
+      findings: [
+        {
+          text: 'Allergy: Penicillin (high criticality) [active] — reaction: anaphylaxis',
+          critical: true,
+          citations: [
+            {
+              resource_type: 'AllergyIntolerance',
+              resource_id: 'a1',
+              label: 'Penicillin',
+              recorded: '2026-07-01T09:00:00Z',
+            },
+          ],
+        },
+      ],
+      caveats: [],
+      answered: true,
+      disclaimer: "Assembled from this patient\u2019s recorded data. It is not a diagnosis.",
+      retrieved: { allergies: 1, failed: [] },
+    })
+  }),
+
   http.get('/flow/beds', ({ request }) => {
     const denied = requireAuth(request)
     if (denied) return denied

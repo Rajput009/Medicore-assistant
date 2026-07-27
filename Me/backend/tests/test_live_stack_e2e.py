@@ -844,6 +844,48 @@ class TestLiveAuditSearch:
         code, _, _ = _http("GET", f"{live_stack['gateway']}/audit/search")
         assert code == 401
 
+    def test_assistant_retrieval_is_audited_against_the_patient(self, live_stack):
+        """The assistant reads a chart, so it must land in that patient's
+        trail like any other access — a Q&A box is not an audit loophole."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.assist", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        code, _, body = _http(
+            "POST",
+            f"{live_stack['gateway']}/assist/ask",
+            token=clinician,
+            body={"patient_id": "123", "question": "what allergies are recorded?"},
+        )
+        assert code == 200, body
+        # The stub FHIR server serves no AllergyIntolerance, so the honest
+        # answer is a caveat rather than a finding.
+        assert body["answered"] is False
+        assert body["caveats"]
+
+        admin = self._admin_token()
+        found = self._search(live_stack, "patient=123&actor=dr.assist", admin)
+        assert found["total"] >= 1, "assistant retrieval never reached the audit index"
+
+    def test_assistant_refuses_advice_over_the_wire(self, live_stack):
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.advice", "password": "medicore-dev"},
+        )
+        code, _, body = _http(
+            "POST",
+            f"{live_stack['gateway']}/assist/ask",
+            token=login["access_token"],
+            body={"patient_id": "123", "question": "should I give penicillin?"},
+        )
+        assert code == 200
+        assert body["answered"] is False
+        assert any("does not give clinical advice" in c for c in body["caveats"])
+
     def test_stats_report_a_healthy_index(self, live_stack):
         code, _, body = _http(
             "GET", f"{live_stack['gateway']}/audit/stats", token=self._admin_token()

@@ -13,6 +13,7 @@ import { api } from '../api/client'
 import type { Bed, FhirResource, QueueItem, QueueListResponse } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { describeError } from '../hooks/useAsync'
+import { ChartAssistant } from './ChartAssistant'
 import { summariseResource } from '../pages/FhirPage'
 import { Alert, Badge, Spinner } from '../ui/components'
 import { usePatientChart } from './PatientChartContext'
@@ -463,6 +464,8 @@ export const PatientChartDrawer: React.FC = () => {
                   </ul>
                 )}
               </section>
+
+              <ChartAssistant patientId={patientId} />
 
               <section className="chart-section">
                 <h3>Handoff note (SBAR)</h3>

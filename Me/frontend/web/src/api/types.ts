@@ -274,3 +274,37 @@ export type HandoffHistoryResponse = {
   versions: HandoffNote[]
   count: number
 }
+
+/** Grounded chart Q&A (Tier 4). */
+
+export type AssistCitation = {
+  resource_type: string
+  resource_id: string
+  label: string
+  recorded?: string | null
+}
+
+export type AssistFinding = {
+  text: string
+  critical: boolean
+  citations: AssistCitation[]
+}
+
+export type AssistAnswer = {
+  patient_id: string
+  intents: string[]
+  findings: AssistFinding[]
+  /** What the answer does NOT establish — as clinically important as findings. */
+  caveats: string[]
+  answered: boolean
+  disclaimer: string
+  retrieved: {
+    allergies?: number
+    medications?: number
+    conditions?: number
+    observations?: number
+    encounters?: number
+    /** Resource types whose retrieval failed; NOT the same as "none found". */
+    failed?: string[]
+  }
+}

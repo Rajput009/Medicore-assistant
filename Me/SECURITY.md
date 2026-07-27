@@ -51,6 +51,7 @@ honest: “designed” is not the same as “proven in your cluster”.
 | Accounting of disclosures | queryable audit index + admin search | real-Postgres + endpoint tests |
 | Emergency access | break-glass: scope-only override, reason required, indexed | unit + live stack |
 | Handoff notes | append-only, author from token, audited as PHI | unit + integration tests |
+| Assistant grounding | extractive; every claim cited or rejected | unit + endpoint + live stack |
 | L3/L4 isolation | NetworkPolicy default-deny | YAML residual tests |
 | Mesh mTLS (optional) | Istio STRICT manifests | YAML present; needs mesh |
 | FQDN egress (optional) | Cilium `toFQDNs` | YAML present; needs Cilium |
@@ -228,3 +229,38 @@ risk acceptance that outlives the person who accepted it.
 
 Both guards were verified to fail when deliberately broken — a tripwire that
 cannot trip is worse than none, because it manufactures confidence.
+
+## Chart assistant (Tier 4)
+
+`POST /assist/ask` answers questions about one patient's chart. It is
+deliberately the *least* impressive version of this feature that is safe, and
+the safety properties are structural rather than prompt-level.
+
+**No model is called, and that is a decision rather than an omission.** No LLM
+provider is configured, and egress is default-deny to an allow-list of FHIR
+and IdP hosts. Sending PHI to a third-party model requires a signed BAA and an
+egress change — a procurement decision, not something to enable quietly in
+code. The default answerer is **extractive**: every value it prints is copied
+from a retrieved FHIR resource that is cited alongside it, so it cannot invent
+a lab result.
+
+`AnswerComposer` is the seam for a model-backed implementation. The guardrail
+does not move with it: `validate_answer` rejects any finding without a
+citation, whichever composer produced it. A safety property enforced by the
+framework cannot be talked out of; one requested in a prompt can.
+
+| Property | How |
+|---|---|
+| No privileged access | Retrieval reuses the same `_search` path as every other read, so ward scope, RBAC, caching and audit apply unchanged |
+| Every claim cited | `validate_answer` raises `UncitedClaimError` rather than returning; an uncited clinical claim must never reach a clinician |
+| Failure ≠ absence | A failed lookup is reported as a failure. "Allergy list unavailable" and "no allergies" are different clinical statements |
+| No advice | Decision questions ("should I give…?") are refused *before* retrieval, so an out-of-scope question is not even a disclosure |
+| Read-only | The endpoint performs no writes; asserted by a test that fails the run if a FHIR create is reached |
+| Narrow retrieval | Only the resource types the question needs are fetched — asking about allergies does not pull the whole chart |
+| Attributed | The patient is named in the audit record even when the question is refused or retrieval fails; probing charts leaves a trace |
+
+Known limits, stated plainly: intent classification is keyword-based, so an
+unusually phrased question is refused rather than guessed at. The assistant
+sees only the first page of each resource type (50), so on a very long chart
+"latest" means "latest in the page retrieved". Neither is hidden from the
+user — the response reports exactly what was looked at.

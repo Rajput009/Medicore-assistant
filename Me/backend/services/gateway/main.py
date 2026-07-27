@@ -46,6 +46,7 @@ from backend.common.middleware import (
     patient_id_from_resource,
     set_audit_sink,
 )
+from backend.services.gateway import assist
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
 from backend.services.gateway.observations import (
@@ -791,4 +792,158 @@ async def audit_stats(user: User = Depends(admin_only)) -> dict[str, Any]:
         "enabled": settings.audit_index_enabled,
         "retention_days": settings.audit_retention_days,
         **audit_store.stats(),
+    }
+
+
+# --------------------------------------------------------------------------
+# Grounded chart Q&A (Tier 4)
+#
+# The assistant answers questions about *this* patient using only resources
+# the caller could already have fetched themselves. Three properties make it
+# safe enough to put in front of a clinician:
+#
+#   1. Retrieval goes through the same `_search` helper as every other read,
+#      so ward scope, RBAC, the response cache and the audit trail all apply
+#      unchanged. There is no privileged side channel — an assistant that can
+#      see more than its user is a data-exfiltration tool with a chat box.
+#   2. Every finding carries citations to the resources it came from, and
+#      `assist.validate_answer` rejects any that does not.
+#   3. A retrieval failure is reported as a failure, never as an absence.
+#      "Allergy list unavailable" and "no allergies" are different clinical
+#      statements and must never render alike.
+#
+# It is read-only by construction: this endpoint performs no writes and gives
+# no advice. See backend/services/gateway/assist.py.
+# --------------------------------------------------------------------------
+
+
+class AssistQuestion(BaseModel):
+    patient_id: str = Field(..., min_length=1, max_length=64)
+    question: str = Field(..., min_length=1, max_length=assist.MAX_QUESTION_LENGTH)
+
+
+async def _assist_search(
+    resource: str, params: dict[str, str], request: Request, evidence: assist.Evidence, key: str
+) -> list[dict[str, Any]]:
+    """Fetch one resource type for the assistant, recording failure explicitly.
+
+    A swallowed exception here would surface to the clinician as "nothing
+    recorded", which is the single most dangerous output this feature could
+    produce. Failure is tracked so the answer can say so.
+    """
+    try:
+        bundle = await _search(resource, params, request)
+    except Exception:
+        logger.warning(
+            "assist retrieval failed",
+            extra={"resource": resource, "evidence_key": key},
+        )
+        evidence.failed.add(key)
+        return []
+    entries = bundle.get("entry") if isinstance(bundle, dict) else None
+    resources: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if isinstance(entry, dict) and isinstance(entry.get("resource"), dict):
+            resources.append(entry["resource"])
+    return resources
+
+
+@app.post("/assist/ask", tags=["assist"])
+async def assist_ask(
+    payload: AssistQuestion,
+    request: Request,
+    user: User = Depends(clinician_or_admin),
+) -> dict[str, Any]:
+    """Answer a question about one patient's chart, with citations.
+
+    Refuses rather than guesses: an unrecognised question, or one asking for a
+    clinical decision, returns `answered: false` with an explanation instead of
+    an answer to a question nobody asked.
+    """
+    _validate_id(payload.patient_id)
+    question = assist.normalise_question(payload.question)
+
+    # Attribute the request to the patient it is about, before any retrieval.
+    # The audit middleware derives its target from the path and query string,
+    # and this endpoint carries the patient in the body — so without this an
+    # assistant query is recorded without saying whose chart was asked about.
+    # Set even on the refusal paths: asking a question about a named patient
+    # is itself an access worth recording, and it is the one signal that would
+    # reveal someone probing charts they have no reason to open.
+    note_audit_patient(request, payload.patient_id)
+
+    # Asking the assistant to decide something is out of scope by design.
+    # Answering with a medication list could be read as endorsement.
+    if assist.requests_advice(question):
+        answer = assist.validate_answer(assist.advice_refusal())
+        return {"patient_id": payload.patient_id, "retrieved": {}, **answer.as_dict()}
+
+    intents = assist.classify(question)
+    if not intents:
+        answer = assist.validate_answer(assist.unsupported_answer(question))
+        return {"patient_id": payload.patient_id, "retrieved": {}, **answer.as_dict()}
+
+    # Fetch only what the question needs. Retrieving the whole chart for every
+    # question would turn one narrow question into a broad disclosure — and
+    # the audit trail would (correctly) record it as such.
+    evidence = assist.Evidence()
+    base = {"patient": payload.patient_id, "_count": "50"}
+
+    if "allergies" in intents:
+        evidence.allergies = await _assist_search(
+            "AllergyIntolerance", dict(base), request, evidence, "allergies"
+        )
+    if "medications" in intents:
+        evidence.medications = await _assist_search(
+            "MedicationRequest", dict(base), request, evidence, "medications"
+        )
+    if "problems" in intents:
+        evidence.conditions = await _assist_search(
+            "Condition", dict(base), request, evidence, "conditions"
+        )
+    if "observations" in intents:
+        evidence.observations = await _assist_search(
+            "Observation", dict(base), request, evidence, "observations"
+        )
+    if "encounters" in intents:
+        evidence.encounters = await _assist_search(
+            "Encounter", dict(base), request, evidence, "encounters"
+        )
+
+    answer = assist.answer_question(question, evidence)
+
+    return {
+        "patient_id": payload.patient_id,
+        # What was actually looked at, so a clinician can judge the answer's
+        # basis rather than trusting it.
+        "retrieved": {
+            "allergies": len(evidence.allergies),
+            "medications": len(evidence.medications),
+            "conditions": len(evidence.conditions),
+            "observations": len(evidence.observations),
+            "encounters": len(evidence.encounters),
+            "failed": sorted(evidence.failed),
+        },
+        **answer.as_dict(),
+    }
+
+
+@app.get("/assist/capabilities", tags=["assist"])
+async def assist_capabilities(
+    user: User = Depends(clinician_or_admin),
+) -> dict[str, Any]:
+    """What the assistant can and cannot do.
+
+    Published rather than buried in documentation: a clinician deciding
+    whether to trust an answer needs to know the assistant is extractive and
+    read-only, not a model forming an opinion.
+    """
+    return {
+        "topics": list(assist.SUPPORTED_TOPICS),
+        "grounding": "answers are extracted from this patient's FHIR records only",
+        "citations": "every finding cites the resources it was taken from",
+        "writes": False,
+        "gives_advice": False,
+        "model_backed": False,
+        "disclaimer": assist.DISCLAIMER,
     }

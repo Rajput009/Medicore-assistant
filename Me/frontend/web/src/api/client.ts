@@ -8,6 +8,7 @@
  */
 
 import type {
+  AssistAnswer,
   AuditAccessorsResponse,
   AuditSearchParams,
   AuditSearchResponse,
@@ -381,6 +382,25 @@ export const api = {
         idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
       },
     )
+  },
+
+  /**
+   * Ask a grounded question about one patient's chart.
+   *
+   * Read-only and cited server-side; the caller sees only what they are
+   * already authorised to fetch themselves.
+   */
+  assistAsk(
+    patientId: string,
+    question: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AssistAnswer> {
+    return request<AssistAnswer>(`${BASE.gateway}/assist/ask`, {
+      method: 'POST',
+      body: { patient_id: patientId, question },
+      signal,
+    })
   },
 
   listBeds(ward: string | null, _token?: string | null, signal?: AbortSignal): Promise<Bed[]> {
