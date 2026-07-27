@@ -1,103 +1,230 @@
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
-from backend.common.config import settings
-from backend.common.middleware import AuditLogMiddleware
+"""MediCore auth service: local login stub + OIDC SSO + internal token minting."""
 
+import os
+import secrets
+from typing import Any
+
+from authlib.integrations.starlette_client import OAuth, OAuthError
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+
+from backend.common.config import settings
+from backend.common.hardening import (
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
+from backend.common.logging import configure_logging
+from backend.common.middleware import AuditLogMiddleware
+from backend.common.security import create_access_token
 from backend.common.telemetry import instrument_fastapi
-app = instrument_fastapi(FastAPI(title="MediCore Auth", version="0.1.0"), service_name="auth")
-app.add_middleware(AuditLogMiddleware)
+
+configure_logging(settings.log_level, service="auth")
+
+app = instrument_fastapi(
+    FastAPI(title="MediCore Auth", version="1.0.0"), service_name="auth"
+)
+
+# Session cookie is required for the OIDC state/nonce round-trip.
+_session_secret = os.getenv("SESSION_SECRET", settings.session_secret)
+if settings.env not in ("local", "test") and _session_secret in (
+    "dev-change-me",
+    "",
+):
+    raise RuntimeError(
+        "SESSION_SECRET must be set to a strong random value outside local/test"
+    )
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_session_secret,
+    same_site="lax",
+    https_only=settings.env not in ("local", "test"),
+)
+
+# Credentialed CORS cannot use a "*" origin — browsers reject the combination,
+# so fall back to an explicit allow-list.
+_origins = settings.cors_origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+# Middleware runs in reverse registration order, so the last registered is
+# outermost. Order matters: security headers must wrap everything (including
+# rejections), and the audit log must see the authenticated principal.
+app.add_middleware(RateLimitMiddleware, limit=settings.login_rate_limit_per_minute)
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
+app.add_middleware(AuditLogMiddleware, service="auth")
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
+
 
 class Health(BaseModel):
     status: str
     service: str
     env: str
 
-@app.get("/health", response_model=Health)
-def health():
+
+@app.get("/health", response_model=Health, tags=["ops"])
+def health() -> Health:
     return Health(status="ok", service="auth", env=settings.env)
 
 
-from fastapi import HTTPException
-from pydantic import BaseModel
-from backend.common.security import create_access_token
+@app.get("/ready", tags=["ops"])
+def ready() -> dict[str, Any]:
+    """Readiness reports whether SSO is wired up; the service still serves
+    token verification for existing sessions either way."""
+    return {"status": "ok", "oidc": "configured" if _OIDC_CONFIGURED else "disabled"}
+
+
+# --------------------------------------------------------------------------
+# Local (development) login
+# --------------------------------------------------------------------------
+
 
 class LoginReq(BaseModel):
     username: str
     password: str
 
+
 class TokenResp(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 3600
+
+
+def _demo_login_enabled() -> bool:
+    """The username/password stub authenticates nobody — keep it out of prod."""
+    return settings.env in ("local", "test") or os.getenv(
+        "ENABLE_DEMO_LOGIN", ""
+    ).lower() in ("1", "true", "yes")
+
 
 @app.post("/login", response_model=TokenResp)
-def login(req: LoginReq):
-    # NOTE: Replace with real IdP/DB. Demo only.
+def login(req: LoginReq) -> TokenResp:
+    if not _demo_login_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Local login is disabled; use /oidc/login",
+        )
     if not req.username or not req.password:
-        raise HTTPException(status_code=400, detail="Invalid credentials")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+        )
+
+    demo_password = os.getenv("DEMO_PASSWORD", "medicore-dev")
+    # Constant-time compare avoids leaking the password via timing.
+    if not secrets.compare_digest(req.password, demo_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+        )
+
     token = create_access_token(sub=req.username, roles=["clinician"])
     return TokenResp(access_token=token)
 
 
-from fastapi import Request, Response
-from fastapi.responses import RedirectResponse, JSONResponse
-from starlette.middleware.sessions import SessionMiddleware
-from starlette.middleware.cors import CORSMiddleware
-from authlib.integrations.starlette_client import OAuth, OAuthError
-import os
-
-# CORS (demo)
-origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
-
-# Sessions for OIDC
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "dev-change-me"))
+# --------------------------------------------------------------------------
+# OIDC SSO
+# --------------------------------------------------------------------------
 
 oauth = OAuth()
-issuer_meta = os.getenv("OIDC_ISSUER") or ""
-client_id = os.getenv("OIDC_CLIENT_ID") or ""
-client_secret = os.getenv("OIDC_CLIENT_SECRET") or ""
-redirect_uri = os.getenv("OIDC_REDIRECT_URI") or "http://localhost:8081/oidc/callback"
 
-if issuer_meta and client_id and client_secret:
+_issuer_meta = os.getenv("OIDC_ISSUER", settings.oidc_issuer)
+_client_id = os.getenv("OIDC_CLIENT_ID", settings.oidc_client_id)
+_client_secret = os.getenv("OIDC_CLIENT_SECRET", settings.oidc_client_secret)
+_redirect_uri = os.getenv("OIDC_REDIRECT_URI", settings.oidc_redirect_uri)
+
+_OIDC_CONFIGURED = bool(_issuer_meta and _client_id and _client_secret)
+
+if _OIDC_CONFIGURED:
+    metadata_url = _issuer_meta
+    # Accept either a bare issuer or a full discovery URL.
+    if not metadata_url.endswith("/.well-known/openid-configuration"):
+        metadata_url = (
+            metadata_url.rstrip("/") + "/.well-known/openid-configuration"
+        )
     oauth.register(
         name="idp",
-        server_metadata_url=issuer_meta,
-        client_id=client_id,
-        client_secret=client_secret,
-        client_kwargs={"scope": "openid email profile"}
+        server_metadata_url=metadata_url,
+        client_id=_client_id,
+        client_secret=_client_secret,
+        client_kwargs={"scope": "openid email profile"},
     )
+
+
+def _not_configured() -> JSONResponse:
+    return JSONResponse({"error": "OIDC not configured"}, status_code=501)
+
+
+# Map IdP groups/roles onto internal roles.
+_ROLE_MAP = {
+    "medicore-admin": "admin",
+    "medicore-clinician": "clinician",
+}
+
+
+def _map_roles(userinfo: dict[str, Any]) -> list[str]:
+    raw: list[str] = []
+    for claim in ("roles", "groups"):
+        value = userinfo.get(claim)
+        if isinstance(value, str):
+            raw.extend(value.replace(",", " ").split())
+        elif isinstance(value, (list, tuple)):
+            raw.extend(str(v) for v in value)
+    roles = {_ROLE_MAP[r] for r in raw if r in _ROLE_MAP}
+    # Default to the least-privileged role rather than granting clinician.
+    return sorted(roles) or ["viewer"]
+
 
 @app.get("/oidc/login")
 async def oidc_login(request: Request):
-    if "idp" not in oauth._clients:
-        return JSONResponse({"error": "OIDC not configured"}, status_code=501)
-    redirect_uri_final = redirect_uri
-    return await oauth.idp.authorize_redirect(request, redirect_uri_final)
+    if not _OIDC_CONFIGURED:
+        return _not_configured()
+    return await oauth.idp.authorize_redirect(request, _redirect_uri)
+
 
 @app.get("/oidc/callback")
 async def oidc_callback(request: Request):
-    if "idp" not in oauth._clients:
-        return JSONResponse({"error": "OIDC not configured"}, status_code=501)
+    if not _OIDC_CONFIGURED:
+        return _not_configured()
     try:
         token = await oauth.idp.authorize_access_token(request)
-        userinfo = await oauth.idp.parse_id_token(request, token)
-    except OAuthError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+    except OAuthError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
-    # Map roles (demo: basic clinician role)
-    roles = ["clinician"]
-    sub = userinfo.get("sub") or userinfo.get("email") or "user"
+    # authorize_access_token already parses and validates the id_token when the
+    # provider returns one; calling parse_id_token(request, token) again fails
+    # (it requires a nonce and has a different signature across Authlib
+    # versions). Prefer the parsed claims, then fall back to /userinfo.
+    userinfo: dict[str, Any] | None = token.get("userinfo")
+    if not userinfo:
+        try:
+            userinfo = dict(await oauth.idp.userinfo(token=token))
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"unable to fetch userinfo: {exc}"}, status_code=400
+            )
 
-    # Mint internal token
-    internal = create_access_token(sub=sub, roles=roles)
+    sub = userinfo.get("sub") or userinfo.get("email")
+    if not sub:
+        return JSONResponse(
+            {"error": "IdP response contained no subject"}, status_code=400
+        )
 
-    return JSONResponse({
-        "access_token": internal,
-        "token_type": "bearer",
-        "user": {
-            "sub": sub,
-            "email": userinfo.get("email"),
-            "name": userinfo.get("name")
+    internal = create_access_token(sub=str(sub), roles=_map_roles(userinfo))
+    return JSONResponse(
+        {
+            "access_token": internal,
+            "token_type": "bearer",
+            "user": {
+                "sub": sub,
+                "email": userinfo.get("email"),
+                "name": userinfo.get("name"),
+            },
         }
-    })
+    )

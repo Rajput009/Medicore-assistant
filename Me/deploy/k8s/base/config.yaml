@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: medicore-config
+  namespace: medicore
+data:
+  LOG_LEVEL: "INFO"
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "medicore"
+  MONGO_URI: "mongodb://mongo:27017"
+  MONGO_DB: "medicore"
+  KAFKA_BROKERS: "kafka:9092"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  OTEL_SERVICE_NAMESPACE: "medicore"
+  ALLOWED_ORIGINS: "https://console.medicore.local"
+---
+# NOTE: the medicore-secrets Secret is deliberately NOT defined here.
+#
+# Committing a placeholder invites it being filled in and pushed. Create it
+# out-of-band with sealed-secrets, External Secrets Operator, or your cloud
+# secret manager. Required keys:
+#
+#   jwt-secret          >= 32 random chars  (openssl rand -hex 32)
+#   session-secret      >= 32 random chars
+#   postgres-password   >= 12 chars
+#   fhir-client-secret  from your EHR vendor
+#   oidc-client-secret  from your IdP
+#
+# Services refuse to start in production if any of these is a placeholder.

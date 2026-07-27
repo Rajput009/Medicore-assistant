@@ -1,180 +1,357 @@
-from fastapi import Request, HTTPException, status
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
-from backend.common.config import settings
-from backend.common.middleware import AuditLogMiddleware
+"""MediCore API gateway.
 
+Edge service: enforces JWT auth + RBAC and proxies FHIR reads/searches with a
+Postgres-backed response cache.
+"""
+
+import logging
+import re
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from pydantic import BaseModel
+
+from backend.common.cache import (
+    close_pool,
+    get_cached,
+    init_pool,
+    invalidate_cache,
+    set_cached,
+    start_janitor,
+    stop_janitor,
+)
+from backend.common.cache import (
+    ping as cache_ping,
+)
+from backend.common.config import settings
+from backend.common.fhir_client import FHIRError, default_fhir_client
+from backend.common.hardening import (
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
+from backend.common.logging import configure_logging
+from backend.common.middleware import AuditLogMiddleware
 from backend.common.telemetry import instrument_fastapi
+from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
-app = instrument_fastapi(FastAPI(title="MediCore Gateway", version="0.1.0"), service_name="gateway")
-app.add_middleware(AuditLogMiddleware)
+
+fhir = default_fhir_client()
+
+# Cache TTLs per resource type (seconds). Observations change far more often.
+CACHE_TTL = {
+    "Patient": 300,
+    "Encounter": 300,
+    "Observation": 60,
+    "MedicationRequest": 300,
+}
+
+# Only these resource types may be targeted by cache invalidation, so a path
+# parameter can never be used to probe arbitrary values.
+KNOWN_RESOURCES = frozenset(CACHE_TTL)
+
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    configure_logging(settings.log_level, service="gateway")
+    try:
+        # Create the pool (and cache table) up front so the first request does
+        # not pay the setup cost, and readiness reflects reality immediately.
+        await init_pool()
+        await start_janitor()
+    except Exception as exc:
+        # Log a one-line summary, not a full traceback: this fires on every
+        # start while the database is unreachable and would otherwise flood
+        # the log pipeline. Readiness reports the degradation.
+        logger.warning(
+            "cache initialisation failed; serving without cache",
+            extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+        )
+    try:
+        yield
+    finally:
+        await stop_janitor()
+        await fhir.aclose()
+        await close_pool()
+
+
+app = instrument_fastapi(
+    FastAPI(title="MediCore Gateway", version="0.1.0", lifespan=lifespan),
+    service_name="gateway",
+)
+
+# Middleware runs in reverse registration order: the last registered is the
+# outermost layer. Auth is registered first so it runs innermost, which means
+# the audit logger wraps it and still records rejected (401/403) requests -
+# denied access attempts are the ones an audit trail most needs.
 app.add_middleware(JWTAuthMiddleware)
+app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
+app.add_middleware(AuditLogMiddleware, service="gateway")
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
+
 
 class Health(BaseModel):
     status: str
     service: str
     env: str
 
-@app.get("/health", response_model=Health)
-def health():
+
+@app.get("/health", response_model=Health, tags=["ops"])
+def health() -> Health:
+    """Liveness only: must not touch dependencies, or a database outage would
+    restart otherwise-healthy pods."""
     return Health(status="ok", service="gateway", env=settings.env)
 
 
-from fastapi import HTTPException
-from backend.common.fhir_client import default_fhir_client
-from backend.services.gateway.auth import get_current_user, requires_roles, User
-fhir = default_fhir_client()
-
-@app.get("/fhir/patient/{patient_id}")
-def get_patient(patient_id: str):
+@app.get("/ready", tags=["ops"])
+async def ready(response: Response) -> dict[str, Any]:
+    """Readiness: verifies the cache database before accepting traffic."""
     try:
-        return fhir.get("Patient", patient_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        await cache_ping()
+    except Exception:
+        logger.warning("readiness check failed", exc_info=True)
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "degraded", "cache": "unavailable"}
+    return {"status": "ok", "cache": "ok"}
 
-
-from fastapi import Request, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
-from backend.common.config import settings
-
-security = HTTPBearer(auto_error=False)
-
-def verify_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_alg])
-    except JWTError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    return payload
 
 @app.get("/secure")
-def secure_route(payload: dict = Depends(verify_jwt)):
-    return {"ok": True, "sub": payload.get("sub"), "roles": payload.get("roles")}
+def secure_route(user: User = Depends(clinician_or_admin)) -> dict[str, Any]:
+    return {"ok": True, "sub": user.sub, "roles": user.roles}
 
 
-from fastapi import Depends, HTTPException, status
-# protected proxy
-@app.get("/fhir/patient/{patient_id}/protected")
-async def get_patient_protected(patient_id: str, user: User = Depends(get_current_user)):
-    if not set(user.roles).intersection({'clinician','admin'}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
+# --------------------------------------------------------------------------
+# FHIR helpers
+# --------------------------------------------------------------------------
+
+# Query params that are gateway-internal / meaningless upstream.
+_RESERVED_PARAMS = frozenset({"access_token", "token"})
+
+# Only FHIR search parameters we intend to support are forwarded. An
+# allow-list (rather than a deny-list) means an attacker cannot reach
+# undocumented upstream behaviour, and cannot flood the response cache with
+# unbounded distinct keys by varying junk parameter names.
+ALLOWED_SEARCH_PARAMS: frozenset[str] = frozenset(
+    {
+        "patient", "subject", "identifier", "_id",
+        "name", "family", "given", "birthdate", "gender",
+        "status", "category", "code", "date", "encounter",
+        "class", "type", "intent", "authoredon", "requester",
+        "_count", "_sort", "_include", "_lastUpdated", "page",
+    }
+)
+
+MAX_PARAM_VALUE_LENGTH = 128
+MAX_SEARCH_PARAMS = 12
+# Upper bound on the page size we will ask the FHIR server for. Without this a
+# caller can request _count=999999 and force a huge upstream response.
+MAX_COUNT = 100
+DEFAULT_COUNT = 50
+
+
+def _clean_params(request: Request) -> dict[str, str]:
+    """Validate and normalise search parameters before they leave the gateway."""
+    params: dict[str, str] = {}
+    for key, value in request.query_params.items():
+        if key in _RESERVED_PARAMS:
+            continue
+        if key not in ALLOWED_SEARCH_PARAMS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported search parameter '{key}'",
+            )
+        if len(value) > MAX_PARAM_VALUE_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Value for '{key}' exceeds {MAX_PARAM_VALUE_LENGTH} characters",
+            )
+        params[key] = value
+
+    if len(params) > MAX_SEARCH_PARAMS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {MAX_SEARCH_PARAMS} search parameters are supported",
+        )
+
+    # Clamp paging so one request cannot pull an unbounded amount of PHI.
+    raw_count = params.get("_count")
+    if raw_count is not None:
+        try:
+            count = int(raw_count)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="_count must be an integer",
+            ) from None
+        params["_count"] = str(max(1, min(count, MAX_COUNT)))
+    else:
+        params["_count"] = str(DEFAULT_COUNT)
+
+    return params
+
+
+# FHIR ids are constrained by the spec to this character set.
+_FHIR_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _validate_id(resource_id: str) -> str:
+    if not _FHIR_ID.match(resource_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed resource id",
+        )
+    return resource_id
+
+
+async def _read(resource: str, resource_id: str) -> dict[str, Any]:
+    _validate_id(resource_id)
     try:
-        return fhir.get("Patient", patient_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        return await fhir.read(resource, resource_id)
+    except FHIRError as exc:
+        # Preserve upstream 404s instead of masking everything as a 502.
+        if exc.status_code == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"{resource}/{resource_id} not found",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
 
 
-# ----------------- Expanded FHIR Endpoints -----------------
+async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
+    ttl = CACHE_TTL.get(resource, 300)
+    try:
+        cached = await get_cached(resource, params, max_age_seconds=ttl)
+        if cached is not None:
+            return cached
+    except Exception:
+        # A cache outage must not take the read path down with it.
+        cached = None
+
+    try:
+        resp = await fhir.search(resource, params)
+    except FHIRError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
+
+    try:
+        await set_cached(resource, params, resp)
+    except Exception:
+        pass
+    return resp
+
+
+# --------------------------------------------------------------------------
+# FHIR routes
+#
+# IMPORTANT: the literal "/search" routes must be declared *before* the
+# "/{id}" routes. FastAPI matches in declaration order, so registering
+# "/fhir/patient/{patient_id}" first would swallow "/fhir/patient/search"
+# and treat "search" as a patient id.
+# --------------------------------------------------------------------------
+
 
 @app.get("/fhir/patient/search")
-async def search_patients(request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    params = dict(request.query_params)
-    # try cache
-    cached = await get_cached("Patient", params, max_age_seconds=300)
-    if cached is not None:
-        return cached
-    try:
-        resp = fhir.search("Patient", params)
-        # store cache async
-        await set_cached("Patient", params, resp)
-        return resp
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def search_patients(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("Patient", _clean_params(request))
 
-@app.get("/fhir/encounter/{encounter_id}")
-async def get_encounter(encounter_id: str, request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    try:
-        return fhir.get("Encounter", encounter_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+
+@app.get("/fhir/patient/{patient_id}")
+async def get_patient(
+    patient_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("Patient", patient_id)
+
+
+# Kept for backwards compatibility with earlier docs/clients.
+@app.get("/fhir/patient/{patient_id}/protected")
+async def get_patient_protected(
+    patient_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("Patient", patient_id)
+
 
 @app.get("/fhir/encounter/search")
-async def search_encounters(request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    params = dict(request.query_params)
-    cached = await get_cached("Encounter", params, max_age_seconds=300)
-    if cached is not None:
-        return cached
-    try:
-        resp = fhir.search("Encounter", params)
-        await set_cached("Encounter", params, resp)
-        return resp
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def search_encounters(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("Encounter", _clean_params(request))
 
-@app.get("/fhir/observation/{obs_id}")
-async def get_observation(obs_id: str, request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    try:
-        return fhir.get("Observation", obs_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+
+@app.get("/fhir/encounter/{encounter_id}")
+async def get_encounter(
+    encounter_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("Encounter", encounter_id)
+
 
 @app.get("/fhir/observation/search")
-async def search_observations(request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    params = dict(request.query_params)
-    cached = await get_cached("Observation", params, max_age_seconds=60)
-    if cached is not None:
-        return cached
-    try:
-        resp = fhir.search("Observation", params)
-        await set_cached("Observation", params, resp)
-        return resp
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def search_observations(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("Observation", _clean_params(request))
 
-@app.get("/fhir/medicationrequest/{med_id}")
-async def get_medication_request(med_id: str, request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    try:
-        return fhir.get("MedicationRequest", med_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+
+@app.get("/fhir/observation/{obs_id}")
+async def get_observation(
+    obs_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("Observation", obs_id)
+
 
 @app.get("/fhir/medicationrequest/search")
-async def search_medication_requests(request: Request):
-    user = getattr(request.state, "user", None)
-    if not user or not set(user.get("roles", [])).intersection({"clinician","admin"}):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    params = dict(request.query_params)
-    cached = await get_cached("MedicationRequest", params, max_age_seconds=300)
-    if cached is not None:
-        return cached
-    try:
-        resp = fhir.search("MedicationRequest", params)
-        await set_cached("MedicationRequest", params, resp)
-        return resp
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def search_medication_requests(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("MedicationRequest", _clean_params(request))
 
 
-# ----------------- Admin Cache Invalidation Endpoints -----------------
+@app.get("/fhir/medicationrequest/{med_id}")
+async def get_medication_request(
+    med_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("MedicationRequest", med_id)
+
+
+# --------------------------------------------------------------------------
+# Admin cache invalidation
+# --------------------------------------------------------------------------
+
 
 @app.delete("/cache/{resource}")
-async def admin_invalidate_cache(resource: str, request: Request, patient: str = None):
-    user = getattr(request.state, "user", None)
-    if not user or "admin" not in user.get("roles", []):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+async def admin_invalidate_cache(
+    resource: str,
+    patient: str | None = Query(default=None),
+    user: User = Depends(admin_only),
+) -> dict[str, Any]:
+    # Normalise case so "patient" and "Patient" both work.
+    canonical = next(
+        (r for r in KNOWN_RESOURCES if r.lower() == resource.lower()), None
+    )
+    if canonical is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown resource '{resource}'. "
+            f"Expected one of: {', '.join(sorted(KNOWN_RESOURCES))}",
+        )
     try:
-        await invalidate_cache(resource, patient)
-        return {"status": "ok", "message": f"Cache invalidated for {resource} (patient={patient})"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        deleted = await invalidate_cache(canonical, patient)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+    return {
+        "status": "ok",
+        "resource": canonical,
+        "patient": patient,
+        "deleted": deleted,
+    }

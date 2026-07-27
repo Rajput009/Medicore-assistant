@@ -1,11 +1,34 @@
-from datetime import datetime, timedelta, timezone
-from jose import jwt
-from typing import Dict, Any
-from .config import settings
+"""JWT minting and verification helpers.
 
-def create_access_token(sub: str, roles: list[str] | None = None, expires_minutes: int = 60) -> str:
-    now = datetime.now(timezone.utc)
-    payload: Dict[str, Any] = {
+Supports:
+  * HS* tokens signed with the shared ``JWT_SECRET`` (local/dev + internal tokens)
+  * RS*/ES* tokens issued by an external IdP, verified against its JWKS.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from jose import JWTError, jwt
+
+from .config import settings
+from .jwks import JWKSFetcher
+
+# Algorithms we are willing to verify. Anything else (notably "none") is rejected
+# outright so a caller cannot downgrade the algorithm via the token header.
+_ALLOWED_HS = {"HS256", "HS384", "HS512"}
+_ALLOWED_ASYMMETRIC = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+
+
+def create_access_token(
+    sub: str,
+    roles: list[str] | None = None,
+    expires_minutes: int = 60,
+) -> str:
+    """Mint an internal HS-signed access token."""
+    now = datetime.now(UTC)
+    payload: dict[str, Any] = {
         "sub": sub,
         "roles": roles or ["viewer"],
         "iat": int(now.timestamp()),
@@ -14,90 +37,120 @@ def create_access_token(sub: str, roles: list[str] | None = None, expires_minute
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_alg)
 
 
-from jose import JWTError, jwt
-from typing import Dict, Any, Optional
-from datetime import datetime, timezone
-from backend.common.config import settings
-
-# def verify_access_token_OLD(token: str) -> Dict[str, Any]:
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_alg])
-        # basic expiry check handled by jwt library; but ensure 'sub' exists
-        sub = payload.get("sub")
-        if not sub:
-            raise JWTError("sub claim missing")
-        return payload
-    except JWTError as e:
-        raise
-
-
-from jose import JWTError, jwt
-from typing import Dict, Any
-from datetime import datetime, timezone
-from backend.common.config import settings
-from backend.common.jwks import JWKSFetcher
-import os
-
 _jwks_fetcher: JWKSFetcher | None = None
+
+
+def _resolve_jwks_url() -> str | None:
+    """Work out the JWKS endpoint from the configured OIDC environment."""
+    jwks_url = settings.oidc_jwks_uri or settings.oidc_issuer
+    if not jwks_url:
+        return None
+    jwks_url = jwks_url.strip()
+    if not jwks_url.startswith("http"):
+        return None
+    if "jwks" in jwks_url:
+        return jwks_url
+    # Derive the JWKS endpoint from a discovery document / bare issuer URL.
+    if jwks_url.endswith("/.well-known/openid-configuration"):
+        base = jwks_url[: -len("/.well-known/openid-configuration")]
+    else:
+        base = jwks_url.rstrip("/")
+    return f"{base}/.well-known/jwks.json"
+
 
 def _get_jwks_fetcher() -> JWKSFetcher | None:
     global _jwks_fetcher
-    jwks_url = os.getenv("OIDC_JWKS_URI") or os.getenv("OIDC_ISSUER")
-    # If issuer provided, try to construct .well-known/jwks.json
-    if jwks_url and jwks_url.startswith("http") and "jwks" not in jwks_url:
-        if jwks_url.endswith("/.well-known/openid-configuration"):
-            # fetch config? but we'll expect OIDC_JWKS_URI to be set in prod. Simple fallback:
-            jwks_url = jwks_url.rsplit("/", 1)[0] + "/jwks"
+    jwks_url = _resolve_jwks_url()
     if not jwks_url:
         return None
-    if _jwks_fetcher is None:
+    # Rebuild the fetcher if the configured URL changed (e.g. in tests).
+    if _jwks_fetcher is None or _jwks_fetcher.url != jwks_url:
         _jwks_fetcher = JWKSFetcher(jwks_url, ttl=600)
     return _jwks_fetcher
 
-def verify_access_token(token: str) -> Dict[str, Any]:
-    # Try decode with configured algorithm (HS or RS). If RS, fetch JWKS and find matching key.
+
+def reset_jwks_cache() -> None:
+    """Drop the memoised JWKS fetcher (useful for tests / key rotation)."""
+    global _jwks_fetcher
+    _jwks_fetcher = None
+
+
+def _decode_options() -> dict[str, Any]:
+    # ``aud``/``iss`` are only validated when explicitly configured.
+    return {
+        "verify_aud": bool(settings.oidc_audience),
+        "verify_iss": bool(settings.oidc_issuer_claim),
+    }
+
+
+def _finalise(payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload.get("sub"):
+        raise JWTError("sub claim missing")
+    return payload
+
+
+def verify_access_token(token: str) -> dict[str, Any]:
+    """Verify ``token`` and return its claims, raising ``JWTError`` when invalid."""
+    if not token or not token.strip():
+        raise JWTError("empty token")
+
     try:
         header = jwt.get_unverified_header(token)
-        alg = header.get("alg", "HS256")
-    except Exception as e:
-        raise JWTError("invalid token header") from e
+    except Exception as exc:  # malformed token
+        raise JWTError("invalid token header") from exc
 
-    # HS family
-    if alg.startswith("HS"):
-        try:
-            payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_alg])
-            sub = payload.get("sub")
-            if not sub:
-                raise JWTError("sub claim missing")
-            return payload
-        except JWTError as e:
-            raise
-    # RS family: use JWKS
-    elif alg.startswith("RS") or alg.startswith("ES"):
+    alg = header.get("alg")
+    if not alg:
+        raise JWTError("missing alg header")
+
+    if alg in _ALLOWED_HS:
+        # Pin verification to the *configured* algorithm so a token cannot pick
+        # a weaker HS variant than the deployment expects.
+        if settings.jwt_alg not in _ALLOWED_HS:
+            raise JWTError("server is not configured for HS tokens")
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[settings.jwt_alg],
+            audience=settings.oidc_audience or None,
+            issuer=settings.oidc_issuer_claim or None,
+            options=_decode_options(),
+        )
+        return _finalise(payload)
+
+    if alg in _ALLOWED_ASYMMETRIC:
         fetcher = _get_jwks_fetcher()
         if not fetcher:
             raise JWTError("no JWKS configured for RS/ES token verification")
-        keys = fetcher.get_keys()
+
         kid = header.get("kid")
-        key = None
-        if kid:
-            for k in keys:
-                if k.get("kid") == kid:
-                    key = k
-                    break
-        else:
-            # fallback: take first key
-            if keys:
-                key = keys[0]
-        if not key:
+        key = _select_key(fetcher.get_keys(), kid)
+        if key is None and kid:
+            # Key may have been rotated since we last cached the JWKS.
+            key = _select_key(fetcher.refresh(), kid)
+        if key is None:
             raise JWTError("matching JWK not found")
-        try:
-            payload = jwt.decode(token, key, algorithms=[alg], options={"verify_aud": False})
-            sub = payload.get("sub")
-            if not sub:
-                raise JWTError("sub claim missing")
-            return payload
-        except JWTError as e:
-            raise
-    else:
-        raise JWTError("unsupported alg")
+
+        payload = jwt.decode(
+            token,
+            key,
+            algorithms=[alg],
+            audience=settings.oidc_audience or None,
+            issuer=settings.oidc_issuer_claim or None,
+            options=_decode_options(),
+        )
+        return _finalise(payload)
+
+    raise JWTError(f"unsupported alg: {alg}")
+
+
+def _select_key(keys: list[dict[str, Any]], kid: str | None) -> dict[str, Any] | None:
+    if not keys:
+        return None
+    if kid:
+        for k in keys:
+            if k.get("kid") == kid:
+                return k
+        return None
+    # No kid in the header: only safe to guess when the IdP publishes one key.
+    return keys[0] if len(keys) == 1 else None

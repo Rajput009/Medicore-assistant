@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Environment / secrets — never commit real values
+.env
+.env.local
+*.env
+!.env.example
+!*.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+.playwright/

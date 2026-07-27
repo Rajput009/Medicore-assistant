@@ -4,8 +4,16 @@ metadata:
   name: medicore-ingress
   namespace: medicore
   annotations:
-    kubernetes.io/ingress.class: nginx
+    # kubernetes.io/ingress.class is deprecated; use spec.ingressClassName.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
 spec:
+  ingressClassName: nginx
+  # PHI must never traverse plaintext HTTP.
+  tls:
+    - hosts:
+        - api.medicore.local
+      secretName: medicore-tls
   rules:
     - host: api.medicore.local
       http:

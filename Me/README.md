@@ -9,23 +9,121 @@ Docker/Kubernetes deploys, CI, and local dev tooling.
 ## Quick Start (Local)
 
 ```bash
-# 1) clone & cd
-# 2) copy envs
-cp .env.example .env
+# 1) copy the env template
 cp backend/.env.example backend/.env
-cp deploy/docker/.env.example deploy/docker/.env
 
-# 3) start everything (APIs, DB, Redis, Kafka, Web)
+# 2) start everything (APIs, Postgres, Mongo, Redis, Kafka, Jaeger, Web)
 docker compose -f deploy/docker/docker-compose.yml up --build
 
-# 4) visit web
-http://localhost:5173
+# 3) visit the console
+open http://localhost:5173
 
-# 5) health checks
+# 4) health checks
 curl http://localhost:8080/health            # gateway
 curl http://localhost:8081/health            # auth
 curl http://localhost:8082/health            # patient-flow
 curl http://localhost:8083/health            # cds
+```
+
+### Get a token and call a protected endpoint
+
+```bash
+# The demo login only works when ENV=local/test (DEMO_PASSWORD, default "medicore-dev").
+TOKEN=$(curl -s -X POST http://localhost:8081/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"dr.smith","password":"medicore-dev"}' | jq -r .access_token)
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/fhir/patient/123
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/fhir/observation/search?patient=123"
+```
+
+### Run tests locally
+
+```bash
+make test      # backend unit + e2e (pytest)
+make test-web  # frontend unit + integration (vitest)
+make test-e2e  # browser end-to-end (playwright)
+make lint      # ruff + tsc --noEmit
+```
+
+| Suite | Location | Count | Runner |
+| ----- | -------- | ----- | ------ |
+| Backend unit/regression | `backend/tests/test_*.py` | 37 | pytest |
+| Backend end-to-end | `backend/tests/test_e2e_api.py` | 43 | pytest |
+| Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
+| Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
+
+Browser e2e requires `npx playwright install` once to download browsers.
+
+## Production notes
+
+**State.** Beds and the triage queue live in MongoDB, never in process memory,
+so the services scale horizontally. Bed ids are derived deterministically from
+`BED_LAYOUT`, so every replica agrees on them and seeding is idempotent.
+
+**Concurrency.** Bed assignment accepts an `expected_occupied` precondition and
+returns `409` when another clinician got there first, instead of silently
+overwriting. Claiming the next triage patient is a single atomic
+`find_one_and_update`, so two clinicians can never be handed the same patient.
+A partial unique index prevents a patient from occupying two waiting slots.
+
+**Probes.** `/health` is liveness (process only) and `/ready` is readiness
+(verifies dependencies). Kubernetes readiness uses `/ready` so a pod with a
+dead database leaves the Service; liveness deliberately does *not* check
+dependencies, or a database outage would restart every healthy pod.
+
+**Clinical scoring.** CDS implements NEWS2 (Royal College of Physicians, 2017)
+with a per-parameter breakdown and the single-parameter red-flag rule, rather
+than an ad-hoc formula. See `backend/services/cds/scoring.py`.
+
+**Logging.** Structured JSON on stdout with trace correlation. Third-party HTTP
+client loggers are raised above INFO because they log full URLs, which in this
+system contain patient identifiers.
+
+**Data retention.** A background sweep purges FHIR cache rows older than
+`CACHE_MAX_AGE_SECONDS`; the table would otherwise grow without bound and
+retain PHI indefinitely.
+
+**Fail-fast configuration.** Outside local/test/dev the services refuse to
+start if `JWT_SECRET`, `SESSION_SECRET` or `POSTGRES_PASSWORD` is still a
+placeholder or too short, or if `ALLOWED_ORIGINS` is `*`. Booting with the
+default signing key - which is published in this repository - would let anyone
+mint a valid admin token, and nothing downstream would notice.
+
+**Audit trail.** Every request is logged with the actor (`sub`, `roles`) and a
+reference to the record touched (`resource_type`, `resource_ref`), so
+"who viewed this chart?" is answerable as HIPAA 164.312(b) requires. Patient
+identifiers are pseudonymised with a salted HMAC: stable enough to correlate
+accesses, but the log stream carries no raw PHI. Denied attempts are recorded
+with `outcome: denied`.
+
+**Edge hardening.** Security headers on every response (including
+`Cache-Control: no-store`, so PHI is never written to a shared cache),
+per-caller rate limiting, and a request body cap. These duplicate what a
+reverse proxy should do, deliberately: if the proxy is bypassed - a
+port-forward, a mesh sidecar in permissive mode - the application still
+defends itself.
+
+**Input validation.** FHIR search parameters are allow-listed, values length
+capped, and `_count` clamped, so a caller cannot reach undocumented upstream
+behaviour, pull an unbounded page of PHI, or flood the response cache with
+junk keys. Resource ids are validated against the FHIR id grammar.
+
+**Network.** NetworkPolicies default-deny east-west traffic; only the ingress
+controller reaches the gateway and only the gateway reaches the internal
+services. No Secret is committed - create `medicore-secrets` out-of-band.
+
+## Web console
+
+The clinician/admin console is a React + TypeScript SPA. It exposes the FHIR
+explorer, bed and triage management, risk scoring and cache administration,
+with role-aware navigation and route guards.
+
+See **[frontend/web/README.md](frontend/web/README.md)** for architecture,
+configuration, the testing strategy and troubleshooting.
+
+```bash
+cd frontend/web && npm install && npm run dev   # http://localhost:5173
 ```
 
 ## Structure
@@ -39,13 +137,13 @@ backend/                 # FastAPI microservices
     cds/                 # clinical decision support stubs
   common/                # shared code: auth, fhir utils, schemas
 frontend/
-  web/                   # React + Vite + TS Admin/Clinician UI
+  web/                   # React + Vite + TS Admin/Clinician UI (see frontend/web/README.md)
 deploy/
   docker/                # docker-compose for local dev
   k8s/                   # production k8s manifests (base overlays)
 infra/
   terraform/             # AWS/Azure IaC stubs (VPC, EKS/AKS, RDS, MSK)
-.github/workflows/       # CI/CD (build, lint, test, docker)
+.github/                 # CI/CD template (ci.yml.example -> workflows/ci.yml)
 Makefile                 # DX helpers
 ```
 
@@ -62,8 +160,10 @@ Makefile                 # DX helpers
 
 - **gateway**: Edge API, request fan-out to internal services, OpenAPI docs at `/docs`.
 - **auth**: Login, token mint/refresh, RBAC, OIDC plumbing.
-- **patient-flow**: Real-time bed/queue endpoints (placeholder logic + pub/sub topics).
-- **cds**: Decision support stub with example risk score endpoint and ML serving hook.
+- **patient-flow**: Bed management and ED triage queue, persisted in MongoDB
+  with optimistic-concurrency updates and atomic patient claiming.
+- **cds**: NEWS2 deterioration scoring with a per-parameter breakdown and
+  escalation guidance.
 
 ## Security Notes
 
@@ -84,9 +184,12 @@ Makefile                 # DX helpers
 - Configure `.env` / `backend/.env` with `FHIR_BASE_URL`, `FHIR_OAUTH_TOKEN_URL`, `FHIR_CLIENT_ID`, `FHIR_CLIENT_SECRET`.
 - Sample proxy: `GET /fhir/patient/{id}` on the **gateway** calls the FHIR API via OAuth2.
 
-## MongoDB (Documents & Logs)
-- `MONGO_URI`, `MONGO_DB` envs.
-- Example endpoints in **patient_flow**: `POST /queue`, `GET /queue` use Mongo.
+## MongoDB (beds & triage queue)
+- `MONGO_URI`, `MONGO_DB`, and pool/timeout envs (see `backend/.env.example`).
+- **patient_flow** endpoints:
+  - `GET /beds`, `GET /beds/{id}`, `PATCH /beds/{id}` (assign/discharge)
+  - `POST /queue`, `GET /queue`, `POST /queue/claim`, `POST /queue/{id}/complete`
+- Requires a replica set for retryable writes; compose runs a single-node `rs0`.
 
 ## Observability (OpenTelemetry + Jaeger)
 - All services auto-instrumented; spans exported to `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://jaeger:4318`).
@@ -110,28 +213,18 @@ Makefile                 # DX helpers
 > For production: configure HTTPS, use PKCE if doing SPA auth, store tokens server-side, and add RBAC role mapping from IdP claims/groups.
 
 
-## Gateway JWT Enforcement
-- Gateway now validates JWTs on secured routes.
-- Example: `GET /secure` requires `Authorization: Bearer <internal-jwt>` header.
-- Internal JWTs are minted by the **auth** service (via SSO or /login).
+## Gateway Auth & RBAC
 
-
-## Gateway JWT Enforcement
-- The gateway now verifies internal JWTs issued by the `auth` service.
-- Use the `/fhir/patient/{id}/protected` endpoint (or `/fhir/patient/{id}` if your gateway was modified) to test RBAC enforcement.
-- Tokens are validated using `backend/common/security.verify_access_token` which uses the `JWT_SECRET` in `.env`.
-- To test: call the `auth` service OIDC login or `/login` stub to get a token, then: `curl -H "Authorization: Bearer <token>" http://localhost:8080/fhir/patient/123/protected`
-
-## Gateway: Global JWT Enforcement (Middleware) & JWKS/RS256
-- The gateway now includes `JWTAuthMiddleware` which enforces presence and validity of bearer tokens globally,
-  exempting a few public endpoints like `/health` and `/docs`.
-- RS256/RS family support: If your IdP issues RS256 tokens, set `OIDC_JWKS_URI` (preferred) or `OIDC_ISSUER` in `.env`.
-  The gateway will fetch JWKS and validate tokens using the matching `kid` header.
-- For HS256 (dev) the gateway uses `JWT_SECRET` as before.
-- To test middleware-protected endpoint:
-  `curl -H "Authorization: Bearer <token>" http://localhost:8080/fhir/patient/123/middleware-protected`
-- Production notes: configure `OIDC_JWKS_URI`, enable caching and rotate keys per IdP guidance. Consider validating `aud` and `iss` claims.
-
+- `JWTAuthMiddleware` enforces a valid bearer token on **every** gateway route
+  except an exact-match allow-list (`/health`, `/docs`, `/openapi.json`, `/metrics`, ...).
+- Route handlers additionally enforce roles: FHIR reads/searches require
+  `clinician` or `admin`; cache invalidation requires `admin`.
+- **HS256 (dev):** tokens are verified with `JWT_SECRET`.
+- **RS256/ES256 (prod):** set `OIDC_JWKS_URI` (preferred) or `OIDC_ISSUER`; the
+  gateway fetches the JWKS and matches on the `kid` header, re-fetching once on
+  an unknown `kid` to tolerate key rotation.
+- `alg: none` and algorithm-downgrade attempts are rejected outright.
+- Optionally set `OIDC_AUDIENCE` / `OIDC_ISSUER_CLAIM` to validate `aud`/`iss`.
 
 ## Expanded FHIR Endpoints
 The gateway now supports these protected endpoints (require clinician/admin role):
