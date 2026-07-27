@@ -73,6 +73,33 @@ export async function stubBackend(page: Page): Promise<void> {
     json(r, { resourceType: 'Patient', id: 'p1', active: true }),
   )
 
+  await page.route('**/api/audit/search*', (route) => {
+    if (unauthorized(route)) return
+    return json(route, {
+      items: [
+        {
+          occurred_at: '2026-07-27T10:00:00+00:00',
+          request_id: 'req-1',
+          service: 'gateway',
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 200,
+          outcome: 'success',
+          actor_sub: 'dr.smith',
+          actor_roles: ['clinician'],
+          resource_type: 'patient',
+          resource_ref: 'sha256:abc',
+          patient_ref: 'sha256:abc',
+          client_ip: '10.0.0.1',
+          duration_ms: 4.2,
+        },
+      ],
+      count: 1,
+      total: 1,
+      patient_ref: 'sha256:abc',
+    })
+  })
+
   await page.route('**/api/cache/**', (r) =>
     json(r, { status: 'ok', resource: 'Patient', patient: null, deleted: 3 }),
   )

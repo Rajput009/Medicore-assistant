@@ -66,7 +66,8 @@ describe('role-based access', () => {
 
   it('allows cache admin for an admin', async () => {
     renderApp('/admin', makeToken({ roles: ['admin'] }))
-    expect(await screen.findByRole('heading', { name: /cache administration/i })).toBeInTheDocument()
+    // The admin page covers audit search as well as cache management.
+    expect(await screen.findByRole('heading', { name: /administration/i })).toBeInTheDocument()
   })
 
   it('denies decision support to a viewer', async () => {

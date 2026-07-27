@@ -319,7 +319,11 @@ class TestLiveStackHealth:
     def test_gateway_ready_hits_real_postgres(self, live_stack):
         code, _, body = _http("GET", f"{live_stack['gateway']}/ready")
         assert code == 200
-        assert body == {"status": "ok", "cache": "ok"}
+        assert body["status"] == "ok"
+        assert body["cache"] == "ok"
+        # Readiness also reports audit rows that never reached the index.
+        # Zero here means the trail on stdout is fully mirrored.
+        assert body["audit_dropped"] == 0
 
     def test_patient_flow_ready_with_mongomock(self, live_stack):
         code, _, body = _http("GET", f"{live_stack['flow']}/ready")

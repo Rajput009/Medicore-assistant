@@ -7,12 +7,15 @@ Postgres-backed response cache.
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 
+from backend.common import audit_store
 from backend.common.app import create_service_app
+from backend.common.audit_store import search as audit_search_events
 from backend.common.cache import (
     close_pool,
     get_cached,
@@ -37,6 +40,7 @@ from backend.common.idempotency import (
 from backend.common.idempotency import (
     store as idem_store,
 )
+from backend.common.middleware import audit_reference
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
 from backend.services.gateway.observations import (
@@ -82,8 +86,22 @@ async def lifespan(app: FastAPI):
             extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
         )
     try:
+        # The audit index is optional: search degrades without it, but the
+        # audit stream on stdout - the system of record - is unaffected.
+        await audit_store.start_writer()
+    except Exception as exc:
+        logger.warning(
+            "audit index unavailable; audit search disabled",
+            extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+        )
+
+    try:
         yield
     finally:
+        # Drain buffered audit rows before the pool closes, or a graceful
+        # shutdown silently discards the last few seconds of the trail.
+        await audit_store.stop_writer()
+        await audit_store.close_pool()
         await stop_janitor()
         await fhir.aclose()
         await close_pool()
@@ -119,13 +137,17 @@ def health() -> Health:
 @app.get("/ready", tags=["ops"])
 async def ready(response: Response) -> dict[str, Any]:
     """Readiness: verifies the cache database before accepting traffic."""
+    # A non-zero count means audit events exist only on stdout. That is a
+    # compliance signal, so it is surfaced rather than left to be discovered
+    # during an investigation.
+    dropped = audit_store.dropped_events()
     try:
         await cache_ping()
     except Exception:
         logger.warning("readiness check failed", exc_info=True)
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "degraded", "cache": "unavailable"}
-    return {"status": "ok", "cache": "ok"}
+        return {"status": "degraded", "cache": "unavailable", "audit_dropped": dropped}
+    return {"status": "ok", "cache": "ok", "audit_dropped": dropped}
 
 
 @app.get("/secure")
@@ -510,6 +532,71 @@ async def create_observations(
     if idem_key:
         idem_store(user.sub, route, idem_key, 201, body)
     return body
+
+
+# --------------------------------------------------------------------------
+# Admin: audit search
+#
+# "Who viewed MRN-X?" is the question HIPAA 164.312(b) exists to answer, and
+# until now it could only be answered by grepping a log stream. The caller
+# supplies a raw MRN; it is pseudonymised here with the same salt the audit
+# middleware used, so the stored index never has to hold a raw identifier for
+# the lookup to work.
+# --------------------------------------------------------------------------
+
+
+@app.get("/audit/search", tags=["admin"])
+async def audit_search(
+    user: User = Depends(admin_only),
+    patient: str | None = Query(default=None, max_length=64),
+    actor: str | None = Query(default=None, max_length=128),
+    resource_type: str | None = Query(default=None, max_length=64),
+    outcome: str | None = Query(default=None, max_length=16),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Search the audit trail. Admin only.
+
+    Reading the audit trail is itself an audited event — the middleware records
+    this request like any other, so "who went looking through the audit log?"
+    stays answerable too.
+    """
+    if outcome is not None and outcome not in ("success", "failure", "denied", "error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="outcome must be one of: success, failure, denied, error",
+        )
+
+    patient_ref = audit_reference(patient) if patient else None
+
+    try:
+        rows, total = await audit_search_events(
+            patient_ref=patient_ref,
+            actor_sub=actor,
+            resource_type=resource_type,
+            outcome=outcome,
+            since=since,
+            until=until,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        logger.error("audit search failed", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Audit index temporarily unavailable",
+        ) from exc
+
+    return {
+        "items": rows,
+        "count": len(rows),
+        "total": total,
+        # Echoed so the caller can confirm which patient was searched without
+        # the response having to repeat the raw MRN back.
+        "patient_ref": patient_ref,
+    }
 
 
 # --------------------------------------------------------------------------

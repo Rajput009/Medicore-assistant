@@ -358,3 +358,21 @@ all three lists is an entry that silently does not render:
 
 Resolved and inactive entries are collapsed rather than discarded, since a
 cleared allergy is still clinical history.
+
+**Audit search.** `GET /audit/search` (admin only) answers "who viewed MRN-X?"
+without grepping a log stream. `AuditLogMiddleware` mirrors every request into
+an `audit_events` table in Postgres alongside the stdout record.
+
+The stdout stream stays the system of record and the table is an index over
+it. Indexing is buffered and best-effort: a database outage degrades *search*,
+never a clinical request. Events that cannot be buffered are counted and
+reported as `audit_dropped` on `/ready`, so an audit gap is an operational
+signal rather than a discovery made during an investigation.
+
+Patient identifiers remain pseudonymised in the index. Search hashes its input
+with the same salt the middleware used, via the shared `audit_reference()` —
+keeping both paths on one function is what stops a lookup from silently
+matching nothing. Retention is separate from the FHIR cache janitor
+(`purge_older_than(days)`): cached PHI should expire in hours, but an access
+log is typically kept for six years (HIPAA 164.316(b)(2)), and sharing a sweep
+would quietly shred the trail. Searching the audit trail is itself audited.

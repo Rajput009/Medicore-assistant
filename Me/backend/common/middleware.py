@@ -25,6 +25,7 @@ import logging
 import re
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -64,6 +65,22 @@ def pseudonymise(value: str, salt: str) -> str:
     return f"sha256:{digest[:32]}"
 
 
+def audit_reference(raw: str) -> str:
+    """Transform an identifier the way the audit trail stores it.
+
+    Search must apply exactly the same transform the middleware applied when
+    writing, or a lookup by MRN silently matches nothing. Keeping both paths on
+    this one function is what guarantees that.
+    """
+    settings = _load_settings()
+    if settings is not None and getattr(settings, "audit_log_raw_identifiers", False):
+        return raw
+    salt = getattr(settings, "audit_log_salt", "") or getattr(
+        settings, "jwt_secret", "medicore"
+    )
+    return pseudonymise(raw, salt)
+
+
 class AuditLogMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, service: str | None = None):
         super().__init__(app)
@@ -72,13 +89,7 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
     def _reference(self, raw: str | None) -> str | None:
         if not raw:
             return None
-        settings = _load_settings()
-        if settings is not None and getattr(settings, "audit_log_raw_identifiers", False):
-            return raw
-        salt = getattr(settings, "audit_log_salt", "") or getattr(
-            settings, "jwt_secret", "medicore"
-        )
-        return pseudonymise(raw, salt)
+        return audit_reference(raw)
 
     def _describe_target(self, request: Request) -> dict[str, Any]:
         """Identify the clinical record a request touches, for the audit trail."""
@@ -174,6 +185,38 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         response.headers["x-request-id"] = request_id
         return response
 
+    @staticmethod
+    def _index(record: dict[str, Any]) -> None:
+        """Mirror the record into the searchable index, best-effort.
+
+        Wrapped in a broad except on purpose: the audit index is an
+        investigative convenience, and no failure in it may ever propagate into
+        a clinical request. The stdout record is written either way.
+        """
+        try:
+            from . import audit_store
+
+            audit_store.enqueue(
+                {
+                    "occurred_at": datetime.now(UTC),
+                    "request_id": record.get("request_id"),
+                    "service": record.get("service"),
+                    "method": record.get("method"),
+                    "path": record.get("path"),
+                    "status": record.get("status"),
+                    "outcome": record.get("outcome"),
+                    "actor_sub": record.get("sub"),
+                    "actor_roles": record.get("roles") or [],
+                    "resource_type": record.get("resource_type"),
+                    "resource_ref": record.get("resource_ref"),
+                    "patient_ref": record.get("patient_ref"),
+                    "client_ip": record.get("client_ip"),
+                    "duration_ms": record.get("duration_ms"),
+                }
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     def _emit(self, request: Request, record: dict[str, Any], level: int = logging.INFO) -> None:
         user = getattr(request.state, "user", None)
         if isinstance(user, dict):
@@ -193,6 +236,8 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
             level = max(level, logging.WARNING)
 
         logger.log(level, json.dumps(record, default=str))
+        # Index after logging: stdout is the system of record.
+        self._index(record)
 
 
 def redact_phi_loggers() -> None:

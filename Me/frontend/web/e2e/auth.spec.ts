@@ -128,6 +128,6 @@ test.describe('role-based access', () => {
   test('an admin can reach every page', async ({ stubbedPage: page }) => {
     await signIn(page, ['admin'])
     await page.goto('/admin')
-    await expect(page.getByRole('heading', { name: /cache administration/i })).toBeVisible()
+    await expect(page.getByRole('heading', { name: /^administration$/i })).toBeVisible()
   })
 })

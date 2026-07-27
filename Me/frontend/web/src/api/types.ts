@@ -158,6 +158,40 @@ export const FHIR_ROUTE: Record<FhirResourceType, string> = {
   Condition: 'condition',
 }
 
+/** One row of the audit trail. Patient references stay pseudonymised. */
+export type AuditEvent = {
+  occurred_at: string
+  request_id?: string | null
+  service?: string | null
+  method?: string | null
+  path?: string | null
+  status?: number | null
+  outcome?: string | null
+  actor_sub?: string | null
+  actor_roles?: string[] | null
+  resource_type?: string | null
+  resource_ref?: string | null
+  patient_ref?: string | null
+  client_ip?: string | null
+  duration_ms?: number | null
+}
+
+export type AuditSearchResponse = {
+  items: AuditEvent[]
+  count: number
+  total: number
+  /** The pseudonymised form of the searched patient id, echoed back. */
+  patient_ref: string | null
+}
+
+export type AuditSearchParams = {
+  patient?: string
+  actor?: string
+  outcome?: string
+  since?: string
+  limit?: number
+}
+
 export type Role = 'admin' | 'clinician' | 'viewer'
 
 export type AuthUser = {

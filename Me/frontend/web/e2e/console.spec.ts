@@ -150,6 +150,23 @@ test.describe('decision support', () => {
   })
 })
 
+test.describe('audit trail search', () => {
+  test('answers "who viewed this patient?"', async ({ stubbedPage: page }) => {
+    await page.goto('/admin')
+    await page.getByLabel(/patient id \/ MRN/i).fill('MRN-000123')
+    await page.getByRole('button', { name: /search audit trail/i }).click()
+    await expect(page.getByText('dr.smith')).toBeVisible()
+  })
+
+  test('never sends the raw MRN into the results table', async ({ stubbedPage: page }) => {
+    await page.goto('/admin')
+    await page.getByLabel(/patient id \/ MRN/i).fill('MRN-000123')
+    await page.getByRole('button', { name: /search audit trail/i }).click()
+    await expect(page.getByRole('table')).toBeVisible()
+    await expect(page.getByRole('table')).not.toContainText('MRN-000123')
+  })
+})
+
 test.describe('cache administration', () => {
   test('requires confirmation before clearing', async ({ stubbedPage: page }) => {
     await page.goto('/admin')

@@ -8,6 +8,8 @@
  */
 
 import type {
+  AuditSearchParams,
+  AuditSearchResponse,
   Bed,
   BedUpdate,
   CacheInvalidationResponse,
@@ -281,6 +283,18 @@ export const api = {
       `${BASE.gateway}/fhir/${FHIR_ROUTE[resource]}/${encodeURIComponent(id)}`,
       { signal },
     )
+  },
+
+  /** Search the audit trail (admin only). */
+  auditSearch(
+    params: AuditSearchParams,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AuditSearchResponse> {
+    return request<AuditSearchResponse>(`${BASE.gateway}/audit/search`, {
+      params: { ...params },
+      signal,
+    })
   },
 
   invalidateCache(

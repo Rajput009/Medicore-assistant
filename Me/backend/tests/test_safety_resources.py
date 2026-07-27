@@ -9,6 +9,7 @@ harms someone.
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 import pytest
@@ -43,8 +44,20 @@ def gateway(monkeypatch):
         yield client, calls
 
 
+_ip_counter = itertools.count(1)
+
+
+_ip_counter = itertools.count(1)
+
+
 def auth(*roles: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {create_access_token('u1', roles=list(roles))}"}
+    # Unique source IP per call. The in-process rate limiter buckets by client
+    # IP and every TestClient request otherwise reports the same host, so a
+    # module's requests would share (and exhaust) one budget in a full run.
+    return {
+        "Authorization": f"Bearer {create_access_token('u1', roles=list(roles))}",
+        "X-Forwarded-For": f"203.0.113.{next(_ip_counter) % 250 + 1}",
+    }
 
 
 class TestAllergyRoutes:

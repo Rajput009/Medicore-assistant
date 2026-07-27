@@ -5,6 +5,7 @@ import type { CacheInvalidationResponse, FhirResourceType } from '../api/types'
 import { FHIR_RESOURCES } from '../api/types'
 import { useAsyncAction } from '../hooks/useAsync'
 import { Alert, Card, Field, Spinner } from '../ui/components'
+import { AuditSearchPanel } from './AuditSearchPanel'
 
 export const AdminPage: React.FC = () => {
   const [resource, setResource] = useState<FhirResourceType>('Patient')
@@ -28,9 +29,11 @@ export const AdminPage: React.FC = () => {
   return (
     <>
       <header className="page-header">
-        <h1>Cache administration</h1>
-        <p>Flush cached FHIR responses. Requires the admin role.</p>
+        <h1>Administration</h1>
+        <p>Audit trail search and FHIR cache management. Requires the admin role.</p>
       </header>
+
+      <AuditSearchPanel />
 
       <Card title="Invalidate cache">
         <form
