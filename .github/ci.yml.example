@@ -52,13 +52,50 @@ jobs:
         working-directory: Me/frontend/web
         run: npm install --no-audit --no-fund
 
-      - name: Typecheck
+      - name: Typecheck (app)
         working-directory: Me/frontend/web
         run: npx tsc --noEmit
+
+      - name: Typecheck (e2e specs)
+        working-directory: Me/frontend/web
+        run: npx tsc --noEmit -p tsconfig.e2e.json
+
+      - name: Unit + integration tests
+        working-directory: Me/frontend/web
+        run: npm run test:coverage
 
       - name: Build
         working-directory: Me/frontend/web
         run: npm run build
+
+  e2e:
+    name: Browser end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install
+        working-directory: Me/frontend/web
+        run: npm install --no-audit --no-fund
+
+      - name: Install Playwright browsers
+        working-directory: Me/frontend/web
+        run: npx playwright install --with-deps chromium firefox
+
+      - name: Run end-to-end tests
+        working-directory: Me/frontend/web
+        run: npx playwright test --project=chromium --project=firefox
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: Me/frontend/web/playwright-report/
+          retention-days: 7
 
   compose:
     name: Validate docker-compose

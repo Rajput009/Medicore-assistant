@@ -40,8 +40,32 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/fhir/observation/s
 ### Run tests locally
 
 ```bash
-make test     # pytest backend/tests
-make lint     # ruff + tsc --noEmit
+make test      # backend unit + e2e (pytest)
+make test-web  # frontend unit + integration (vitest)
+make test-e2e  # browser end-to-end (playwright)
+make lint      # ruff + tsc --noEmit
+```
+
+| Suite | Location | Count | Runner |
+| ----- | -------- | ----- | ------ |
+| Backend unit/regression | `backend/tests/test_*.py` | 37 | pytest |
+| Backend end-to-end | `backend/tests/test_e2e_api.py` | 43 | pytest |
+| Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
+| Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
+
+Browser e2e requires `npx playwright install` once to download browsers.
+
+## Web console
+
+The clinician/admin console is a React + TypeScript SPA. It exposes the FHIR
+explorer, bed and triage management, risk scoring and cache administration,
+with role-aware navigation and route guards.
+
+See **[frontend/web/README.md](frontend/web/README.md)** for architecture,
+configuration, the testing strategy and troubleshooting.
+
+```bash
+cd frontend/web && npm install && npm run dev   # http://localhost:5173
 ```
 
 ## Structure
@@ -55,7 +79,7 @@ backend/                 # FastAPI microservices
     cds/                 # clinical decision support stubs
   common/                # shared code: auth, fhir utils, schemas
 frontend/
-  web/                   # React + Vite + TS Admin/Clinician UI
+  web/                   # React + Vite + TS Admin/Clinician UI (see frontend/web/README.md)
 deploy/
   docker/                # docker-compose for local dev
   k8s/                   # production k8s manifests (base overlays)

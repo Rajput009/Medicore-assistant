@@ -30,3 +30,7 @@ dist/
 *.tfstate
 *.tfstate.*
 *.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+.playwright/

@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/docker/docker-compose.yml
 
-.PHONY: help up down logs fmt lint test build docker clean
+.PHONY: help up down logs fmt lint test test-web test-e2e test-all build docker clean
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -26,8 +26,16 @@ lint: ## Lint Python and web sources
 	python -m ruff check backend
 	cd frontend/web && npx tsc --noEmit
 
-test: ## Run the backend test suite
+test: ## Run the backend test suite (unit + e2e)
 	python -m pytest backend/tests -q
+
+test-web: ## Run frontend unit + integration tests
+	cd frontend/web && npm test
+
+test-e2e: ## Run browser end-to-end tests (needs: npx playwright install)
+	cd frontend/web && npm run test:e2e
+
+test-all: test test-web ## Run every suite that needs no browser download
 
 build: ## Build all container images
 	$(COMPOSE) build
