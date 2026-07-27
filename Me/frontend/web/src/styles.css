@@ -733,3 +733,19 @@ pre.json {
   background: var(--primary);
   min-width: 4px;
 }
+
+/* ---- SBAR handoff ---- */
+.handoff-textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: inherit;
+  box-sizing: border-box;
+}

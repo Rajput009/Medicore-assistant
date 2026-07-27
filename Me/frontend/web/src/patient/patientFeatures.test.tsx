@@ -291,6 +291,68 @@ describe('Worklist actions (API wiring)', () => {
   })
 })
 
+describe('handoffNotes', () => {
+  it('saves and loads SBAR drafts per patient', async () => {
+    const { saveHandoff, loadHandoff, clearHandoff, sbarTemplate } = await import(
+      './handoffNotes'
+    )
+    clearHandoff('P1')
+    const tpl = sbarTemplate('P1')
+    expect(tpl).toMatch(/Situation/)
+    saveHandoff('P1', 'S — chest pain\nR — admit', 'dr.a', 100)
+    const loaded = loadHandoff('P1')
+    expect(loaded?.text).toContain('chest pain')
+    expect(loaded?.author).toBe('dr.a')
+    clearHandoff('P1')
+    expect(loadHandoff('P1')).toBeNull()
+  })
+})
+
+describe('Idempotency-Key on writes', () => {
+  it('sends Idempotency-Key on enqueue and claim', async () => {
+    const seen: Record<string, string | null> = {}
+    server.use(
+      http.post('/flow/queue', ({ request }) => {
+        if (new URL(request.url).pathname.includes('/claim')) {
+          return new HttpResponse(null, { status: 405 })
+        }
+        seen.enqueue = request.headers.get('idempotency-key')
+        return HttpResponse.json({ ok: true, id: 'p' }, { status: 201 })
+      }),
+      http.post(/\/flow\/queue\/claim/, ({ request }) => {
+        seen.claim = request.headers.get('idempotency-key')
+        return HttpResponse.json({
+          ok: true,
+          item: { patient_id: 'c1', acuity: 1, dept: 'ED', status: 'in_progress' },
+        })
+      }),
+      http.patch(/\/flow\/beds\//, ({ request }) => {
+        seen.bed = request.headers.get('idempotency-key')
+        return HttpResponse.json({
+          bed_id: 'A-001',
+          ward: 'A',
+          occupied: true,
+          patient_id: 'p',
+        })
+      }),
+    )
+    document.cookie = 'medicore_session=test-session; path=/'
+    const { api } = await import('../api/client')
+    await api.enqueue({ patient_id: 'p', acuity: 3, dept: 'ED' }, null, undefined, 'key-enq-1')
+    await api.claimNext('ED', null, undefined, 'key-claim-1')
+    await api.setBedOccupancy(
+      'A-001',
+      { occupied: true, patient_id: 'p', expected_occupied: false },
+      null,
+      undefined,
+      'key-bed-1',
+    )
+    expect(seen.enqueue).toBe('key-enq-1')
+    expect(seen.claim).toBe('key-claim-1')
+    expect(seen.bed).toBe('key-bed-1')
+  })
+})
+
 describe('CdsPage escalate', () => {
   it('enqueues the patient after a high-risk score', async () => {
     const user = userEvent.setup()

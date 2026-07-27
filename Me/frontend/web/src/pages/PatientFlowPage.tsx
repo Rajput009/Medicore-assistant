@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 
 import { api } from '../api/client'
-import type { Bed, QueueListResponse } from '../api/types'
+import type { Bed, QueueItem, QueueListResponse } from '../api/types'
 import { useAsyncAction, useAsyncData } from '../hooks/useAsync'
 import { PatientLink } from '../patient/PatientChartDrawer'
 import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
@@ -23,8 +23,6 @@ const BedsCard: React.FC = () => {
       {
         occupied: !bed.occupied,
         patient_id: bed.occupied ? null : patientId,
-        // Conditional write: fail loudly if another clinician changed the bed
-        // first instead of silently overwriting their assignment.
         expected_occupied: bed.occupied,
       },
       null,
@@ -91,11 +89,7 @@ const BedsCard: React.FC = () => {
                         </Badge>
                       </td>
                       <td className="mono">
-                        {bed.patient_id ? (
-                          <PatientLink id={bed.patient_id} />
-                        ) : (
-                          '—'
-                        )}
+                        {bed.patient_id ? <PatientLink id={bed.patient_id} /> : '—'}
                       </td>
                       <td>
                         <button
@@ -118,30 +112,57 @@ const BedsCard: React.FC = () => {
 }
 
 const QueueCard: React.FC = () => {
-  const [dept, setDept] = useState('')
-  const [limit, setLimit] = useState(10)
+  const [dept, setDept] = useState('ED')
+  const [limit, setLimit] = useState(25)
+  const [actionMsg, setActionMsg] = useState<string | null>(null)
   const list = useAsyncAction<[number, string | null], QueueListResponse>((signal, l, d) =>
     api.listQueue(l, d, null, signal),
   )
+  const claim = useAsyncAction<[string], { ok: boolean; item: QueueItem }>((signal, d) =>
+    api.claimNext(d, null, signal),
+  )
+  const complete = useAsyncAction<[string], { ok: boolean; item: QueueItem }>((signal, pid) =>
+    api.completeQueue(pid, null, signal),
+  )
 
-  // Load once on mount, then on demand.
   React.useEffect(() => {
     void list.run(limit, dept.trim() || null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const refresh = () => void list.run(limit, dept.trim() || null)
+
+  const onClaim = async () => {
+    setActionMsg(null)
+    const d = dept.trim() || 'ED'
+    const res = await claim.run(d)
+    if (res) {
+      setActionMsg(`Claimed ${res.item.patient_id} in ${d}.`)
+      refresh()
+    }
+  }
+
+  const onComplete = async (patientId: string) => {
+    setActionMsg(null)
+    const res = await complete.run(patientId)
+    if (res) {
+      setActionMsg(`Completed ${patientId}.`)
+      refresh()
+    }
+  }
+
   const items = list.state.status === 'success' ? list.state.data.items : []
   const total = list.state.status === 'success' ? list.state.data.total : 0
+  const busy =
+    list.state.status === 'loading' ||
+    claim.state.status === 'loading' ||
+    complete.state.status === 'loading'
 
   return (
     <Card
       title="Triage queue"
       actions={
-        <button
-          type="button"
-          className="ghost"
-          onClick={() => void list.run(limit, dept.trim() || null)}
-        >
+        <button type="button" className="ghost" onClick={refresh} disabled={busy}>
           Refresh
         </button>
       }
@@ -150,7 +171,7 @@ const QueueCard: React.FC = () => {
         className="row"
         onSubmit={(e) => {
           e.preventDefault()
-          void list.run(limit, dept.trim() || null)
+          refresh()
         }}
       >
         <Field id="queue-dept" label="Department">
@@ -159,7 +180,7 @@ const QueueCard: React.FC = () => {
               {...props}
               value={dept}
               onChange={(e) => setDept(e.target.value)}
-              placeholder="All departments"
+              placeholder="ED"
             />
           )}
         </Field>
@@ -175,10 +196,37 @@ const QueueCard: React.FC = () => {
             />
           )}
         </Field>
-        <button type="submit" disabled={list.state.status === 'loading'}>
+        <button type="submit" disabled={busy}>
           Apply
         </button>
+        <button
+          type="button"
+          className="primary"
+          disabled={busy || !dept.trim()}
+          onClick={() => void onClaim()}
+        >
+          {claim.state.status === 'loading' ? (
+            <>
+              <Spinner label="Claiming" /> Claiming…
+            </>
+          ) : (
+            'Claim next'
+          )}
+        </button>
       </form>
+
+      {(claim.state.status === 'error' || complete.state.status === 'error') && (
+        <div style={{ marginTop: 10 }}>
+          <Alert kind="error">
+            {claim.state.status === 'error' ? claim.state.error : complete.state.error}
+          </Alert>
+        </div>
+      )}
+      {actionMsg && (
+        <div style={{ marginTop: 10 }}>
+          <Alert kind="success">{actionMsg}</Alert>
+        </div>
+      )}
 
       <div style={{ marginTop: 12 }}>
         {list.state.status === 'loading' && <SkeletonRows rows={3} />}
@@ -189,7 +237,7 @@ const QueueCard: React.FC = () => {
           ) : (
             <div className="table-wrap">
               <p className="muted" style={{ marginTop: 0 }}>
-                Showing {items.length} of {total} waiting
+                Showing {items.length} of {total}
               </p>
               <table>
                 <caption className="visually-hidden">Triage queue, most urgent first</caption>
@@ -198,6 +246,10 @@ const QueueCard: React.FC = () => {
                     <th scope="col">Patient</th>
                     <th scope="col">Acuity</th>
                     <th scope="col">Department</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">
+                      <span className="visually-hidden">Actions</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -210,6 +262,20 @@ const QueueCard: React.FC = () => {
                         <Badge tone={acuityTone(item.acuity)}>ESI {item.acuity}</Badge>
                       </td>
                       <td>{item.dept}</td>
+                      <td className="muted">{item.status ?? 'waiting'}</td>
+                      <td>
+                        {item.status === 'in_progress' || item.claimed_by ? (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void onComplete(item.patient_id)}
+                          >
+                            Complete
+                          </button>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -224,11 +290,10 @@ const QueueCard: React.FC = () => {
 const EnqueueCard: React.FC = () => {
   const [patientId, setPatientId] = useState('')
   const [acuity, setAcuity] = useState(3)
-  const [dept, setDept] = useState('')
+  const [dept, setDept] = useState('ED')
   const [errors, setErrors] = useState<Record<string, string>>({})
   const enqueue = useAsyncAction<[string, number, string], { ok: boolean; id: string }>(
-    (signal, pid, ac, d) =>
-      api.enqueue({ patient_id: pid, acuity: ac, dept: d }, null, signal),
+    (signal, pid, ac, d) => api.enqueue({ patient_id: pid, acuity: ac, dept: d }, null, signal),
   )
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -245,7 +310,7 @@ const EnqueueCard: React.FC = () => {
     const res = await enqueue.run(patientId.trim(), acuity, dept.trim())
     if (res) {
       setPatientId('')
-      setDept('')
+      setDept('ED')
       setAcuity(3)
     }
   }
@@ -313,7 +378,7 @@ export const PatientFlowPage: React.FC = () => (
   <>
     <header className="page-header">
       <h1>Patient flow</h1>
-      <p>Bed occupancy and emergency department triage queue.</p>
+      <p>Bed occupancy and emergency department triage — claim, complete, assign.</p>
     </header>
     <BedsCard />
     <QueueCard />

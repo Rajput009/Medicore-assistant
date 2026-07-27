@@ -11,9 +11,16 @@ import { Link } from 'react-router-dom'
 
 import { api } from '../api/client'
 import type { Bed, FhirResource, QueueItem, QueueListResponse } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
 import { summariseResource } from '../pages/FhirPage'
 import { Alert, Badge, Spinner } from '../ui/components'
 import { usePatientChart } from './PatientChartContext'
+import {
+  clearHandoff,
+  loadHandoff,
+  saveHandoff,
+  sbarTemplate,
+} from './handoffNotes'
 import {
   barWidthPercent,
   extractObservationPoints,
@@ -35,16 +42,25 @@ function patientLabel(p: FhirResource | null, fallbackId: string): string {
 
 export const PatientChartDrawer: React.FC = () => {
   const { patientId, closePatient } = usePatientChart()
+  const { user } = useAuth()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<ChartData | null>(null)
+  const [handoffText, setHandoffText] = useState('')
+  const [handoffSaved, setHandoffSaved] = useState<string | null>(null)
 
   useEffect(() => {
     if (!patientId) {
       setData(null)
       setError(null)
+      setHandoffText('')
+      setHandoffSaved(null)
       return
     }
+    const existing = loadHandoff(patientId)
+    setHandoffText(existing?.text ?? sbarTemplate(patientId))
+    setHandoffSaved(null)
+
     const ac = new AbortController()
     setLoading(true)
     setError(null)
@@ -274,6 +290,63 @@ export const PatientChartDrawer: React.FC = () => {
                       </li>
                     ))}
                   </ul>
+                )}
+              </section>
+
+              <section className="chart-section">
+                <h3>Handoff note (SBAR)</h3>
+                <p className="muted" style={{ marginTop: 0, fontSize: '0.8rem' }}>
+                  Draft only — not saved to the EHR. Stored in this browser tab.
+                </p>
+                <textarea
+                  className="handoff-textarea"
+                  aria-label="SBAR handoff note"
+                  rows={8}
+                  value={handoffText}
+                  onChange={(e) => {
+                    setHandoffText(e.target.value)
+                    setHandoffSaved(null)
+                  }}
+                />
+                <div className="row" style={{ gap: 8, marginTop: 8 }}>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => {
+                      if (!patientId) return
+                      saveHandoff(patientId, handoffText, user?.sub)
+                      setHandoffSaved('Saved in this tab.')
+                    }}
+                  >
+                    Save draft
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!patientId) return
+                      setHandoffText(sbarTemplate(patientId))
+                      setHandoffSaved(null)
+                    }}
+                  >
+                    Reset template
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => {
+                      if (!patientId) return
+                      clearHandoff(patientId)
+                      setHandoffText(sbarTemplate(patientId))
+                      setHandoffSaved('Cleared.')
+                    }}
+                  >
+                    Clear
+                  </button>
+                </div>
+                {handoffSaved && (
+                  <div style={{ marginTop: 8 }}>
+                    <Alert kind="success">{handoffSaved}</Alert>
+                  </div>
                 )}
               </section>
 

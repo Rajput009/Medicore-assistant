@@ -85,6 +85,8 @@ type RequestOptions = {
   body?: unknown
   params?: Record<string, string | number | boolean | undefined | null>
   signal?: AbortSignal
+  /** Optional Idempotency-Key for safe retries on unsafe methods. */
+  idempotencyKey?: string
 }
 
 /** Builds a query string, dropping empty/undefined values. */
@@ -143,8 +145,15 @@ function readCookie(name: string): string | null {
 
 const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
+export function newIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `idem-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
 export async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', token, body, params, signal } = options
+  const { method = 'GET', token, body, params, signal, idempotencyKey } = options
 
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (token) headers.Authorization = `Bearer ${token}`
@@ -154,6 +163,7 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
   if (UNSAFE.has(method.toUpperCase())) {
     const csrf = readCookie('medicore_csrf')
     if (csrf) headers['X-CSRF-Token'] = csrf
+    if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
   }
 
   let res: Response
@@ -291,11 +301,13 @@ export const api = {
     update: BedUpdate,
     _token?: string | null,
     signal?: AbortSignal,
+    idempotencyKey?: string,
   ): Promise<Bed> {
     return request<Bed>(`${BASE.patientFlow}/beds/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       body: update,
       signal,
+      idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
     })
   },
 
@@ -315,11 +327,13 @@ export const api = {
     item: QueueItem,
     _token?: string | null,
     signal?: AbortSignal,
+    idempotencyKey?: string,
   ): Promise<{ ok: boolean; id: string }> {
     return request<{ ok: boolean; id: string }>(`${BASE.patientFlow}/queue`, {
       method: 'POST',
       body: item,
       signal,
+      idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
     })
   },
 
@@ -328,11 +342,13 @@ export const api = {
     dept: string,
     _token?: string | null,
     signal?: AbortSignal,
+    idempotencyKey?: string,
   ): Promise<{ ok: boolean; item: QueueItem }> {
     return request<{ ok: boolean; item: QueueItem }>(`${BASE.patientFlow}/queue/claim`, {
       method: 'POST',
       params: { dept },
       signal,
+      idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
     })
   },
 
