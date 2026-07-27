@@ -80,10 +80,10 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Fixed-window-per-caller rate limiting.
 
-    In-process, so with N replicas the effective ceiling is N x limit. That is
-    acceptable for its purpose here - blunting credential stuffing and runaway
-    clients - but a shared Redis limiter is required if you need an exact
-    global budget. Documented rather than silently assumed.
+    Prefers Redis when available so N replicas share one global budget. Falls
+    back to an in-process deque when Redis is down or disabled — that weakens
+    the ceiling to N x limit, which is still enough to blunt credential
+    stuffing, and is the only option in unit tests without a Redis broker.
     """
 
     def __init__(
@@ -93,12 +93,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         window_seconds: int = 60,
         exempt_paths: tuple[str, ...] = ("/health", "/ready", "/metrics"),
         key_func: Callable[[Request], str] | None = None,
+        redis_prefix: str = "medicore:rl:",
     ):
         super().__init__(app)
         self.limit = limit
         self.window = window_seconds
         self.exempt_paths = exempt_paths
         self.key_func = key_func or self._default_key
+        self.redis_prefix = redis_prefix
         self._hits: dict[str, deque[float]] = {}
         self._last_sweep = time.monotonic()
 
@@ -109,6 +111,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         user = getattr(request.state, "user", None)
         if isinstance(user, dict) and user.get("sub"):
             return f"sub:{user['sub']}"
+        # Cookie-authenticated sessions (auth service) expose principal the
+        # same way once JWT middleware has run; fall back to IP otherwise.
+        principal = getattr(request.state, "principal", None)
+        if principal is not None and getattr(principal, "sub", None):
+            return f"sub:{principal.sub}"
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
             return f"ip:{forwarded.split(',')[0].strip()}"
@@ -123,21 +130,57 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             self._hits.pop(key, None)
         self._last_sweep = now
 
-    async def dispatch(self, request: Request, call_next) -> Response:
-        if request.url.path in self.exempt_paths:
-            return await call_next(request)
+    def _hit_redis(self, key: str) -> tuple[bool, int, int] | None:
+        """Return (allowed, remaining, retry_after) via Redis, or None on miss."""
+        try:
+            from backend.common.redis_client import get_redis
+        except Exception:
+            return None
+        client = get_redis()
+        if client is None:
+            return None
+        redis_key = f"{self.redis_prefix}{key}"
+        try:
+            # Atomic INCR + EXPIRE on first hit. Fixed window starting at first
+            # request in the window — simpler and good enough for abuse blunt.
+            pipe = client.pipeline()
+            pipe.incr(redis_key)
+            pipe.ttl(redis_key)
+            count, ttl = pipe.execute()
+            if ttl == -1 or (count == 1 and ttl < 0):
+                client.expire(redis_key, self.window)
+                ttl = self.window
+            if count > self.limit:
+                return False, 0, max(1, int(ttl) if ttl and ttl > 0 else self.window)
+            return True, max(0, self.limit - int(count)), max(1, int(ttl) if ttl and ttl > 0 else self.window)
+        except Exception:
+            return None
 
+    def _hit_local(self, key: str) -> tuple[bool, int, int]:
         now = time.monotonic()
         self._sweep(now)
-
-        key = self.key_func(request)
         bucket = self._hits.setdefault(key, deque())
         cutoff = now - self.window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
-
         if len(bucket) >= self.limit:
             retry_after = max(1, int(self.window - (now - bucket[0])))
+            return False, 0, retry_after
+        bucket.append(now)
+        return True, max(0, self.limit - len(bucket)), self.window
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        if request.url.path in self.exempt_paths:
+            return await call_next(request)
+
+        key = self.key_func(request)
+        result = self._hit_redis(key)
+        if result is None:
+            allowed, remaining, retry_after = self._hit_local(key)
+        else:
+            allowed, remaining, retry_after = result
+
+        if not allowed:
             return JSONResponse(
                 {"detail": "Rate limit exceeded"},
                 status_code=429,
@@ -148,10 +191,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        bucket.append(now)
         response = await call_next(request)
         response.headers.setdefault("X-RateLimit-Limit", str(self.limit))
-        response.headers.setdefault(
-            "X-RateLimit-Remaining", str(max(0, self.limit - len(bucket)))
-        )
+        response.headers.setdefault("X-RateLimit-Remaining", str(remaining))
         return response

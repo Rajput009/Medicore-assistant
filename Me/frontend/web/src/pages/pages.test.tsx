@@ -328,9 +328,9 @@ describe('PatientFlowPage', () => {
 
   it('validates the enqueue form client-side', async () => {
     const { user } = renderWithProviders(<PatientFlowPage />, { token: makeToken() })
+    // Department defaults to ED; only patient id is empty.
     await user.click(await screen.findByRole('button', { name: /add to queue/i }))
     expect(await screen.findByText('Patient id is required.')).toBeInTheDocument()
-    expect(screen.getByText('Department is required.')).toBeInTheDocument()
   })
 
   it('submits a valid enqueue and clears the form', async () => {
@@ -344,7 +344,9 @@ describe('PatientFlowPage', () => {
     const { user } = renderWithProviders(<PatientFlowPage />, { token: makeToken() })
     await user.type(await screen.findByLabelText(/patient id/i), 'pat-99')
     await user.selectOptions(screen.getByLabelText(/acuity/i), '2')
-    await user.type(screen.getByLabelText(/department/i, { selector: '#enqueue-dept' }), 'ICU')
+    const dept = screen.getByLabelText(/department/i, { selector: '#enqueue-dept' })
+    await user.clear(dept)
+    await user.type(dept, 'ICU')
     await user.click(screen.getByRole('button', { name: /add to queue/i }))
 
     await waitFor(() =>

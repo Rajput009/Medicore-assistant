@@ -28,6 +28,12 @@ PROD = {
     "session_secret": "t" * 40,
     "postgres_password": "p" * 20,
     "fhir_client_secret": "real-secret",
+    "trusted_hosts": "api.hospital.example,localhost",
+    "oidc_issuer": "https://idp.example/realms/medicore",
+    "oidc_client_id": "medicore-console",
+    "oidc_client_secret": "oidc-secret-value-not-a-placeholder",
+    "access_token_ttl_minutes": 15,
+    "enable_demo_login": False,
 }
 
 
@@ -97,6 +103,39 @@ class TestProductionSecretValidation:
             )
         message = str(exc.value)
         assert "JWT_SECRET" in message and "SESSION_SECRET" in message
+
+    def test_missing_trusted_hosts_rejected(self):
+        with pytest.raises(ValueError, match="TRUSTED_HOSTS"):
+            Settings(**{**PROD, "trusted_hosts": ""})
+
+    def test_demo_login_cannot_be_enabled_in_production(self):
+        with pytest.raises(ValueError, match="ENABLE_DEMO_LOGIN"):
+            Settings(**{**PROD, "enable_demo_login": True})
+
+    def test_production_requires_oidc(self):
+        with pytest.raises(ValueError, match="OIDC"):
+            Settings(
+                **{
+                    **PROD,
+                    "oidc_issuer": "",
+                    "oidc_client_id": "",
+                    "oidc_client_secret": "",
+                }
+            )
+
+    def test_access_token_ttl_bounded_in_production(self):
+        with pytest.raises(ValueError, match="ACCESS_TOKEN_TTL"):
+            Settings(**{**PROD, "access_token_ttl_minutes": 24 * 60})
+
+    def test_demo_login_allowed_only_in_local_test(self):
+        assert Settings(env="local").demo_login_allowed is True
+        assert Settings(env="test").demo_login_allowed is True
+        # "dev" is non-production but still requires an explicit opt-in.
+        assert Settings(env="dev", enable_demo_login=False).demo_login_allowed is False
+        assert Settings(env="dev", enable_demo_login=True).demo_login_allowed is True
+        # Production is always False, even if someone tries to force the flag
+        # (the validator also refuses to boot in that case).
+        assert Settings(**PROD).demo_login_allowed is False
 
 
 # ---------------------------------------------------------------------------

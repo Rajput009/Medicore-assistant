@@ -48,10 +48,40 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression | `backend/tests/test_*.py` | 37 | pytest |
-| Backend end-to-end | `backend/tests/test_e2e_api.py` | 43 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 413 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
+
+Backend DB / residual coverage notes:
+
+- **PostgreSQL (real):** `tests/test_cache_postgres.py` boots a genuine PostgreSQL
+  server via the `pgserver` wheel (no Docker) and exercises the FHIR cache DDL,
+  jsonb codec, `ON CONFLICT` upserts, SQL-side TTL, invalidation and janitor.
+- **MongoDB (mock):** `tests/test_repository.py` + residual suite use
+  `mongomock-motor`. **Proven on the mock:** unique partial index on
+  `(patient_id) where status=waiting`, including re-queue after complete.
+  **Not proven:** replica-set behaviour, retryable writes, multi-document
+  transactions (real `mongod` download is TLS-blocked in this environment).
+- **Redis multi-replica:** `tests/test_multi_replica_redis.py` uses one
+  `fakeredis.FakeServer` with two independent clients (two pods, one broker).
+  Proves a shared rate-limit budget and cross-pod revocation visibility, and
+  that the in-process fallback is **not** shared (control).
+- **NetworkPolicy / Ingress / mesh / FQDN:** residual suite asserts default-deny
+  ingress+egress, TLS ingress, path routing, **STRICT** Istio
+  `PeerAuthentication` + ServiceAccount identities (`istio-mtls.yaml`), and
+  Cilium `toFQDNs` allow-lists with no bare `*` (`cilium-egress.yaml`).
+- **Mongo client shape:** ConfigMap URI requires `replicaSet` + `retryWrites`;
+  driver enables `retryWrites=True`. Multi-doc transactions remain unproven on
+  the mock (explicitly asserted).
+
+
+- **Live multi-process stack:** `tests/test_live_stack_e2e.py` boots real
+  uvicorn workers for auth, gateway, CDS and patient-flow on loopback against
+  genuine Postgres (`pgserver`), an HTTP FHIR stub, and mongomock for flow
+  state. Covers login → token → CDS/flow clinical workflow → gateway FHIR
+  cache round-trip → logout revocation. No Docker required.
+
+Suites `importorskip` cleanly when optional engines are missing.
 
 Browser e2e requires `npx playwright install` once to download browsers.
 
@@ -86,9 +116,38 @@ retain PHI indefinitely.
 
 **Fail-fast configuration.** Outside local/test/dev the services refuse to
 start if `JWT_SECRET`, `SESSION_SECRET` or `POSTGRES_PASSWORD` is still a
-placeholder or too short, or if `ALLOWED_ORIGINS` is `*`. Booting with the
-default signing key - which is published in this repository - would let anyone
-mint a valid admin token, and nothing downstream would notice.
+placeholder or too short; if `ALLOWED_ORIGINS` is `*`; if `TRUSTED_HOSTS` is
+empty; if demo login is enabled; if OIDC is not fully configured; or if the
+access-token TTL is outside 1–60 minutes. Booting with the default signing key
+— which is published in this repository — would let anyone mint a valid admin
+token, and nothing downstream would notice.
+
+**Tokens.** Access tokens default to a **15-minute** lifetime
+(`ACCESS_TOKEN_TTL_MINUTES`), carry a unique `jti` and a `token_use=access`
+claim. Logout hits `/auth/logout`, which places the `jti` on a denylist
+(Redis when available, in-process otherwise) so a stolen token dies before
+natural expiry. Demo username/password login is forced off in production.
+
+**Sessions.** Login/OIDC also set an **httpOnly Secure** session cookie. The
+SPA prefers that cookie (`credentials: 'include'`) and keeps any JS-visible
+token in memory + tab-scoped `sessionStorage` only — never `localStorage`
+(XSS-durable). Legacy localStorage values are migrated away on read.
+
+**Rate limits.** Prefer Redis so N replicas share one global budget; fall back
+to in-process when Redis is down so a cache outage cannot take the API with it.
+
+**API surface.** Interactive OpenAPI docs (`/docs`, `/redoc`, `/openapi.json`)
+are disabled outside local/test. `/ready` stays public (probes send no auth)
+but returns only dependency status, never PHI. Every service is built through
+a shared factory (`backend.common.app.create_service_app`) so security headers,
+body-size limits, rate limits, audit logging, CORS allow-lists and
+TrustedHost checks cannot drift between services.
+
+**Containers.** Images run as uid 10001, drop all capabilities, use a
+read-only root filesystem with an in-memory `/tmp`, and start a single uvicorn
+worker (scale with replicas, not `--workers`). Kubernetes manifests set
+`runAsNonRoot`, PodDisruptionBudgets, topology spread, and NetworkPolicies
+that default-deny east-west traffic.
 
 **Audit trail.** Every request is logged with the actor (`sub`, `roles`) and a
 reference to the record touched (`resource_type`, `resource_ref`), so
@@ -109,9 +168,16 @@ capped, and `_count` clamped, so a caller cannot reach undocumented upstream
 behaviour, pull an unbounded page of PHI, or flood the response cache with
 junk keys. Resource ids are validated against the FHIR id grammar.
 
-**Network.** NetworkPolicies default-deny east-west traffic; only the ingress
-controller reaches the gateway and only the gateway reaches the internal
-services. No Secret is committed - create `medicore-secrets` out-of-band.
+**Network.** NetworkPolicies default-deny **ingress and egress**. The ingress
+controller is the only external entry; path prefixes (`/api`, `/auth`,
+`/flow`, `/cds`) match the Vite dev proxy so the SPA never needs internal
+service DNS. Egress is opened only for DNS, data stores, Redis, and HTTPS to
+upstream FHIR/IdP/OTLP. No Secret is committed — create `medicore-secrets`
+out-of-band.
+
+**CSRF.** Cookie-authenticated unsafe methods require a matching
+`Origin`/`Referer` from `ALLOWED_ORIGINS`, or a double-submit
+`X-CSRF-Token` header. Bearer-authenticated calls are unaffected.
 
 ## Web console
 
@@ -158,8 +224,8 @@ Makefile                 # DX helpers
 
 ## Services (initial)
 
-- **gateway**: Edge API, request fan-out to internal services, OpenAPI docs at `/docs`.
-- **auth**: Login, token mint/refresh, RBAC, OIDC plumbing.
+- **gateway**: Edge API, JWT + RBAC, FHIR proxy with Postgres cache. Docs off in prod.
+- **auth**: OIDC SSO (required in prod), short-lived internal JWT minting, demo login local-only.
 - **patient-flow**: Bed management and ED triage queue, persisted in MongoDB
   with optimistic-concurrency updates and atomic patient claiming.
 - **cds**: NEWS2 deterioration scoring with a per-parameter breakdown and

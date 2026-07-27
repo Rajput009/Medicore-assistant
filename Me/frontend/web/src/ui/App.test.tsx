@@ -7,7 +7,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 
 import { AuthProvider } from '../auth/AuthContext'
-import { STORAGE_KEY } from '../auth/token'
+import { SESSION_STORAGE_KEY, STORAGE_KEY } from '../auth/token'
 import { makeToken, seedToken } from '../test/helpers'
 import { App } from './App'
 import { visibleNavItems } from './AppShell'
@@ -99,6 +99,8 @@ describe('navigation', () => {
   it('shows FHIR but not admin to a clinician', () => {
     expect(visibleNavItems(['clinician']).map((i) => i.to)).toEqual([
       '/',
+      '/worklist',
+      '/wards',
       '/fhir',
       '/flow',
       '/cds',
@@ -106,7 +108,7 @@ describe('navigation', () => {
   })
 
   it('shows everything to an admin', () => {
-    expect(visibleNavItems(['admin'])).toHaveLength(5)
+    expect(visibleNavItems(['admin'])).toHaveLength(7)
   })
 
   it('shows only the overview when the user has no roles', () => {
@@ -133,6 +135,7 @@ describe('navigation', () => {
     const { user } = renderApp('/', makeToken())
     await user.click(await screen.findByRole('button', { name: /sign out/i }))
     expect(await screen.findByRole('heading', { name: /sign in/i })).toBeInTheDocument()
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
@@ -150,7 +153,9 @@ describe('OIDC callback', () => {
     const token = makeToken({ sub: 'sso.user' })
     renderApp(`/oidc/callback#access_token=${token}`)
     expect(await screen.findByRole('heading', { name: /system overview/i })).toBeInTheDocument()
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBe(token)
+    // Cookie-only: raw JWT must never land in web storage.
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
   it('accepts a token from the query string', async () => {

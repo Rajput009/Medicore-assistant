@@ -522,3 +522,282 @@ pre.json {
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
+
+/* ---- Patient chart drawer ---- */
+.chart-root {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  justify-content: flex-end;
+}
+.chart-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: rgba(15, 23, 42, 0.45);
+  cursor: pointer;
+}
+.chart-drawer {
+  position: relative;
+  width: min(420px, 100vw);
+  height: 100%;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  animation: chart-in 0.18s ease-out;
+}
+@keyframes chart-in {
+  from {
+    transform: translateX(12px);
+    opacity: 0.6;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.chart-body {
+  padding: 14px 18px 28px;
+  overflow: auto;
+  flex: 1;
+}
+.chart-section {
+  margin-bottom: 18px;
+}
+.chart-section h3 {
+  margin: 0 0 8px;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.chart-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.chart-dl {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+.chart-dl > div {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px;
+  font-size: 0.92rem;
+}
+.chart-dl dt {
+  margin: 0;
+  color: var(--text-muted);
+}
+.chart-dl dd {
+  margin: 0;
+}
+.chart-list {
+  margin: 0;
+  padding-left: 18px;
+}
+.chart-list li {
+  margin-bottom: 4px;
+}
+.chart-actions .button-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: inherit;
+  text-decoration: none;
+  font-size: 0.875rem;
+}
+.chart-actions .button-link.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.patient-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--primary);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font: inherit;
+}
+.patient-link:hover {
+  opacity: 0.85;
+}
+
+/* ---- Worklist ---- */
+.worklist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+.worklist-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.worklist-item:last-child {
+  border-bottom: 0;
+}
+
+/* ---- Ward whiteboard ---- */
+.ward-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+.ward-column h3 {
+  margin: 0 0 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.bed-tile {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--surface-alt);
+}
+.bed-tile.free {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.bed-tile.busy {
+  border-color: color-mix(in srgb, var(--danger, #b91c1c) 40%, var(--border));
+}
+.bed-tile .bed-id {
+  font-weight: 700;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* ---- Escalate strip ---- */
+.escalate-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-end;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- Observation trends ---- */
+.trend-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.trend-row {
+  margin-bottom: 10px;
+}
+.trend-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.88rem;
+  margin-bottom: 4px;
+}
+.trend-bar-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  overflow: hidden;
+}
+.trend-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+  min-width: 4px;
+}
+
+/* ---- SBAR handoff ---- */
+.handoff-textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: inherit;
+  box-sizing: border-box;
+}
+
+/* ---- Global patient search + topbar ---- */
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.patient-search {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.patient-search input {
+  min-width: 140px;
+  max-width: 200px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+}
+.census-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.census-tile {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  background: var(--surface-alt);
+}
+.census-tile .census-value {
+  font-size: 1.6rem;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.census-tile .census-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.bed-tile-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}

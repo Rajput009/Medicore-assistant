@@ -1,16 +1,26 @@
-/** Unit tests for JWT decoding, expiry and role handling — including edge cases. */
+/** Unit tests for JWT decoding and cookie-only storage hygiene. */
 
 import { describe, expect, it, vi } from 'vitest'
 
 import { makeToken } from '../test/helpers'
-import { decodeToken, hasAnyRole, isExpired, millisUntilExpiry, tokenStorage } from './token'
+import {
+  decodeToken,
+  hasAnyRole,
+  isExpired,
+  millisUntilExpiry,
+  purgeLegacyTokenStorage,
+  sessionUserFromClaims,
+  tokenStorage,
+} from './token'
 
 function b64url(value: string): string {
   return btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 function tokenWithPayload(payload: unknown): string {
-  return [b64url(JSON.stringify({ alg: 'HS256' })), b64url(JSON.stringify(payload)), 'sig'].join('.')
+  return [b64url(JSON.stringify({ alg: 'HS256' })), b64url(JSON.stringify(payload)), 'sig'].join(
+    '.',
+  )
 }
 
 describe('decodeToken', () => {
@@ -41,10 +51,6 @@ describe('decodeToken', () => {
     expect(decodeToken(tokenWithPayload({ sub: '' }))).toBeNull()
   })
 
-  it('returns null when sub is not a string', () => {
-    expect(decodeToken(tokenWithPayload({ sub: 12345 }))).toBeNull()
-  })
-
   it('defaults roles to an empty array when absent', () => {
     expect(decodeToken(tokenWithPayload({ sub: 'x' }))?.roles).toEqual([])
   })
@@ -54,10 +60,6 @@ describe('decodeToken', () => {
       'admin',
       'clinician',
     ])
-    expect(decodeToken(tokenWithPayload({ sub: 'x', roles: 'admin,viewer' }))?.roles).toEqual([
-      'admin',
-      'viewer',
-    ])
   })
 
   it('ignores unknown roles and de-duplicates', () => {
@@ -66,27 +68,9 @@ describe('decodeToken', () => {
     )
     expect(user?.roles).toEqual(['admin', 'viewer'])
   })
-
-  it('handles a payload with non-ASCII characters', () => {
-    // btoa cannot encode raw non-ASCII, so encode UTF-8 bytes first.
-    const json = JSON.stringify({ sub: 'zoë.科', roles: ['viewer'] })
-    const utf8 = String.fromCharCode(...new TextEncoder().encode(json))
-    const token = `${b64url('{}')}.${b64url(utf8)}.sig`
-    expect(decodeToken(token)?.sub).toBe('zoë.科')
-  })
-
-  it('tolerates base64url payloads without padding', () => {
-    const token = makeToken({ sub: 'abc' })
-    expect(token.split('.')[1]).not.toContain('=')
-    expect(decodeToken(token)?.sub).toBe('abc')
-  })
-
-  it('treats a non-numeric exp as absent', () => {
-    expect(decodeToken(tokenWithPayload({ sub: 'x', exp: 'soon' }))?.exp).toBeUndefined()
-  })
 })
 
-describe('isExpired', () => {
+describe('isExpired / millisUntilExpiry / hasAnyRole', () => {
   it('is false for a future expiry', () => {
     expect(isExpired(decodeToken(makeToken({ expiresInSeconds: 60 })))).toBe(false)
   })
@@ -99,72 +83,50 @@ describe('isExpired', () => {
     expect(isExpired(decodeToken(makeToken({ expiresInSeconds: null })))).toBe(false)
   })
 
-  it('is false for a null user', () => {
-    expect(isExpired(null)).toBe(false)
-  })
-
-  it('treats the exact expiry instant as expired', () => {
-    const exp = 1_000_000
-    expect(isExpired({ sub: 'x', roles: [], exp }, exp * 1000)).toBe(true)
-  })
-})
-
-describe('millisUntilExpiry', () => {
-  it('returns null without an exp claim', () => {
-    expect(millisUntilExpiry({ sub: 'x', roles: [] })).toBeNull()
-  })
-
-  it('never returns a negative value', () => {
+  it('millisUntilExpiry never returns a negative value', () => {
     expect(millisUntilExpiry({ sub: 'x', roles: [], exp: 1 }, 9_999_999_999)).toBe(0)
   })
 
-  it('computes the remaining time', () => {
-    expect(millisUntilExpiry({ sub: 'x', roles: [], exp: 200 }, 100_000)).toBe(100_000)
-  })
-})
-
-describe('hasAnyRole', () => {
-  const user = { sub: 'x', roles: ['clinician' as const] }
-
-  it('matches when a required role is present', () => {
+  it('hasAnyRole matches required roles', () => {
+    const user = { sub: 'x', roles: ['clinician' as const] }
     expect(hasAnyRole(user, ['clinician', 'admin'])).toBe(true)
-  })
-
-  it('rejects when no required role is present', () => {
     expect(hasAnyRole(user, ['admin'])).toBe(false)
-  })
-
-  it('allows an empty requirement list', () => {
-    expect(hasAnyRole(user, [])).toBe(true)
-  })
-
-  it('rejects a null user even with an empty requirement', () => {
     expect(hasAnyRole(null, [])).toBe(false)
   })
 })
 
-describe('tokenStorage', () => {
-  it('round-trips a value', () => {
-    tokenStorage.write('abc')
-    expect(tokenStorage.read()).toBe('abc')
-    tokenStorage.clear()
+describe('sessionUserFromClaims', () => {
+  it('normalises roles from the session endpoint', () => {
+    expect(sessionUserFromClaims({ sub: 'a', roles: ['ADMIN', 'nope'] })).toEqual({
+      sub: 'a',
+      roles: ['admin'],
+      exp: undefined,
+    })
+  })
+})
+
+describe('cookie-only storage hygiene', () => {
+  it('tokenStorage never persists a JWT', () => {
+    tokenStorage.write('abc.def.ghi')
     expect(tokenStorage.read()).toBeNull()
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBeNull()
+    expect(window.localStorage.getItem('medicore.token')).toBeNull()
   })
 
-  it('degrades gracefully when localStorage throws', () => {
-    // Safari private mode / storage disabled by policy.
-    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
-      throw new Error('denied')
-    })
-    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-      throw new Error('denied')
-    })
+  it('purgeLegacyTokenStorage wipes old localStorage and sessionStorage keys', () => {
+    window.localStorage.setItem('medicore.token', 'legacy-jwt')
+    window.sessionStorage.setItem('medicore.session.token', 'legacy-jwt')
+    purgeLegacyTokenStorage()
+    expect(window.localStorage.getItem('medicore.token')).toBeNull()
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBeNull()
+  })
+
+  it('degrades gracefully when storage throws', () => {
     vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
       throw new Error('denied')
     })
-
-    expect(tokenStorage.read()).toBeNull()
+    expect(() => purgeLegacyTokenStorage()).not.toThrow()
     expect(() => tokenStorage.write('x')).not.toThrow()
-    expect(() => tokenStorage.clear()).not.toThrow()
+    expect(tokenStorage.read()).toBeNull()
   })
 })

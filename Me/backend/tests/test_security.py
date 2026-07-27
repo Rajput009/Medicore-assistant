@@ -16,6 +16,32 @@ def test_round_trip():
     claims = verify_access_token(token)
     assert claims["sub"] == "alice"
     assert claims["roles"] == ["clinician"]
+    assert claims.get("token_use") == "access"
+
+
+def test_default_ttl_is_short_lived():
+    """Stolen tokens must stop working quickly; default is 15 minutes."""
+    token = create_access_token("alice")
+    claims = verify_access_token(token)
+    remaining = claims["exp"] - int(time.time())
+    assert remaining <= settings.access_token_ttl_minutes * 60 + 5
+    assert remaining > 0
+
+
+def test_non_access_token_use_is_rejected():
+    """A future refresh token must not be accepted as an access token."""
+    token = jwt.encode(
+        {
+            "sub": "alice",
+            "roles": ["admin"],
+            "exp": int(time.time()) + 600,
+            "token_use": "refresh",
+        },
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+    with pytest.raises(JWTError):
+        verify_access_token(token)
 
 
 def test_default_role_is_least_privileged():

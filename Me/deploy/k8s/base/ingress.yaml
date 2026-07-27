@@ -1,27 +1,70 @@
+# Single external entry point. The browser only talks to this host; path
+# prefixes match the Vite dev proxy so the same SPA build works in prod
+# without baking internal service DNS names into the bundle.
+#
+#   /api/*   → gateway        (FHIR, cache)     strip prefix
+#   /auth/*  → auth           (login, OIDC, session)
+#   /flow/*  → patient-flow   (beds, triage)
+#   /cds/*   → cds            (NEWS2)
+#   /*       → web console    (static SPA)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: medicore-ingress
   namespace: medicore
   annotations:
-    # kubernetes.io/ingress.class is deprecated; use spec.ingressClassName.
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Strip the /api prefix so gateway routes stay at /fhir, /cache, ...
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
   # PHI must never traverse plaintext HTTP.
   tls:
     - hosts:
         - api.medicore.local
+        - console.medicore.local
       secretName: medicore-tls
   rules:
     - host: api.medicore.local
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080
+          - path: /auth(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: auth
+                port:
+                  number: 8081
+          - path: /flow(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: patient-flow
+                port:
+                  number: 8082
+          - path: /cds(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: cds
+                port:
+                  number: 8083
+    - host: console.medicore.local
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: gateway
+                name: web
                 port:
-                  number: 8080
+                  number: 80

@@ -16,3 +16,6 @@ authlib
 itsdangerous
 python-multipart
 passlib[bcrypt]
+
+# Optional shared rate-limit + revocation store
+redis>=5.0.0

@@ -13,3 +13,6 @@ opentelemetry-instrumentation-logging
 python-jose[cryptography]
 httpx
 asyncpg
+
+# Optional shared rate-limit + revocation store
+redis>=5.0.0

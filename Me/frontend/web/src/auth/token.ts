@@ -1,22 +1,27 @@
 /**
- * JWT helpers.
+ * JWT helpers (decode-only) and legacy storage cleanup.
  *
- * These decode the token purely to drive UI affordances (which nav items to
- * show, whether the session looks expired). The gateway remains the only
- * authority: every protected call is still verified server-side, so a user who
- * tampers with a token in localStorage gains nothing but a 401.
+ * The SPA is **cookie-only**: the access token lives in an httpOnly cookie set
+ * by the auth service. JavaScript never persists the raw JWT — not in
+ * localStorage, not in sessionStorage, not in memory across navigations.
+ *
+ * `decodeToken` remains for OIDC fragment handoff (one-shot, then discarded)
+ * and for tests. UI claims come from `GET /auth/session`.
  */
 
 import type { AuthUser, Role } from '../api/types'
 
 const VALID_ROLES: readonly string[] = ['admin', 'clinician', 'viewer']
 
+/** Legacy keys — wiped on boot so older builds cannot leave a durable JWT. */
+export const STORAGE_KEY = 'medicore.token'
+export const SESSION_STORAGE_KEY = 'medicore.session.token'
+
 /** Base64url -> UTF-8 string, tolerating missing padding. */
 function decodeSegment(segment: string): string {
   const padded = segment.replace(/-/g, '+').replace(/_/g, '/')
   const withPadding = padded + '='.repeat((4 - (padded.length % 4)) % 4)
   const binary = atob(withPadding)
-  // Round-trip through percent-encoding so non-ASCII names survive.
   const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
   return new TextDecoder('utf-8').decode(bytes)
 }
@@ -54,7 +59,8 @@ export function decodeToken(token: string | null | undefined): AuthUser | null {
   const sub = payload.sub
   if (typeof sub !== 'string' || sub === '') return null
 
-  const exp = typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp : undefined
+  const exp =
+    typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp : undefined
 
   return { sub, roles: normaliseRoles(payload.roles), exp }
 }
@@ -77,29 +83,53 @@ export function hasAnyRole(user: AuthUser | null, required: readonly Role[]): bo
   return required.some((r) => user.roles.includes(r))
 }
 
-export const STORAGE_KEY = 'medicore.token'
+export function sessionUserFromClaims(s: {
+  sub: string
+  roles?: string[]
+  exp?: number
+}): AuthUser | null {
+  if (!s?.sub) return null
+  const roles = normaliseRoles(s.roles ?? [])
+  const exp = typeof s.exp === 'number' && Number.isFinite(s.exp) ? s.exp : undefined
+  return { sub: s.sub, roles, exp }
+}
 
-/** localStorage access guarded for Safari private mode / disabled storage. */
+/**
+ * Wipe any JWT left by older builds. Does **not** store tokens.
+ * Safe to call on every app boot.
+ */
+export function purgeLegacyTokenStorage(): void {
+  try {
+    window.localStorage.removeItem(STORAGE_KEY)
+  } catch {
+    /* ignore */
+  }
+  try {
+    window.sessionStorage.removeItem(SESSION_STORAGE_KEY)
+  } catch {
+    /* ignore */
+  }
+  // Older keys if any
+  try {
+    window.localStorage.removeItem('medicore.session.token')
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * @deprecated Cookie-only mode: no-op write / always-null read.
+ * Kept so tests that still import `tokenStorage` fail closed (never persist).
+ */
 export const tokenStorage = {
   read(): string | null {
-    try {
-      return window.localStorage.getItem(STORAGE_KEY)
-    } catch {
-      return null
-    }
+    purgeLegacyTokenStorage()
+    return null
   },
-  write(token: string): void {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, token)
-    } catch {
-      /* non-fatal: session becomes tab-scoped */
-    }
+  write(_token: string): void {
+    purgeLegacyTokenStorage()
   },
   clear(): void {
-    try {
-      window.localStorage.removeItem(STORAGE_KEY)
-    } catch {
-      /* ignore */
-    }
+    purgeLegacyTokenStorage()
   },
 }

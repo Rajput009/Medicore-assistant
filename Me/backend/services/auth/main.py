@@ -1,67 +1,59 @@
-"""MediCore auth service: local login stub + OIDC SSO + internal token minting."""
+"""MediCore auth service: local login stub + OIDC SSO + internal token minting.
+
+Issues short-lived access tokens and, for browser clients, an httpOnly Secure
+session cookie so the SPA never has to hold the JWT in JavaScript-accessible
+storage (XSS cannot exfiltrate it). Logout revokes the token's ``jti`` so the
+credential dies before natural expiry.
+"""
+
+from __future__ import annotations
 
 import os
 import secrets
 from typing import Any
 
 from authlib.integrations.starlette_client import OAuth, OAuthError
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from starlette.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
+from backend.common.app import create_service_app
 from backend.common.config import settings
-from backend.common.hardening import (
-    BodySizeLimitMiddleware,
-    RateLimitMiddleware,
-    SecurityHeadersMiddleware,
-)
-from backend.common.logging import configure_logging
-from backend.common.middleware import AuditLogMiddleware
-from backend.common.security import create_access_token
-from backend.common.telemetry import instrument_fastapi
-
-configure_logging(settings.log_level, service="auth")
-
-app = instrument_fastapi(
-    FastAPI(title="MediCore Auth", version="1.0.0"), service_name="auth"
-)
+from backend.common.csrf import clear_csrf_cookie, issue_csrf_cookie
+from backend.common.revocation import revoke_payload
+from backend.common.security import create_access_token, verify_access_token
 
 # Session cookie is required for the OIDC state/nonce round-trip.
 _session_secret = os.getenv("SESSION_SECRET", settings.session_secret)
-if settings.env not in ("local", "test") and _session_secret in (
-    "dev-change-me",
-    "",
+if settings.is_production and (
+    not _session_secret or _session_secret in ("dev-change-me", "")
 ):
     raise RuntimeError(
-        "SESSION_SECRET must be set to a strong random value outside local/test"
+        "SESSION_SECRET must be set to a strong random value in production"
     )
 
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=_session_secret,
-    same_site="lax",
-    https_only=settings.env not in ("local", "test"),
+# Session middleware must sit inside CORS/TrustedHost so the cookie is set on
+# responses that already passed host/origin checks. Registered as innermost
+# extra middleware via the shared factory.
+app = create_service_app(
+    title="MediCore Auth",
+    service_name="auth",
+    version="1.0.0",
+    rate_limit=settings.login_rate_limit_per_minute,
+    enable_cors=True,
+    extra_middleware=(
+        (
+            SessionMiddleware,
+            {
+                "secret_key": _session_secret,
+                "same_site": "lax",
+                "https_only": settings.is_production,
+                "max_age": 600,  # OIDC round-trip only; short-lived.
+            },
+        ),
+    ),
 )
-
-# Credentialed CORS cannot use a "*" origin — browsers reject the combination,
-# so fall back to an explicit allow-list.
-_origins = settings.cors_origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-# Middleware runs in reverse registration order, so the last registered is
-# outermost. Order matters: security headers must wrap everything (including
-# rejections), and the audit log must see the authenticated principal.
-app.add_middleware(RateLimitMiddleware, limit=settings.login_rate_limit_per_minute)
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
-app.add_middleware(AuditLogMiddleware, service="auth")
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 
 class Health(BaseModel):
@@ -83,36 +75,86 @@ def ready() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Cookie helpers
+# --------------------------------------------------------------------------
+
+
+def _cookie_secure() -> bool:
+    # Secure cookies on anything that is not a plain local/test HTTP setup.
+    return settings.is_production or settings.env.lower() not in ("local", "test")
+
+
+def _set_session_cookie(response: Response, token: str, max_age: int) -> None:
+    if not settings.auth_set_cookie:
+        return
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=token,
+        max_age=max_age,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.auth_cookie_name,
+        path="/",
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+    )
+
+
+def _extract_bearer_or_cookie(request: Request) -> str | None:
+    auth = request.headers.get("authorization")
+    if auth:
+        scheme, _, token = auth.partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            return token.strip()
+    cookie = request.cookies.get(settings.auth_cookie_name)
+    if cookie and cookie.strip():
+        return cookie.strip()
+    return None
+
+
+# --------------------------------------------------------------------------
 # Local (development) login
 # --------------------------------------------------------------------------
 
 
 class LoginReq(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=256)
 
 
 class TokenResp(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    expires_in: int = 3600
+    expires_in: int
 
 
 def _demo_login_enabled() -> bool:
-    """The username/password stub authenticates nobody — keep it out of prod."""
-    return settings.env in ("local", "test") or os.getenv(
-        "ENABLE_DEMO_LOGIN", ""
-    ).lower() in ("1", "true", "yes")
+    """The username/password stub authenticates nobody real — keep it out of prod.
+
+    Production is always False (enforced in Settings too). Outside production
+    the shared ``settings.demo_login_allowed`` gate still requires ENV=local/test
+    or an explicit ENABLE_DEMO_LOGIN opt-in.
+    """
+    return settings.demo_login_allowed
 
 
 @app.post("/login", response_model=TokenResp)
-def login(req: LoginReq) -> TokenResp:
+def login(req: LoginReq, response: Response) -> TokenResp:
     if not _demo_login_enabled():
+        # 404 rather than 403: do not advertise that a password endpoint exists.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Local login is disabled; use /oidc/login",
         )
-    if not req.username or not req.password:
+    if not req.username.strip() or not req.password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
@@ -124,8 +166,100 @@ def login(req: LoginReq) -> TokenResp:
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
 
-    token = create_access_token(sub=req.username, roles=["clinician"])
-    return TokenResp(access_token=token)
+    ttl = settings.access_token_ttl_minutes
+    token = create_access_token(sub=req.username.strip(), roles=["clinician"])
+    body = TokenResp(access_token=token, expires_in=ttl * 60)
+    _set_session_cookie(response, token, max_age=ttl * 60)
+    issue_csrf_cookie(response, secure=_cookie_secure())
+    return body
+
+
+@app.post("/logout", tags=["auth"])
+def logout(request: Request, response: Response) -> dict[str, str]:
+    """Revoke the current access token and clear the session cookie.
+
+    Safe to call anonymously: a missing/invalid token still clears the cookie
+    so a half-broken browser session can always recover.
+    """
+    raw = _extract_bearer_or_cookie(request)
+    if raw:
+        try:
+            payload = verify_access_token(raw)
+            revoke_payload(payload)
+        except Exception:
+            # Token already invalid/expired — still clear the cookie.
+            pass
+    _clear_session_cookie(response)
+    clear_csrf_cookie(response, secure=_cookie_secure())
+    return {"status": "ok"}
+
+
+@app.get("/session", tags=["auth"])
+def session(request: Request) -> dict[str, Any]:
+    """Return the caller's claims without exposing the raw token.
+
+    The SPA uses this after a cookie-based login so it never has to read the
+    JWT out of storage. Returns 401 when no valid session is present.
+    """
+    raw = _extract_bearer_or_cookie(request)
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        payload = verify_access_token(raw)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+    return {
+        "sub": payload.get("sub"),
+        "roles": payload.get("roles") or [],
+        "exp": payload.get("exp"),
+        "jti": payload.get("jti"),
+    }
+
+
+class EstablishSessionReq(BaseModel):
+    """One-shot handoff from an OIDC fragment / external token mint."""
+
+    access_token: str = Field(..., min_length=20, max_length=8192)
+
+
+@app.post("/session/establish", tags=["auth"])
+def establish_session(
+    req: EstablishSessionReq, response: Response
+) -> dict[str, Any]:
+    """Verify ``access_token`` and set the httpOnly session cookie.
+
+    Used by the SPA after an OIDC redirect that delivered the token in the
+    URL fragment. The browser then discards the fragment; only the cookie
+    remains. Returns claims (never echoes the raw token back for storage).
+    """
+    try:
+        payload = verify_access_token(req.access_token.strip())
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+
+    exp = int(payload.get("exp") or 0)
+    now = int(__import__("time").time())
+    max_age = max(1, exp - now) if exp else settings.access_token_ttl_minutes * 60
+    _set_session_cookie(response, req.access_token.strip(), max_age=max_age)
+    issue_csrf_cookie(response, secure=_cookie_secure())
+    return {
+        "sub": payload.get("sub"),
+        "roles": payload.get("roles") or [],
+        "exp": payload.get("exp"),
+        "jti": payload.get("jti"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -216,15 +350,19 @@ async def oidc_callback(request: Request):
             {"error": "IdP response contained no subject"}, status_code=400
         )
 
+    ttl = settings.access_token_ttl_minutes
     internal = create_access_token(sub=str(sub), roles=_map_roles(userinfo))
-    return JSONResponse(
-        {
-            "access_token": internal,
-            "token_type": "bearer",
-            "user": {
-                "sub": sub,
-                "email": userinfo.get("email"),
-                "name": userinfo.get("name"),
-            },
-        }
-    )
+    body = {
+        "access_token": internal,
+        "token_type": "bearer",
+        "expires_in": ttl * 60,
+        "user": {
+            "sub": sub,
+            "email": userinfo.get("email"),
+            "name": userinfo.get("name"),
+        },
+    }
+    response = JSONResponse(body)
+    _set_session_cookie(response, internal, max_age=ttl * 60)
+    issue_csrf_cookie(response, secure=_cookie_secure())
+    return response

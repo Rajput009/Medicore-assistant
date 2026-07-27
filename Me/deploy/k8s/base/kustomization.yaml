@@ -13,3 +13,6 @@ resources:
   - ingress.yaml
   - pdb.yaml
   - networkpolicy.yaml
+  - istio-mtls.yaml
+  - cilium-egress.yaml
+

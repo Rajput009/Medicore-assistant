@@ -3,19 +3,30 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-
 
 import type { Role } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
+import { PatientChartDrawer } from '../patient/PatientChartDrawer'
+import { PatientChartProvider } from '../patient/PatientChartContext'
 import { AdminPage } from '../pages/AdminPage'
 import { CdsPage } from '../pages/CdsPage'
 import { DashboardPage } from '../pages/DashboardPage'
 import { FhirPage } from '../pages/FhirPage'
 import { LoginPage } from '../pages/LoginPage'
 import { PatientFlowPage } from '../pages/PatientFlowPage'
+import { WorklistPage } from '../pages/WorklistPage'
+import { WardBoardPage } from '../pages/WardBoardPage'
 import { AppShell } from './AppShell'
 import { Alert, Card } from './components'
 
 /** Redirects unauthenticated users to the login page, preserving intent. */
 const RequireAuth: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { isAuthenticated } = useAuth()
+  const { isAuthenticated, isBootstrapping } = useAuth()
   const location = useLocation()
+  if (isBootstrapping) {
+    return (
+      <main className="login-page">
+        <p className="muted">Checking session…</p>
+      </main>
+    )
+  }
   if (!isAuthenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />
   }
@@ -57,6 +68,7 @@ const OidcCallback: React.FC = () => {
   const [error, setError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
+    let cancelled = false
     const fromHash = new URLSearchParams(location.hash.replace(/^#/, ''))
     const fromQuery = new URLSearchParams(location.search)
     const token = fromHash.get('access_token') ?? fromQuery.get('access_token')
@@ -65,12 +77,19 @@ const OidcCallback: React.FC = () => {
       setError('No access token was returned by the identity provider.')
       return
     }
-    if (!adoptToken(token)) {
-      setError('The identity provider returned an invalid or expired token.')
-      return
+    void (async () => {
+      const ok = await adoptToken(token)
+      if (cancelled) return
+      if (!ok) {
+        setError('The identity provider returned an invalid or expired token.')
+        return
+      }
+      // Strip the token from the address bar — cookie is the only credential.
+      navigate('/', { replace: true })
+    })()
+    return () => {
+      cancelled = true
     }
-    // Strip the token from the address bar.
-    navigate('/', { replace: true })
   }, [location, adoptToken, navigate])
 
   return (
@@ -107,44 +126,63 @@ export const App: React.FC = () => (
       path="*"
       element={
         <RequireAuth>
-          <AppShell>
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route
-                path="/fhir"
-                element={
-                  <RequireRole roles={['clinician', 'admin']}>
-                    <FhirPage />
-                  </RequireRole>
-                }
-              />
-              <Route
-                path="/flow"
-                element={
-                  <RequireRole roles={['clinician', 'admin']}>
-                    <PatientFlowPage />
-                  </RequireRole>
-                }
-              />
-              <Route
-                path="/cds"
-                element={
-                  <RequireRole roles={['clinician', 'admin']}>
-                    <CdsPage />
-                  </RequireRole>
-                }
-              />
-              <Route
-                path="/admin"
-                element={
-                  <RequireRole roles={['admin']}>
-                    <AdminPage />
-                  </RequireRole>
-                }
-              />
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </AppShell>
+          <PatientChartProvider>
+            <AppShell>
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route
+                  path="/worklist"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <WorklistPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/wards"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <WardBoardPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/fhir"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <FhirPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/flow"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <PatientFlowPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/cds"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <CdsPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/admin"
+                  element={
+                    <RequireRole roles={['admin']}>
+                      <AdminPage />
+                    </RequireRole>
+                  }
+                />
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+              <PatientChartDrawer />
+            </AppShell>
+          </PatientChartProvider>
         </RequireAuth>
       }
     />

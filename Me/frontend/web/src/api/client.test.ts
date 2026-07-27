@@ -198,9 +198,9 @@ describe('api endpoints', () => {
     })
   })
 
-  it('sends the bearer token to patient-flow and CDS', async () => {
-    // These services enforce auth independently of the gateway, so the token
-    // must be attached to their requests too.
+  it('uses cookie credentials (not bearer) for patient-flow and CDS', async () => {
+    // Cookie-only SPA: Authorization is omitted; credentials:include carries
+    // the httpOnly session cookie. Services accept cookie or bearer.
     const seen: Record<string, string | null> = {}
     server.use(
       http.get('/flow/beds', ({ request: req }) => {
@@ -221,16 +221,16 @@ describe('api endpoints', () => {
       }),
     )
 
-    await api.listBeds(null, 'tok')
-    await api.listQueue(10, null, 'tok')
-    await api.enqueue({ patient_id: 'p', acuity: 3, dept: 'ED' }, 'tok')
-    await api.risk({ hr: 72, sbp: 120, spo2: 98 }, 'tok')
+    await api.listBeds(null)
+    await api.listQueue(10, null)
+    await api.enqueue({ patient_id: 'p', acuity: 3, dept: 'ED' })
+    await api.risk({ hr: 72, sbp: 120, spo2: 98 })
 
     expect(seen).toEqual({
-      beds: 'Bearer tok',
-      queue: 'Bearer tok',
-      enqueue: 'Bearer tok',
-      risk: 'Bearer tok',
+      beds: null,
+      queue: null,
+      enqueue: null,
+      risk: null,
     })
   })
 })

@@ -9,6 +9,18 @@ spec:
   podSelector: {}
   policyTypes: [Ingress]
 ---
+# Default-deny egress too. Explicit allow rules below open only what each
+# workload needs. Without egress deny, a compromised pod can exfiltrate PHI
+# to any external host or scan the cluster network.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: medicore
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
 # Only the ingress controller may reach the gateway.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -26,8 +38,69 @@ spec:
       ports:
         - { protocol: TCP, port: 8080 }
 ---
-# Internal services accept traffic only from the gateway, never from arbitrary
-# pods. Probes come from the kubelet, which NetworkPolicy does not restrict.
+# Gateway egress: internal services, Postgres (cache), Redis (rate-limit /
+# revocation), and HTTPS to the upstream FHIR / OIDC / OTLP endpoints.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  namespace: medicore
+spec:
+  podSelector:
+    matchLabels: { app: gateway }
+  policyTypes: [Egress]
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # In-cluster dependencies
+    - to:
+        - podSelector:
+            matchLabels: { app: auth }
+      ports:
+        - { protocol: TCP, port: 8081 }
+    - to:
+        - podSelector:
+            matchLabels: { app: patient-flow }
+      ports:
+        - { protocol: TCP, port: 8082 }
+    - to:
+        - podSelector:
+            matchLabels: { app: cds }
+      ports:
+        - { protocol: TCP, port: 8083 }
+    - to:
+        - podSelector:
+            matchLabels: { app: postgres }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - podSelector:
+            matchLabels: { app: redis }
+      ports:
+        - { protocol: TCP, port: 6379 }
+    # Upstream TLS fallback for clusters WITHOUT a FQDN-aware CNI.
+    # Prefer cilium-egress.yaml (toFQDNs) which replaces this open allow with
+    # an explicit IdP/FHIR/OTLP host list. Keep this only as a last resort and
+    # never on clusters that have Cilium installed.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 4318 }
+---
+# Internal services accept traffic from the gateway (service-to-service) and
+# from the ingress controller (browser path prefixes /auth /flow /cds). Every
+# PHI route still requires a verified JWT — NetworkPolicy is defence in depth,
+# not the only control. Arbitrary pods remain blocked.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -44,7 +117,94 @@ spec:
     - from:
         - podSelector:
             matchLabels: { app: gateway }
+        - namespaceSelector:
+            matchLabels: { name: ingress-nginx }
       ports:
         - { protocol: TCP, port: 8081 }
         - { protocol: TCP, port: 8082 }
         - { protocol: TCP, port: 8083 }
+---
+# Auth egress: Redis (session denylist), HTTPS to the IdP, DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-egress
+  namespace: medicore
+spec:
+  podSelector:
+    matchLabels: { app: auth }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels: { app: redis }
+      ports:
+        - { protocol: TCP, port: 6379 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# Patient-flow egress: Mongo only (+ DNS).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: patient-flow-egress
+  namespace: medicore
+spec:
+  podSelector:
+    matchLabels: { app: patient-flow }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels: { app: mongo }
+      ports:
+        - { protocol: TCP, port: 27017 }
+    - to:
+        - podSelector:
+            matchLabels: { app: redis }
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+# CDS holds no state; only DNS (and optional OTLP).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cds-egress
+  namespace: medicore
+spec:
+  podSelector:
+    matchLabels: { app: cds }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - { protocol: TCP, port: 4318 }
+        - { protocol: TCP, port: 443 }

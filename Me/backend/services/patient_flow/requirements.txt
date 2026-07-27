@@ -12,3 +12,10 @@ opentelemetry-instrumentation-httpx
 opentelemetry-instrumentation-logging
 motor
 pymongo
+
+# JWT verification (shared deps.get_principal)
+python-jose[cryptography]
+httpx
+
+# Optional shared rate-limit + revocation store
+redis>=5.0.0

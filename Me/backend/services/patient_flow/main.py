@@ -12,20 +12,24 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import PyMongoError
 
+from backend.common.app import create_service_app
 from backend.common.config import settings
-from backend.common.deps import Principal, clinical_staff
-from backend.common.hardening import (
-    BodySizeLimitMiddleware,
-    RateLimitMiddleware,
-    SecurityHeadersMiddleware,
+from backend.common.deps import (
+    Principal,
+    clinical_staff,
+    require_department_access,
+    require_ward_access,
 )
-from backend.common.logging import configure_logging
-from backend.common.middleware import AuditLogMiddleware
-from backend.common.telemetry import instrument_fastapi
+from backend.common.idempotency import (
+    extract_idempotency_key,
+    lookup as idem_lookup,
+    replay_response,
+    store as idem_store,
+)
 
 from .repository import (
     ConflictError,
@@ -63,7 +67,6 @@ def build_bed_documents() -> list[dict[str, Any]]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client, _repository
-    configure_logging(settings.log_level, service="patient-flow")
 
     # A repository may be injected before startup (tests, or an embedding
     # process). Only open our own connection when one was not supplied, but
@@ -92,17 +95,12 @@ async def lifespan(app: FastAPI):
             _repository = None
 
 
-app = instrument_fastapi(
-    FastAPI(title="MediCore Patient Flow", version="1.0.0", lifespan=lifespan),
+app = create_service_app(
+    title="MediCore Patient Flow",
     service_name="patient-flow",
+    version="1.0.0",
+    lifespan=lifespan,
 )
-# Middleware runs in reverse registration order, so the last registered is
-# outermost. Order matters: security headers must wrap everything (including
-# rejections), and the audit log must see the authenticated principal.
-app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
-app.add_middleware(AuditLogMiddleware, service="patient-flow")
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 ClinicalUser = Annotated[Principal, Depends(clinical_staff)]
 Repo = Annotated[PatientFlowRepository, Depends(get_repository)]
@@ -205,10 +203,14 @@ async def list_beds(
     ward: str | None = Query(default=None, max_length=64),
     occupied: bool | None = Query(default=None),
 ) -> list[Bed]:
+    require_ward_access(ward, principal)
     try:
         docs = await repo.list_beds(ward=ward, occupied=occupied)
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
+    # If the caller is ward-scoped and asked for all wards, filter in process.
+    if principal.wards and "admin" not in principal.roles and ward is None:
+        docs = [d for d in docs if d.get("ward") in principal.wards]
     return [Bed(**d) for d in docs]
 
 
@@ -222,18 +224,43 @@ async def get_bed(bed_id: str, repo: Repo, principal: ClinicalUser) -> Bed:
         raise _unavailable(exc) from exc
 
 
-@app.patch("/beds/{bed_id}", response_model=Bed, tags=["beds"])
+@app.patch("/beds/{bed_id}", response_model=None, tags=["beds"])
 async def update_bed(
-    bed_id: str, update: BedUpdate, repo: Repo, principal: ClinicalUser
-) -> Bed:
+    bed_id: str,
+    update: BedUpdate,
+    repo: Repo,
+    principal: ClinicalUser,
+    request: Request,
+):
     """Assign or release a bed.
 
     Pass ``expected_occupied`` to make the write conditional; a 409 then means
     another clinician changed the bed first, rather than silently overwriting.
+
+    Optional ``Idempotency-Key`` header: retries return the first successful body.
     """
     if update.occupied and not update.patient_id:
-        # 422 constant name differs across Starlette versions; use the code.
         raise HTTPException(422, "patient_id is required when marking a bed occupied")
+
+    # Ward scope: load bed first when principal is restricted.
+    if principal.wards and "admin" not in principal.roles:
+        try:
+            existing = await repo.get_bed(bed_id)
+        except NotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"bed {bed_id} not found"
+            ) from exc
+        except PyMongoError as exc:
+            raise _unavailable(exc) from exc
+        require_ward_access(existing.get("ward"), principal)
+
+    route = f"PATCH /beds/{bed_id}"
+    idem_key = extract_idempotency_key(request)
+    if idem_key:
+        hit = idem_lookup(principal.sub, route, idem_key)
+        if hit is not None:
+            return replay_response(hit[0], hit[1])
+
     try:
         doc = await repo.set_bed_occupancy(
             bed_id,
@@ -250,7 +277,11 @@ async def update_bed(
         ) from exc
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
-    return Bed(**doc)
+
+    body = Bed(**doc).model_dump()
+    if idem_key:
+        idem_store(principal.sub, route, idem_key, 200, body)
+    return body
 
 
 # --------------------------------------------------------------------------
@@ -258,10 +289,22 @@ async def update_bed(
 # --------------------------------------------------------------------------
 
 
-@app.post("/queue", status_code=status.HTTP_201_CREATED, tags=["queue"])
+@app.post("/queue", status_code=status.HTTP_201_CREATED, response_model=None, tags=["queue"])
 async def enqueue(
-    item: QueueItem, repo: Repo, principal: ClinicalUser
-) -> dict[str, Any]:
+    item: QueueItem,
+    repo: Repo,
+    principal: ClinicalUser,
+    request: Request,
+):
+    require_department_access(item.dept, principal)
+
+    route = "POST /queue"
+    idem_key = extract_idempotency_key(request)
+    if idem_key:
+        hit = idem_lookup(principal.sub, route, idem_key)
+        if hit is not None:
+            return replay_response(hit[0], hit[1])
+
     try:
         doc = await repo.enqueue(
             item.patient_id, item.acuity, item.dept, created_by=principal.sub
@@ -273,7 +316,11 @@ async def enqueue(
         ) from exc
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
-    return {"ok": True, "item": doc}
+
+    body = {"ok": True, "item": doc}
+    if idem_key:
+        idem_store(principal.sub, route, idem_key, 201, body)
+    return body
 
 
 @app.get("/queue", tags=["queue"])
@@ -283,30 +330,45 @@ async def list_queue(
     limit: int = Query(default=25, ge=1, le=200),
     dept: str | None = Query(default=None, max_length=64),
 ) -> dict[str, Any]:
+    require_department_access(dept, principal)
     try:
         items = await repo.list_queue(limit=limit, dept=dept)
         total = await repo.count_queue(dept=dept)
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
-    # `total` lets the UI show "showing 25 of 108" rather than implying the
-    # page is the whole queue.
+    if principal.departments and "admin" not in principal.roles and dept is None:
+        items = [i for i in items if i.get("dept") in principal.departments]
+        total = len(items)
     return {"items": items, "count": len(items), "total": total}
 
 
-@app.post("/queue/claim", tags=["queue"])
+@app.post("/queue/claim", response_model=None, tags=["queue"])
 async def claim_next(
     repo: Repo,
     principal: ClinicalUser,
+    request: Request,
     dept: str = Query(..., max_length=64),
-) -> dict[str, Any]:
+):
     """Atomically claim the most urgent waiting patient in a department."""
+    require_department_access(dept, principal)
+
+    route = f"POST /queue/claim?dept={dept}"
+    idem_key = extract_idempotency_key(request)
+    if idem_key:
+        hit = idem_lookup(principal.sub, route, idem_key)
+        if hit is not None:
+            return replay_response(hit[0], hit[1])
+
     try:
         doc = await repo.claim_next(dept=dept, clinician=principal.sub)
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No patients waiting in {dept}")
-    return {"ok": True, "item": doc}
+    body = {"ok": True, "item": doc}
+    if idem_key:
+        idem_store(principal.sub, route, idem_key, 200, body)
+    return body
 
 
 @app.post("/queue/{patient_id}/complete", tags=["queue"])

@@ -58,6 +58,21 @@ def test_health_is_public(gateway):
     assert r.json()["service"] == "gateway"
 
 
+def test_ready_is_public_for_probes(gateway):
+    """Kubernetes readiness and Docker HEALTHCHECK send no Authorization."""
+    client, _ = gateway
+    # May be 200 or 503 depending on whether the cache pool is up; never 401.
+    assert client.get("/ready").status_code in (200, 503)
+
+
+def test_openapi_docs_are_not_public_by_default(gateway):
+    """The schema is a free reconnaissance map; keep it off the public surface."""
+    client, _ = gateway
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        # Either 401 (auth required) or 404 (route disabled). Never 200.
+        assert client.get(path).status_code in (401, 404)
+
+
 # --- authentication ------------------------------------------------------
 
 

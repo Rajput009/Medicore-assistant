@@ -7,6 +7,7 @@ Supports:
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,6 +15,7 @@ from jose import JWTError, jwt
 
 from .config import settings
 from .jwks import JWKSFetcher
+from .revocation import is_revoked
 
 # Algorithms we are willing to verify. Anything else (notably "none") is rejected
 # outright so a caller cannot downgrade the algorithm via the token header.
@@ -24,15 +26,39 @@ _ALLOWED_ASYMMETRIC = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
 def create_access_token(
     sub: str,
     roles: list[str] | None = None,
-    expires_minutes: int = 60,
+    expires_minutes: int | None = None,
 ) -> str:
-    """Mint an internal HS-signed access token."""
+    """Mint an internal HS-signed access token.
+
+    Default lifetime comes from ``settings.access_token_ttl_minutes`` (15m) so a
+    stolen token stops working quickly. Callers that need a different window
+    (tests, short-lived bootstrap) pass ``expires_minutes`` explicitly.
+
+    Every token carries a unique ``jti`` so logout / compromise can revoke it
+    before natural expiry via the denylist.
+    """
+    ttl = (
+        settings.access_token_ttl_minutes
+        if expires_minutes is None
+        else expires_minutes
+    )
+    if ttl <= 0:
+        # Negative/zero TTL is only useful in tests to force expiry; clamp the
+        # resulting exp slightly into the past so verification always fails.
+        delta = timedelta(seconds=ttl * 60 if ttl < 0 else -1)
+    else:
+        delta = timedelta(minutes=ttl)
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": sub,
         "roles": roles or ["viewer"],
         "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=expires_minutes)).timestamp()),
+        "exp": int((now + delta).timestamp()),
+        # Unique id for revocation (denylist keyed by jti until exp).
+        "jti": uuid.uuid4().hex,
+        # Explicit token type so a future refresh token cannot be replayed as
+        # an access token if we ever issue both from the same secret.
+        "token_use": "access",
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_alg)
 
@@ -86,6 +112,16 @@ def _decode_options() -> dict[str, Any]:
 def _finalise(payload: dict[str, Any]) -> dict[str, Any]:
     if not payload.get("sub"):
         raise JWTError("sub claim missing")
+    # Reject tokens that advertise a non-access purpose (e.g. a future refresh
+    # token minted under the same secret). Tokens without the claim remain
+    # accepted for backwards compatibility with already-issued sessions.
+    token_use = payload.get("token_use")
+    if token_use is not None and token_use != "access":
+        raise JWTError("token is not an access token")
+    # Honour the denylist so logout / compromise takes effect before exp.
+    jti = payload.get("jti")
+    if jti and is_revoked(str(jti)):
+        raise JWTError("token has been revoked")
     return payload
 
 

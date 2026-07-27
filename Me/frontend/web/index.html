@@ -3,6 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow" />
+    <!-- Baseline CSP for the console. Tighten script-src once the SPA is
+         built without inline bootstraps; connect-src covers same-origin API
+         prefixes (/api /auth /flow /cds) and any configured absolute base. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'"
+    />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
     <title>MediCore Console</title>
   </head>
   <body>
