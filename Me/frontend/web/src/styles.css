@@ -412,6 +412,11 @@ select[aria-invalid='true'] {
   color: var(--text-muted);
   border-color: var(--border);
 }
+.alert.warn {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border-color: currentColor;
+}
 
 table {
   width: 100%;

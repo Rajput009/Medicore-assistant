@@ -28,10 +28,15 @@ export const Spinner: React.FC<{ label?: string }> = ({ label = 'Loading' }) => 
  * errors, polite status for everything else.
  */
 export const Alert: React.FC<{
-  kind: 'error' | 'success' | 'info'
+  kind: 'error' | 'success' | 'info' | 'warn'
   children: React.ReactNode
 }> = ({ kind, children }) => (
-  <div className={`alert ${kind}`} role={kind === 'error' ? 'alert' : 'status'}>
+  // 'warn' is announced assertively too: it marks things like break-glass
+  // access that a clinician must not scroll past unnoticed.
+  <div
+    className={`alert ${kind}`}
+    role={kind === 'error' || kind === 'warn' ? 'alert' : 'status'}
+  >
     <span>{children}</span>
   </div>
 )

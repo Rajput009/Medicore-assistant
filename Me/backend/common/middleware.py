@@ -235,6 +235,18 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
             record["outcome"] = "denied"
             level = max(level, logging.WARNING)
 
+        # A successful break-glass is an access that policy would normally have
+        # refused. It is recorded as its own outcome so a reviewer can list
+        # every override without wading through routine access.
+        break_glass = getattr(request.state, "break_glass", None)
+        if isinstance(break_glass, dict):
+            record["outcome"] = "break_glass"
+            record["break_glass_reason"] = break_glass.get("reason")
+            record["break_glass_scope"] = (
+                f"{break_glass.get('scope_type')}:{break_glass.get('scope_value')}"
+            )
+            level = max(level, logging.WARNING)
+
         logger.log(level, json.dumps(record, default=str))
         # Index after logging: stdout is the system of record.
         self._index(record)

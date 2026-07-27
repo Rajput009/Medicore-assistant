@@ -2,13 +2,14 @@
  * Ward whiteboard — beds grouped by ward with assign/discharge actions.
  */
 
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import type { Bed } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { useAsyncData } from '../hooks/useAsync'
 import { PatientLink } from '../patient/PatientChartDrawer'
+import { BreakGlassPrompt } from '../ui/BreakGlassPrompt'
 import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
 
 export function groupBedsByWard(beds: Bed[]): Record<string, Bed[]> {
@@ -44,10 +45,22 @@ export function scopeBeds(beds: Bed[], wards: string[]): Bed[] {
 export const WardBoardPage: React.FC = () => {
   const { user } = useAuth()
   const [filter, setFilter] = useState('')
+  // Set only after an explicit, justified override; never persisted, so it
+  // dies with the page and cannot become a standing privilege.
+  const [breakGlass, setBreakGlass] = useState<string | null>(null)
+  const [offerBreakGlass, setOfferBreakGlass] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionOk, setActionOk] = useState<string | null>(null)
-  const { state, reload } = useAsyncData((signal) => api.listBeds(null, null, signal), [])
+  const { state, reload } = useAsyncData(
+    (signal) => api.listBeds(null, null, signal, breakGlass ?? undefined),
+    [breakGlass],
+  )
+
+  // Offer the override only when the server said it would accept one.
+  useEffect(() => {
+    if (state.status === 'error' && state.statusCode === 403) setOfferBreakGlass(true)
+  }, [state])
 
   const scope = user?.wards ?? []
 
@@ -134,6 +147,24 @@ export const WardBoardPage: React.FC = () => {
           Refresh
         </button>
       </div>
+
+      {breakGlass && (
+        <Alert kind="warn">
+          Break-glass access is active for this view. This access has been recorded in the
+          audit trail.
+        </Alert>
+      )}
+
+      {offerBreakGlass && !breakGlass && (
+        <BreakGlassPrompt
+          scope="these wards"
+          onConfirm={(reason) => {
+            setBreakGlass(reason)
+            setOfferBreakGlass(false)
+          }}
+          onCancel={() => setOfferBreakGlass(false)}
+        />
+      )}
 
       {actionError && <Alert kind="error">{actionError}</Alert>}
       {actionOk && <Alert kind="success">{actionOk}</Alert>}

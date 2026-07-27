@@ -7,6 +7,8 @@ can talk to any Service, so "it sits behind the gateway" is not a control.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, status
@@ -14,6 +16,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from .security import verify_access_token
+
+logger = logging.getLogger("medicore.audit")
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -168,20 +172,137 @@ def get_principal(
     )
 
 
-def require_ward_access(ward: str | None, principal: Principal) -> None:
-    if not principal.can_access_ward(ward):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorised for this ward",
-        )
+# Break-glass: emergency override of ward/department scope.
+#
+# A clinician responding to an arrest on a ward they are not assigned to must
+# not be blocked by an access-control rule. The answer in healthcare is not to
+# loosen the rule - it is to let it be overridden explicitly, loudly, and with
+# a reason attached, so the override is reviewable afterwards.
+#
+# Three properties make this safe rather than a backdoor:
+#   1. It is opt-in per request (a header), never a standing privilege.
+#   2. It requires a stated reason, so the audit record is meaningful.
+#   3. It escalates the audit trail rather than bypassing it.
+#
+# It deliberately does NOT override *role* checks: a viewer cannot break glass
+# into write access. It only relaxes ward/department data scope for a caller
+# who already holds a clinical role.
+BREAK_GLASS_HEADER = "x-break-glass-reason"
+_MIN_REASON_LENGTH = 10
+_MAX_REASON_LENGTH = 500
 
 
-def require_department_access(dept: str | None, principal: Principal) -> None:
-    if not principal.can_access_department(dept):
+def break_glass_reason(request: Request | None) -> str | None:
+    """Extract and validate a break-glass reason, if the caller declared one.
+
+    A too-short reason is rejected rather than ignored: silently downgrading
+    "x" to a normal denied request would leave the clinician staring at a 403
+    with no idea their override was thrown away.
+    """
+    if request is None:
+        return None
+    raw = (request.headers.get(BREAK_GLASS_HEADER) or "").strip()
+    if not raw:
+        return None
+    if len(raw) < _MIN_REASON_LENGTH:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorised for this department",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Break-glass access requires a specific reason of at least "
+                f"{_MIN_REASON_LENGTH} characters"
+            ),
         )
+    return raw[:_MAX_REASON_LENGTH]
+
+
+def _record_break_glass(
+    request: Request | None,
+    principal: Principal,
+    reason: str,
+    scope_type: str,
+    scope_value: str | None,
+) -> None:
+    """Mark the request so the audit middleware escalates it.
+
+    Emitted at WARNING with a dedicated event type: break-glass events are
+    rare and every one should be reviewed, so they must be greppable and must
+    not blend into the ordinary access stream.
+    """
+    if request is not None:
+        request.state.break_glass = {
+            "reason": reason,
+            "scope_type": scope_type,
+            "scope_value": scope_value,
+        }
+    logger.warning(
+        json.dumps(
+            {
+                "event": "break_glass_access",
+                "sub": principal.sub,
+                "roles": principal.roles,
+                "scope_type": scope_type,
+                "scope_value": scope_value,
+                "reason": reason,
+            }
+        )
+    )
+
+
+def record_break_glass_scope(
+    request: Request | None,
+    principal: Principal,
+    scope_type: str,
+    scope_value: str | None,
+) -> None:
+    """Record an override on a path where no single scope check applies.
+
+    Listing endpoints narrow results in-process rather than refusing outright,
+    so there is no denial for ``require_*_access`` to override. Without this
+    the caller would pass the check and then be quietly filtered back down to
+    their own wards — an override that appears to work and does not.
+    """
+    reason = break_glass_reason(request)
+    if reason:
+        _record_break_glass(request, principal, reason, scope_type, scope_value)
+
+
+def require_ward_access(
+    ward: str | None,
+    principal: Principal,
+    request: Request | None = None,
+) -> None:
+    if principal.can_access_ward(ward):
+        return
+    reason = break_glass_reason(request)
+    if reason:
+        _record_break_glass(request, principal, reason, "ward", ward)
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Not authorised for this ward",
+        headers={
+            # Tell the caller the override exists; they still have to justify it.
+            "X-Break-Glass-Available": "true",
+        },
+    )
+
+
+def require_department_access(
+    dept: str | None,
+    principal: Principal,
+    request: Request | None = None,
+) -> None:
+    if principal.can_access_department(dept):
+        return
+    reason = break_glass_reason(request)
+    if reason:
+        _record_break_glass(request, principal, reason, "department", dept)
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Not authorised for this department",
+        headers={"X-Break-Glass-Available": "true"},
+    )
 
 
 def requires_roles(*required: str):

@@ -40,12 +40,18 @@ export const BASE = {
 export class ApiError extends Error {
   readonly status: number
   readonly detail: string
+  /**
+   * True when the server refused on ward/department scope but signalled that
+   * a justified break-glass override would be accepted.
+   */
+  readonly breakGlassAvailable: boolean
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, breakGlassAvailable = false) {
     super(detail || `HTTP ${status}`)
     this.name = 'ApiError'
     this.status = status
     this.detail = detail
+    this.breakGlassAvailable = breakGlassAvailable
   }
 
   get isAuthError(): boolean {
@@ -93,6 +99,12 @@ type RequestOptions = {
   signal?: AbortSignal
   /** Optional Idempotency-Key for safe retries on unsafe methods. */
   idempotencyKey?: string
+  /**
+   * Emergency override of ward/department scope. Must be a specific,
+   * human-written justification: it is recorded in the audit trail and
+   * reviewed afterwards.
+   */
+  breakGlassReason?: string
 }
 
 /** Builds a query string, dropping empty/undefined values. */
@@ -159,13 +171,26 @@ export function newIdempotencyKey(): string {
 }
 
 export async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', token, body, params, signal, idempotencyKey } = options
+  const {
+    method = 'GET',
+    token,
+    body,
+    params,
+    signal,
+    idempotencyKey,
+    breakGlassReason,
+  } = options
 
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (token) headers.Authorization = `Bearer ${token}`
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   // Double-submit CSRF: echo the non-httpOnly medicore_csrf cookie so
   // cookie-only authenticated mutations pass CookieCSRFMiddleware.
+  // Applies to reads as well as writes: viewing an out-of-scope chart is
+  // exactly the case break-glass exists for.
+  if (breakGlassReason?.trim()) {
+    headers['X-Break-Glass-Reason'] = breakGlassReason.trim()
+  }
   if (UNSAFE.has(method.toUpperCase())) {
     const csrf = readCookie('medicore_csrf')
     if (csrf) headers['X-CSRF-Token'] = csrf
@@ -192,7 +217,13 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
     throw new NetworkError(err instanceof Error ? err.message : undefined)
   }
 
-  if (!res.ok) throw new ApiError(res.status, await extractDetail(res))
+  if (!res.ok) {
+    throw new ApiError(
+      res.status,
+      await extractDetail(res),
+      res.headers.get('X-Break-Glass-Available') === 'true',
+    )
+  }
 
   if (res.status === 204) return undefined as T
   const text = await res.text()
@@ -310,10 +341,16 @@ export const api = {
     })
   },
 
-  listBeds(ward: string | null, _token?: string | null, signal?: AbortSignal): Promise<Bed[]> {
+  listBeds(
+    ward: string | null,
+    _token?: string | null,
+    signal?: AbortSignal,
+    breakGlassReason?: string,
+  ): Promise<Bed[]> {
     return request<Bed[]>(`${BASE.patientFlow}/beds`, {
       params: ward ? { ward } : {},
       signal,
+      breakGlassReason,
     })
   },
 
@@ -342,10 +379,12 @@ export const api = {
     dept: string | null,
     _token?: string | null,
     signal?: AbortSignal,
+    breakGlassReason?: string,
   ): Promise<QueueListResponse> {
     return request<QueueListResponse>(`${BASE.patientFlow}/queue`, {
       params: { limit, ...(dept ? { dept } : {}) },
       signal,
+      breakGlassReason,
     })
   },
 

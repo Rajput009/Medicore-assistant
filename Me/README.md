@@ -376,3 +376,29 @@ matching nothing. Retention is separate from the FHIR cache janitor
 (`purge_older_than(days)`): cached PHI should expire in hours, but an access
 log is typically kept for six years (HIPAA 164.316(b)(2)), and sharing a sweep
 would quietly shred the trail. Searching the audit trail is itself audited.
+
+**Break-glass.** A clinician responding to an arrest on a ward they are not
+assigned to must not be blocked by an access-control rule. The answer is not a
+looser rule but an explicit override: send `X-Break-Glass-Reason` with a
+specific justification and ward/department scope is relaxed for that one
+request.
+
+Four properties keep this an override rather than a backdoor:
+
+- **Per-request.** Never a standing privilege; the next request without the
+  header is enforced normally.
+- **Justified.** A reason under 10 characters is rejected with a 400, not
+  silently ignored — a discarded override would leave the clinician facing a
+  403 with no idea why.
+- **Cannot escalate a role.** It relaxes *data scope* only; a viewer cannot
+  break glass into write access, and it never bypasses authentication.
+- **Loudly audited.** Logged at WARNING as a `break_glass_access` event with
+  the actor, the scope overridden and the reason, and the request's own audit
+  record is marked `outcome: break_glass` so every override is greppable and
+  reviewable without wading through routine access.
+
+A refusal on scope returns `X-Break-Glass-Available: true`, so the console can
+offer the override rather than making a clinician guess it exists. Listing
+endpoints narrow results in-process instead of refusing, so they honour the
+override explicitly too — otherwise a caller would pass the check and then be
+quietly filtered back down to their own wards.

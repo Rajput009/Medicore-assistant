@@ -20,7 +20,9 @@ from backend.common.app import create_service_app
 from backend.common.config import settings
 from backend.common.deps import (
     Principal,
+    break_glass_reason,
     clinical_staff,
+    record_break_glass_scope,
     require_department_access,
     require_ward_access,
 )
@@ -200,16 +202,29 @@ def _unavailable(exc: Exception) -> HTTPException:
 async def list_beds(
     repo: Repo,
     principal: ClinicalUser,
+    request: Request,
     ward: str | None = Query(default=None, max_length=64),
     occupied: bool | None = Query(default=None),
 ) -> list[Bed]:
-    require_ward_access(ward, principal)
+    require_ward_access(ward, principal, request)
     try:
         docs = await repo.list_beds(ward=ward, occupied=occupied)
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
-    # If the caller is ward-scoped and asked for all wards, filter in process.
-    if principal.wards and "admin" not in principal.roles and ward is None:
+
+    # Scope is applied two ways: an explicit ward is checked above, and an
+    # unfiltered list is narrowed here. A break-glass caller must clear both,
+    # or the override only half works — they would be let past the check and
+    # then silently filtered back down to their own wards.
+    #
+    # `require_ward_access` cannot have recorded the override for ward=None
+    # (that case is always permitted), so the reason is read directly.
+    broke_glass = getattr(request.state, "break_glass", None) is not None
+    if not broke_glass and ward is None and break_glass_reason(request):
+        record_break_glass_scope(request, principal, "ward", None)
+        broke_glass = True
+
+    if principal.wards and "admin" not in principal.roles and ward is None and not broke_glass:
         docs = [d for d in docs if d.get("ward") in principal.wards]
     return [Bed(**d) for d in docs]
 
@@ -252,7 +267,7 @@ async def update_bed(
             ) from exc
         except PyMongoError as exc:
             raise _unavailable(exc) from exc
-        require_ward_access(existing.get("ward"), principal)
+        require_ward_access(existing.get("ward"), principal, request)
 
     route = f"PATCH /beds/{bed_id}"
     idem_key = extract_idempotency_key(request)
@@ -296,7 +311,7 @@ async def enqueue(
     principal: ClinicalUser,
     request: Request,
 ):
-    require_department_access(item.dept, principal)
+    require_department_access(item.dept, principal, request)
 
     route = "POST /queue"
     idem_key = extract_idempotency_key(request)
@@ -327,16 +342,28 @@ async def enqueue(
 async def list_queue(
     repo: Repo,
     principal: ClinicalUser,
+    request: Request,
     limit: int = Query(default=25, ge=1, le=200),
     dept: str | None = Query(default=None, max_length=64),
 ) -> dict[str, Any]:
-    require_department_access(dept, principal)
+    require_department_access(dept, principal, request)
     try:
         items = await repo.list_queue(limit=limit, dept=dept)
         total = await repo.count_queue(dept=dept)
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
-    if principal.departments and "admin" not in principal.roles and dept is None:
+    # Same two-path scoping as /beds: an unfiltered list is narrowed here, so
+    # an override has to be honoured on this path too.
+    broke_glass = getattr(request.state, "break_glass", None) is not None
+    if not broke_glass and dept is None and break_glass_reason(request):
+        record_break_glass_scope(request, principal, "department", None)
+        broke_glass = True
+    if (
+        principal.departments
+        and "admin" not in principal.roles
+        and dept is None
+        and not broke_glass
+    ):
         items = [i for i in items if i.get("dept") in principal.departments]
         total = len(items)
     return {"items": items, "count": len(items), "total": total}
@@ -350,7 +377,7 @@ async def claim_next(
     dept: str = Query(..., max_length=64),
 ):
     """Atomically claim the most urgent waiting patient in a department."""
-    require_department_access(dept, principal)
+    require_department_access(dept, principal, request)
 
     route = f"POST /queue/claim?dept={dept}"
     idem_key = extract_idempotency_key(request)
