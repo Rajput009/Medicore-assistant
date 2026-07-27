@@ -99,6 +99,8 @@ describe('navigation', () => {
   it('shows FHIR but not admin to a clinician', () => {
     expect(visibleNavItems(['clinician']).map((i) => i.to)).toEqual([
       '/',
+      '/worklist',
+      '/wards',
       '/fhir',
       '/flow',
       '/cds',
@@ -106,7 +108,7 @@ describe('navigation', () => {
   })
 
   it('shows everything to an admin', () => {
-    expect(visibleNavItems(['admin'])).toHaveLength(5)
+    expect(visibleNavItems(['admin'])).toHaveLength(7)
   })
 
   it('shows only the overview when the user has no roles', () => {

@@ -147,7 +147,50 @@ export const handlers = [
   http.get('/api/fhir/patient/:id', ({ params, request }) => {
     const denied = requireAuth(request)
     if (denied) return denied
-    return HttpResponse.json({ resourceType: 'Patient', id: params.id, active: true })
+    return HttpResponse.json({
+      resourceType: 'Patient',
+      id: params.id,
+      active: true,
+      gender: 'female',
+      birthDate: '1815-12-10',
+      name: [{ text: 'Ada Lovelace' }],
+    })
+  }),
+
+  http.get(/\/api\/fhir\/observation\/search/, ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Observation',
+            id: 'obs-1',
+            code: { text: 'Heart rate' },
+            valueQuantity: { value: 88, unit: '/min' },
+          },
+        },
+      ],
+    })
+  }),
+
+  http.get(/\/api\/fhir\/encounter\/search/, ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Encounter',
+            id: 'enc-1',
+            status: 'in-progress',
+            class: { code: 'EMER' },
+          },
+        },
+      ],
+    })
   }),
 
   http.delete('/api/cache/:resource', ({ params, request }) => {

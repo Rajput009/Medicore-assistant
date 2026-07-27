@@ -1,9 +1,11 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 
 import { api } from '../api/client'
 import type { FhirBundle, FhirResource, FhirResourceType } from '../api/types'
 import { FHIR_RESOURCES } from '../api/types'
 import { useAsyncAction } from '../hooks/useAsync'
+import { PatientLink } from '../patient/PatientChartDrawer'
 import { Alert, Card, EmptyState, Field, JsonBlock, Spinner } from '../ui/components'
 
 type Mode = 'search' | 'read'
@@ -34,13 +36,20 @@ export function bundleResources(bundle: FhirBundle | undefined): FhirResource[] 
 }
 
 export const FhirPage: React.FC = () => {
+  const [searchParams] = useSearchParams()
   const [resource, setResource] = useState<FhirResourceType>('Patient')
   const [mode, setMode] = useState<Mode>('search')
   const [resourceId, setResourceId] = useState('')
-  const [patient, setPatient] = useState('')
+  const [patient, setPatient] = useState(() => searchParams.get('patient')?.trim() ?? '')
   const [extraKey, setExtraKey] = useState('')
   const [extraValue, setExtraValue] = useState('')
   const [validation, setValidation] = useState<string | null>(null)
+
+  // Prefill patient filter from deep link / chart action.
+  useEffect(() => {
+    const p = searchParams.get('patient')?.trim()
+    if (p) setPatient(p)
+  }, [searchParams])
 
   const search = useAsyncAction<[FhirResourceType, Record<string, string>], FhirBundle>(
     (signal, res, params) => api.fhirSearch(res, params, null, signal),
@@ -205,13 +214,28 @@ export const FhirPage: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {results.map((r, i) => (
-                    <tr key={`${r.id ?? 'row'}-${i}`}>
-                      <td>{r.resourceType}</td>
-                      <td className="mono">{r.id ?? '—'}</td>
-                      <td>{summariseResource(r)}</td>
-                    </tr>
-                  ))}
+                  {results.map((r, i) => {
+                    const chartId =
+                      r.resourceType === 'Patient'
+                        ? r.id
+                        : typeof (r as { subject?: { reference?: string } }).subject
+                              ?.reference === 'string'
+                          ? String(
+                              (r as { subject?: { reference?: string } }).subject?.reference,
+                            )
+                              .split('/')
+                              .pop()
+                          : patient || r.id
+                    return (
+                      <tr key={`${r.id ?? 'row'}-${i}`}>
+                        <td>{r.resourceType}</td>
+                        <td className="mono">
+                          {chartId ? <PatientLink id={chartId}>{r.id ?? chartId}</PatientLink> : (r.id ?? '—')}
+                        </td>
+                        <td>{summariseResource(r)}</td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>

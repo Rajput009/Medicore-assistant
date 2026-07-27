@@ -3,12 +3,16 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-
 
 import type { Role } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
+import { PatientChartDrawer } from '../patient/PatientChartDrawer'
+import { PatientChartProvider } from '../patient/PatientChartContext'
 import { AdminPage } from '../pages/AdminPage'
 import { CdsPage } from '../pages/CdsPage'
 import { DashboardPage } from '../pages/DashboardPage'
 import { FhirPage } from '../pages/FhirPage'
 import { LoginPage } from '../pages/LoginPage'
 import { PatientFlowPage } from '../pages/PatientFlowPage'
+import { WorklistPage } from '../pages/WorklistPage'
+import { WardBoardPage } from '../pages/WardBoardPage'
 import { AppShell } from './AppShell'
 import { Alert, Card } from './components'
 
@@ -122,44 +126,63 @@ export const App: React.FC = () => (
       path="*"
       element={
         <RequireAuth>
-          <AppShell>
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route
-                path="/fhir"
-                element={
-                  <RequireRole roles={['clinician', 'admin']}>
-                    <FhirPage />
-                  </RequireRole>
-                }
-              />
-              <Route
-                path="/flow"
-                element={
-                  <RequireRole roles={['clinician', 'admin']}>
-                    <PatientFlowPage />
-                  </RequireRole>
-                }
-              />
-              <Route
-                path="/cds"
-                element={
-                  <RequireRole roles={['clinician', 'admin']}>
-                    <CdsPage />
-                  </RequireRole>
-                }
-              />
-              <Route
-                path="/admin"
-                element={
-                  <RequireRole roles={['admin']}>
-                    <AdminPage />
-                  </RequireRole>
-                }
-              />
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </AppShell>
+          <PatientChartProvider>
+            <AppShell>
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route
+                  path="/worklist"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <WorklistPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/wards"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <WardBoardPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/fhir"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <FhirPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/flow"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <PatientFlowPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/cds"
+                  element={
+                    <RequireRole roles={['clinician', 'admin']}>
+                      <CdsPage />
+                    </RequireRole>
+                  }
+                />
+                <Route
+                  path="/admin"
+                  element={
+                    <RequireRole roles={['admin']}>
+                      <AdminPage />
+                    </RequireRole>
+                  }
+                />
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+              <PatientChartDrawer />
+            </AppShell>
+          </PatientChartProvider>
         </RequireAuth>
       }
     />

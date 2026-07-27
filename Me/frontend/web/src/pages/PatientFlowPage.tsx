@@ -3,6 +3,7 @@ import React, { useState } from 'react'
 import { api } from '../api/client'
 import type { Bed, QueueListResponse } from '../api/types'
 import { useAsyncAction, useAsyncData } from '../hooks/useAsync'
+import { PatientLink } from '../patient/PatientChartDrawer'
 import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
 
 /** ESI acuity 1 (most urgent) .. 5 (least). */
@@ -89,7 +90,13 @@ const BedsCard: React.FC = () => {
                           {bed.occupied ? 'occupied' : 'available'}
                         </Badge>
                       </td>
-                      <td className="mono">{bed.patient_id ?? '—'}</td>
+                      <td className="mono">
+                        {bed.patient_id ? (
+                          <PatientLink id={bed.patient_id} />
+                        ) : (
+                          '—'
+                        )}
+                      </td>
                       <td>
                         <button
                           type="button"
@@ -196,7 +203,9 @@ const QueueCard: React.FC = () => {
                 <tbody>
                   {items.map((item, i) => (
                     <tr key={`${item.patient_id}-${i}`}>
-                      <td className="mono">{item.patient_id}</td>
+                      <td className="mono">
+                        <PatientLink id={item.patient_id} />
+                      </td>
                       <td>
                         <Badge tone={acuityTone(item.acuity)}>ESI {item.acuity}</Badge>
                       </td>

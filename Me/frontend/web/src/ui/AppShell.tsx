@@ -11,6 +11,8 @@ type NavItem = { to: string; label: string; roles?: Role[] }
 // a link that would immediately 403.
 export const NAV_ITEMS: NavItem[] = [
   { to: '/', label: 'Overview' },
+  { to: '/worklist', label: 'My patients', roles: ['clinician', 'admin'] },
+  { to: '/wards', label: 'Ward board', roles: ['clinician', 'admin'] },
   { to: '/fhir', label: 'FHIR explorer', roles: ['clinician', 'admin'] },
   { to: '/flow', label: 'Patient flow', roles: ['clinician', 'admin'] },
   { to: '/cds', label: 'Decision support', roles: ['clinician', 'admin'] },

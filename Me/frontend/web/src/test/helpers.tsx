@@ -7,6 +7,7 @@ import { http, HttpResponse } from 'msw'
 import type { Role } from '../api/types'
 import { AuthProvider } from '../auth/AuthContext'
 import { purgeLegacyTokenStorage } from '../auth/token'
+import { PatientChartProvider } from '../patient/PatientChartContext'
 import { server } from './server'
 
 /** base64url encode, matching what a JWT issuer produces. */
@@ -92,7 +93,9 @@ export function renderWithProviders(
   const user = userEvent.setup()
   const result = render(
     <MemoryRouter initialEntries={[route]}>
-      <AuthProvider>{ui}</AuthProvider>
+      <AuthProvider>
+        <PatientChartProvider>{ui}</PatientChartProvider>
+      </AuthProvider>
     </MemoryRouter>,
   )
   return { ...result, user }
