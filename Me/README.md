@@ -85,7 +85,7 @@ deploy/
   k8s/                   # production k8s manifests (base overlays)
 infra/
   terraform/             # AWS/Azure IaC stubs (VPC, EKS/AKS, RDS, MSK)
-.github/workflows/       # CI/CD (build, lint, test, docker)
+.github/                 # CI/CD template (ci.yml.example -> workflows/ci.yml)
 Makefile                 # DX helpers
 ```
 

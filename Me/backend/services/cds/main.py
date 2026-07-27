@@ -1,9 +1,10 @@
 """MediCore clinical decision support (stub scoring)."""
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
 
 from backend.common.config import settings
+from backend.common.deps import Principal, clinical_staff
 from backend.common.middleware import AuditLogMiddleware
 from backend.common.telemetry import instrument_fastapi
 
@@ -21,6 +22,7 @@ class Health(BaseModel):
 
 @app.get("/health", response_model=Health)
 def health() -> Health:
+    """Unauthenticated: probes and load balancers need this."""
     return Health(status="ok", service="cds", env=settings.env)
 
 
@@ -39,7 +41,10 @@ class RiskResp(BaseModel):
 
 
 @app.post("/risk", response_model=RiskResp)
-def risk(req: RiskRequest) -> RiskResp:
+def risk(
+    req: RiskRequest,
+    principal: Principal = Depends(clinical_staff),
+) -> RiskResp:
     """Dummy scoring logic — replace with a validated clinical model.
 
     Each term is clamped at 0 so that a *better* vital can never offset a worse

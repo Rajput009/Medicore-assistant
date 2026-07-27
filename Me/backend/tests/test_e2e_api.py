@@ -350,14 +350,14 @@ class TestCdsService:
         return TestClient(m.app)
 
     def test_end_to_end_scoring(self, client):
-        r = client.post("/risk", json={"hr": 72, "sbp": 120, "spo2": 98})
+        r = client.post("/risk", json={"hr": 72, "sbp": 120, "spo2": 98}, headers=bearer("clinician"))
         assert r.status_code == 200
         body = r.json()
         assert body["class_label"] == "low"
         assert 0.0 <= body["score"] <= 1.0
 
     def test_critical_patient_is_high_risk(self, client):
-        r = client.post("/risk", json={"hr": 190, "sbp": 55, "spo2": 78})
+        r = client.post("/risk", json={"hr": 190, "sbp": 55, "spo2": 78}, headers=bearer("clinician"))
         assert r.json()["class_label"] == "high"
 
     @pytest.mark.parametrize(
@@ -370,7 +370,8 @@ class TestCdsService:
         ],
     )
     def test_invalid_payloads_are_rejected(self, client, payload):
-        assert client.post("/risk", json=payload).status_code == 422
+        r = client.post("/risk", json=payload, headers=bearer("clinician"))
+        assert r.status_code == 422
 
     def test_health(self, client):
         assert client.get("/health").json()["service"] == "cds"

@@ -7,11 +7,13 @@ import { Badge } from './components'
 
 type NavItem = { to: string; label: string; roles?: Role[] }
 
+// Roles mirror what each backend service enforces, so the console never shows
+// a link that would immediately 403.
 export const NAV_ITEMS: NavItem[] = [
   { to: '/', label: 'Overview' },
   { to: '/fhir', label: 'FHIR explorer', roles: ['clinician', 'admin'] },
-  { to: '/flow', label: 'Patient flow' },
-  { to: '/cds', label: 'Decision support' },
+  { to: '/flow', label: 'Patient flow', roles: ['clinician', 'admin'] },
+  { to: '/cds', label: 'Decision support', roles: ['clinician', 'admin'] },
   { to: '/admin', label: 'Cache admin', roles: ['admin'] },
 ]
 

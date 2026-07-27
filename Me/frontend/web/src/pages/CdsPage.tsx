@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 
 import { api } from '../api/client'
 import type { RiskResponse } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
 import { useAsyncAction } from '../hooks/useAsync'
 import { Alert, Badge, Card, Field, Spinner } from '../ui/components'
 
@@ -40,6 +41,7 @@ export function riskTone(label: RiskResponse['class_label']): 'ok' | 'warn' | 'e
 }
 
 export const CdsPage: React.FC = () => {
+  const { token } = useAuth()
   const [values, setValues] = useState<Record<VitalKey, string>>({
     hr: '72',
     sbp: '120',
@@ -47,7 +49,7 @@ export const CdsPage: React.FC = () => {
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const risk = useAsyncAction<[number, number, number], RiskResponse>((signal, hr, sbp, spo2) =>
-    api.risk({ hr, sbp, spo2 }, signal),
+    api.risk({ hr, sbp, spo2 }, token, signal),
   )
 
   const set = (key: VitalKey) => (e: React.ChangeEvent<HTMLInputElement>) =>

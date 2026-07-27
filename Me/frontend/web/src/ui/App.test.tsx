@@ -69,17 +69,31 @@ describe('role-based access', () => {
     expect(await screen.findByRole('heading', { name: /cache administration/i })).toBeInTheDocument()
   })
 
-  it('allows shared pages for any authenticated role', async () => {
+  it('denies decision support to a viewer', async () => {
+    // Vitals are clinical data; the CDS service enforces this server-side too.
     renderApp('/cds', makeToken({ roles: ['viewer'] }))
-    expect(
-      await screen.findByRole('heading', { name: /clinical decision support/i }),
-    ).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: /access denied/i })).toBeInTheDocument()
+  })
+
+  it('denies patient flow to a viewer', async () => {
+    renderApp('/flow', makeToken({ roles: ['viewer'] }))
+    expect(await screen.findByRole('heading', { name: /access denied/i })).toBeInTheDocument()
+  })
+
+  it('allows patient flow and decision support for a clinician', async () => {
+    renderApp('/flow', makeToken({ roles: ['clinician'] }))
+    expect(await screen.findByRole('heading', { name: /^patient flow$/i })).toBeInTheDocument()
+  })
+
+  it('always allows the overview page', async () => {
+    renderApp('/', makeToken({ roles: ['viewer'] }))
+    expect(await screen.findByRole('heading', { name: /system overview/i })).toBeInTheDocument()
   })
 })
 
 describe('navigation', () => {
-  it('hides privileged links from a viewer', () => {
-    expect(visibleNavItems(['viewer']).map((i) => i.to)).toEqual(['/', '/flow', '/cds'])
+  it('hides every clinical link from a viewer', () => {
+    expect(visibleNavItems(['viewer']).map((i) => i.to)).toEqual(['/'])
   })
 
   it('shows FHIR but not admin to a clinician', () => {
@@ -95,8 +109,8 @@ describe('navigation', () => {
     expect(visibleNavItems(['admin'])).toHaveLength(5)
   })
 
-  it('shows only public links when the user has no roles', () => {
-    expect(visibleNavItems([]).map((i) => i.to)).toEqual(['/', '/flow', '/cds'])
+  it('shows only the overview when the user has no roles', () => {
+    expect(visibleNavItems([]).map((i) => i.to)).toEqual(['/'])
   })
 
   it('navigates between pages via the sidebar', async () => {

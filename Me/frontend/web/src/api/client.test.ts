@@ -186,7 +186,43 @@ describe('api endpoints', () => {
         return HttpResponse.json({ id: 'b', ward: 'A', occupied: true })
       }),
     )
-    await api.setBedOccupancy('b', true)
+    await api.setBedOccupancy('b', true, 'tok')
     expect(search).toBe('?occupied=true')
+  })
+
+  it('sends the bearer token to patient-flow and CDS', async () => {
+    // These services enforce auth independently of the gateway, so the token
+    // must be attached to their requests too.
+    const seen: Record<string, string | null> = {}
+    server.use(
+      http.get('/flow/beds', ({ request: req }) => {
+        seen.beds = req.headers.get('authorization')
+        return HttpResponse.json([])
+      }),
+      http.get('/flow/queue', ({ request: req }) => {
+        seen.queue = req.headers.get('authorization')
+        return HttpResponse.json({ items: [], count: 0 })
+      }),
+      http.post('/flow/queue', ({ request: req }) => {
+        seen.enqueue = req.headers.get('authorization')
+        return HttpResponse.json({ ok: true, id: 'q' }, { status: 201 })
+      }),
+      http.post('/cds/risk', ({ request: req }) => {
+        seen.risk = req.headers.get('authorization')
+        return HttpResponse.json({ score: 0, class_label: 'low' })
+      }),
+    )
+
+    await api.listBeds(null, 'tok')
+    await api.listQueue(10, null, 'tok')
+    await api.enqueue({ patient_id: 'p', acuity: 3, dept: 'ED' }, 'tok')
+    await api.risk({ hr: 72, sbp: 120, spo2: 98 }, 'tok')
+
+    expect(seen).toEqual({
+      beds: 'Bearer tok',
+      queue: 'Bearer tok',
+      enqueue: 'Bearer tok',
+      risk: 'Bearer tok',
+    })
   })
 })

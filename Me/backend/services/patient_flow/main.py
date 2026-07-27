@@ -1,20 +1,50 @@
-"""MediCore patient flow: bed management + triage queue."""
+"""MediCore patient flow: bed management + triage queue.
 
+Every route here touches patient data, so all of them require a valid token.
+Reads and writes require the clinician or admin role.
+"""
+
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import PyMongoError
 
 from backend.common.config import settings
+from backend.common.deps import Principal, clinical_staff
 from backend.common.middleware import AuditLogMiddleware
 from backend.common.telemetry import instrument_fastapi
 
+# serverSelectionTimeoutMS keeps requests from hanging ~30s when Mongo is down.
+_client = MongoClient(
+    settings.mongo_uri,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000,
+    tz_aware=True,
+)
+mdb = _client[settings.mongo_db]
+_queue = mdb.triage_queue
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: index creation is best-effort so a brief Mongo outage does not
+    # prevent the service from booting (health checks must still answer).
+    try:
+        _queue.create_index([("acuity", ASCENDING), ("created_at", ASCENDING)])
+        _queue.create_index([("patient_id", ASCENDING)])
+    except PyMongoError:
+        pass
+    yield
+    _client.close()
+
+
 app = instrument_fastapi(
-    FastAPI(title="MediCore Patient Flow", version="0.1.0"),
+    FastAPI(title="MediCore Patient Flow", version="0.1.0", lifespan=lifespan),
     service_name="patient-flow",
 )
 app.add_middleware(AuditLogMiddleware)
@@ -28,6 +58,7 @@ class Health(BaseModel):
 
 @app.get("/health", response_model=Health)
 def health() -> Health:
+    """Unauthenticated: probes and load balancers need this."""
     return Health(status="ok", service="patient-flow", env=settings.env)
 
 
@@ -42,20 +73,25 @@ class Bed(BaseModel):
     occupied: bool
 
 
-BEDS: list[Bed] = [
-    Bed(id=str(uuid4()), ward="A", occupied=False) for _ in range(4)
-]
+BEDS: list[Bed] = [Bed(id=str(uuid4()), ward="A", occupied=False) for _ in range(4)]
 
 
 @app.get("/beds", response_model=list[Bed])
-def list_beds(ward: str | None = None) -> list[Bed]:
+def list_beds(
+    ward: str | None = None,
+    principal: Principal = Depends(clinical_staff),
+) -> list[Bed]:
     if ward:
         return [b for b in BEDS if b.ward == ward]
     return BEDS
 
 
 @app.patch("/beds/{bed_id}", response_model=Bed)
-def update_bed(bed_id: str, occupied: bool) -> Bed:
+def update_bed(
+    bed_id: str,
+    occupied: bool,
+    principal: Principal = Depends(clinical_staff),
+) -> Bed:
     for bed in BEDS:
         if bed.id == bed_id:
             bed.occupied = occupied
@@ -69,42 +105,19 @@ def update_bed(bed_id: str, occupied: bool) -> Bed:
 # Triage queue (MongoDB)
 # --------------------------------------------------------------------------
 
-# serverSelectionTimeoutMS keeps requests from hanging ~30s when Mongo is down.
-_client = MongoClient(
-    settings.mongo_uri,
-    serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=5000,
-    tz_aware=True,
-)
-mdb = _client[settings.mongo_db]
-_queue = mdb.triage_queue
-
-
-@app.on_event("startup")
-def _ensure_indexes() -> None:
-    try:
-        # Supports the sorted queue read below.
-        _queue.create_index([("acuity", ASCENDING), ("created_at", ASCENDING)])
-        _queue.create_index([("patient_id", ASCENDING)])
-    except PyMongoError:
-        # Don't block startup if Mongo is briefly unavailable.
-        pass
-
-
-@app.on_event("shutdown")
-def _close_mongo() -> None:
-    _client.close()
-
 
 class QueueItem(BaseModel):
-    patient_id: str = Field(..., min_length=1)
+    patient_id: str = Field(..., min_length=1, max_length=64)
     # ESI-style acuity: 1 = most urgent, 5 = least.
     acuity: int = Field(..., ge=1, le=5)
-    dept: str = Field(..., min_length=1)
+    dept: str = Field(..., min_length=1, max_length=64)
 
 
 @app.post("/queue", status_code=status.HTTP_201_CREATED)
-def enqueue(item: QueueItem) -> dict[str, Any]:
+def enqueue(
+    item: QueueItem,
+    principal: Principal = Depends(clinical_staff),
+) -> dict[str, Any]:
     rec = item.model_dump()
     rec["created_at"] = datetime.now(UTC)
     try:
@@ -121,6 +134,7 @@ def enqueue(item: QueueItem) -> dict[str, Any]:
 def list_queue(
     limit: int = Query(default=10, ge=1, le=200),
     dept: str | None = None,
+    principal: Principal = Depends(clinical_staff),
 ) -> dict[str, Any]:
     query: dict[str, Any] = {}
     if dept:

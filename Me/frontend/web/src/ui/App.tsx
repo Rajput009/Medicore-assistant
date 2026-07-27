@@ -118,8 +118,22 @@ export const App: React.FC = () => (
                   </RequireRole>
                 }
               />
-              <Route path="/flow" element={<PatientFlowPage />} />
-              <Route path="/cds" element={<CdsPage />} />
+              <Route
+                path="/flow"
+                element={
+                  <RequireRole roles={['clinician', 'admin']}>
+                    <PatientFlowPage />
+                  </RequireRole>
+                }
+              />
+              <Route
+                path="/cds"
+                element={
+                  <RequireRole roles={['clinician', 'admin']}>
+                    <CdsPage />
+                  </RequireRole>
+                }
+              />
               <Route
                 path="/admin"
                 element={

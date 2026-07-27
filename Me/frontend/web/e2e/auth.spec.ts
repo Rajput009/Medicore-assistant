@@ -102,8 +102,21 @@ test.describe('role-based access', () => {
   test('a viewer sees no privileged navigation links', async ({ stubbedPage: page }) => {
     await signIn(page, ['viewer'])
     await page.goto('/')
-    await expect(page.getByRole('link', { name: /fhir explorer/i })).toHaveCount(0)
-    await expect(page.getByRole('link', { name: /cache admin/i })).toHaveCount(0)
+    for (const label of [/fhir explorer/i, /patient flow/i, /decision support/i, /cache admin/i]) {
+      await expect(page.getByRole('link', { name: label })).toHaveCount(0)
+    }
+    // The overview remains available to any authenticated user.
+    await expect(page.getByRole('link', { name: /overview/i })).toBeVisible()
+  })
+
+  test('a viewer cannot open patient flow or decision support', async ({
+    stubbedPage: page,
+  }) => {
+    await signIn(page, ['viewer'])
+    for (const route of ['/flow', '/cds']) {
+      await page.goto(route)
+      await expect(page.getByRole('heading', { name: /access denied/i })).toBeVisible()
+    }
   })
 
   test('a clinician cannot open cache administration', async ({ stubbedPage: page }) => {

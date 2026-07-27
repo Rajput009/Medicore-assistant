@@ -27,6 +27,16 @@ export function makeToken(
 const json = (route: Route, body: unknown, status = 200) =>
   route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 
+/** Mirrors the real services, which reject anonymous callers. */
+function unauthorized(route: Route): boolean {
+  const header = route.request().headers()['authorization']
+  if (!header?.toLowerCase().startsWith('bearer ')) {
+    void json(route, { detail: 'Missing bearer token' }, 401)
+    return true
+  }
+  return false
+}
+
 /** Registers the default happy-path backend stubs. */
 export async function stubBackend(page: Page): Promise<void> {
   await page.route('**/api/health', (r) =>
@@ -67,17 +77,20 @@ export async function stubBackend(page: Page): Promise<void> {
     json(r, { status: 'ok', resource: 'Patient', patient: null, deleted: 3 }),
   )
 
-  await page.route('**/flow/beds', (r) =>
-    json(r, [
+  await page.route('**/flow/beds', (r) => {
+    if (unauthorized(r)) return
+    return json(r, [
       { id: 'bed-11111111', ward: 'A', occupied: false },
       { id: 'bed-22222222', ward: 'B', occupied: true },
-    ]),
-  )
-  await page.route('**/flow/beds/*', (r) =>
-    json(r, { id: 'bed-11111111', ward: 'A', occupied: true }),
-  )
+    ])
+  })
+  await page.route('**/flow/beds/*', (r) => {
+    if (unauthorized(r)) return
+    return json(r, { id: 'bed-11111111', ward: 'A', occupied: true })
+  })
 
   await page.route('**/flow/queue*', async (route) => {
+    if (unauthorized(route)) return
     if (route.request().method() === 'POST') {
       return json(route, { ok: true, id: 'q1' }, 201)
     }
@@ -91,6 +104,7 @@ export async function stubBackend(page: Page): Promise<void> {
   })
 
   await page.route('**/cds/risk', async (route) => {
+    if (unauthorized(route)) return
     const b = route.request().postDataJSON() as { hr: number; sbp: number; spo2: number }
     const score = Math.min(
       Math.max(b.hr - 100, 0) / 100 + Math.max(90 - b.sbp, 0) / 90 + Math.max(95 - b.spo2, 0) / 95,

@@ -132,8 +132,8 @@ npm run build
 | --------------------- | -------- | -------------------------------------------------------- | ------------------ |
 | **Overview**          | `/`      | Live health of all four services, refresh, resolved config | any                |
 | **FHIR explorer**     | `/fhir`  | Search or read Patient / Encounter / Observation / MedicationRequest; result table + raw bundle | clinician or admin |
-| **Patient flow**      | `/flow`  | Bed occupancy with toggle, triage queue with filters, enqueue form | any                |
-| **Decision support**  | `/cds`   | Risk scoring from vitals with a visual scale              | any                |
+| **Patient flow**      | `/flow`  | Bed occupancy with toggle, triage queue with filters, enqueue form | clinician or admin |
+| **Decision support**  | `/cds`   | Risk scoring from vitals with a visual scale              | clinician or admin |
 | **Cache admin**       | `/admin` | Invalidate cached FHIR responses, optionally per patient  | admin              |
 
 Every destructive action (cache invalidation) requires explicit confirmation.
@@ -158,10 +158,16 @@ Session handling covers the cases that usually break in practice:
 
 ### The client-side role gate is an affordance, not a control
 
-`RequireRole` and the filtered navigation only reduce confusion. **The gateway
+`RequireRole` and the filtered navigation only reduce confusion. **Every service
 independently enforces RBAC on every request.** A user who edits their token or
 navigates directly to `/admin` gets a 403 from the server, which the UI renders
 as a permission message. Treat the browser as untrusted.
+
+Enforcement is per-service, not only at the gateway: `patient-flow` and `cds`
+are directly reachable inside a cluster, so they validate the bearer token
+themselves via `backend/common/deps.py`. Only `/health` is public, because
+liveness and readiness probes need it. Consequently **every** call the console
+makes to those services carries the `Authorization` header.
 
 ### OIDC callback
 

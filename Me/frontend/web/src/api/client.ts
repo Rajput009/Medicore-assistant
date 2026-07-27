@@ -223,39 +223,62 @@ export const api = {
     })
   },
 
-  listBeds(ward: string | null, signal?: AbortSignal): Promise<Bed[]> {
+  listBeds(ward: string | null, token: string | null, signal?: AbortSignal): Promise<Bed[]> {
     return request<Bed[]>(`${BASE.patientFlow}/beds`, {
+      token,
       params: ward ? { ward } : {},
       signal,
     })
   },
 
-  setBedOccupancy(id: string, occupied: boolean, signal?: AbortSignal): Promise<Bed> {
+  setBedOccupancy(
+    id: string,
+    occupied: boolean,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<Bed> {
     return request<Bed>(`${BASE.patientFlow}/beds/${encodeURIComponent(id)}`, {
       method: 'PATCH',
+      token,
       params: { occupied },
       signal,
     })
   },
 
-  listQueue(limit: number, dept: string | null, signal?: AbortSignal): Promise<QueueListResponse> {
+  listQueue(
+    limit: number,
+    dept: string | null,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<QueueListResponse> {
     return request<QueueListResponse>(`${BASE.patientFlow}/queue`, {
+      token,
       params: { limit, ...(dept ? { dept } : {}) },
       signal,
     })
   },
 
-  enqueue(item: QueueItem, signal?: AbortSignal): Promise<{ ok: boolean; id: string }> {
+  enqueue(
+    item: QueueItem,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; id: string }> {
     return request<{ ok: boolean; id: string }>(`${BASE.patientFlow}/queue`, {
       method: 'POST',
+      token,
       body: item,
       signal,
     })
   },
 
-  risk(payload: RiskRequest, signal?: AbortSignal): Promise<RiskResponse> {
+  risk(
+    payload: RiskRequest,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<RiskResponse> {
     return request<RiskResponse>(`${BASE.cds}/risk`, {
       method: 'POST',
+      token,
       body: payload,
       signal,
     })

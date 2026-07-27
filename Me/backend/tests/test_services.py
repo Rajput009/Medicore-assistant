@@ -4,6 +4,12 @@ import pytest
 from starlette.testclient import TestClient
 
 from backend.common.cache import _make_key
+from backend.common.security import create_access_token
+
+
+def _auth(*roles: str) -> dict[str, str]:
+    """CDS enforces auth itself, so these calls must carry a token."""
+    return {"Authorization": f"Bearer {create_access_token('t', roles=list(roles) or ['clinician'])}"}
 
 # --- cache keys ----------------------------------------------------------
 
@@ -33,25 +39,25 @@ def cds():
 
 
 def test_healthy_vitals_are_low_risk(cds):
-    r = cds.post("/risk", json={"hr": 72, "sbp": 120, "spo2": 98})
+    r = cds.post("/risk", json={"hr": 72, "sbp": 120, "spo2": 98}, headers=_auth())
     assert r.status_code == 200
     assert r.json()["class_label"] == "low"
     assert r.json()["score"] == 0.0
 
 
 def test_critical_vitals_are_high_risk(cds):
-    r = cds.post("/risk", json={"hr": 190, "sbp": 60, "spo2": 80})
+    r = cds.post("/risk", json={"hr": 190, "sbp": 60, "spo2": 80}, headers=_auth())
     assert r.json()["class_label"] == "high"
 
 
 def test_good_vital_cannot_mask_bad_one(cds):
     """Regression: the old formula let high SBP cancel out tachycardia."""
-    tachy = cds.post("/risk", json={"hr": 180, "sbp": 190, "spo2": 99}).json()
+    tachy = cds.post("/risk", json={"hr": 180, "sbp": 190, "spo2": 99}, headers=_auth()).json()
     assert tachy["score"] > 0.0
 
 
 def test_score_is_bounded(cds):
-    r = cds.post("/risk", json={"hr": 300, "sbp": 1, "spo2": 1}).json()
+    r = cds.post("/risk", json={"hr": 300, "sbp": 1, "spo2": 1}, headers=_auth()).json()
     assert 0.0 <= r["score"] <= 1.0
 
 
@@ -64,7 +70,7 @@ def test_score_is_bounded(cds):
     ],
 )
 def test_impossible_vitals_rejected(cds, payload):
-    assert cds.post("/risk", json=payload).status_code == 422
+    assert cds.post("/risk", json=payload, headers=_auth()).status_code == 422
 
 
 # --- audit logging -------------------------------------------------------
