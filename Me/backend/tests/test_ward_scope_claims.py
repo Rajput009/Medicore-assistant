@@ -151,7 +151,7 @@ class TestScopeIsEnforcedEndToEnd:
     def test_enqueue_outside_department_scope_is_forbidden(self, flow):
         r = flow.post(
             "/queue",
-            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ICU"},
+            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ICU", "reason": "Deteriorating observations requiring urgent review"},
             headers=self._headers(departments=["ED"]),
         )
         assert r.status_code == 403

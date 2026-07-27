@@ -208,7 +208,7 @@ class TestMongoMockIndexSemantics:
             await repo.enqueue("MRN-1", 2, "ED", "nurse")
             with pytest.raises(ConflictError):
                 await repo.enqueue("MRN-1", 1, "ED", "nurse")
-            await repo.complete("MRN-1")
+            await repo.complete("MRN-1", disposition="discharged", completed_by="dr.test")
             # After completion the patient may wait again.
             await repo.enqueue("MRN-1", 3, "ED", "nurse")
             assert await repo.count_queue() == 1

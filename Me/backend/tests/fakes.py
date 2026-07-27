@@ -8,6 +8,7 @@ without needing a MongoDB instance.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from typing import Any
 
@@ -95,7 +96,17 @@ class FakePatientFlowRepository:
     # -- queue -------------------------------------------------------------
 
     async def enqueue(
-        self, patient_id: str, acuity: int, dept: str, created_by: str
+        self,
+        patient_id: str,
+        acuity: int,
+        dept: str,
+        created_by: str,
+        *,
+        reason: str | None = None,
+        news2_score: int | None = None,
+        news2_band: str | None = None,
+        red_flag: bool | None = None,
+        vitals_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._guard()
         # Mirrors the unique partial index on (patient_id, status="waiting").
@@ -104,7 +115,7 @@ class FakePatientFlowRepository:
             for i in self.queue_store
         ):
             raise ConflictError(patient_id)
-        doc = {
+        doc: dict[str, Any] = {
             "patient_id": patient_id,
             "acuity": acuity,
             "dept": dept,
@@ -112,6 +123,18 @@ class FakePatientFlowRepository:
             "created_at": _utcnow(),
             "created_by": created_by,
         }
+        # Same rule as the real repository: absent evidence is omitted, never
+        # written as an explicit null.
+        if reason:
+            doc["reason"] = reason
+        if news2_score is not None:
+            doc["news2_score"] = news2_score
+        if news2_band:
+            doc["news2_band"] = news2_band
+        if red_flag is not None:
+            doc["red_flag"] = red_flag
+        if vitals_snapshot:
+            doc["vitals_snapshot"] = vitals_snapshot
         self.queue_store.append(doc)
         return dict(doc)
 
@@ -144,7 +167,14 @@ class FakePatientFlowRepository:
         item["claimed_at"] = _utcnow()
         return dict(item)
 
-    async def complete(self, patient_id: str) -> dict[str, Any]:
+    async def complete(
+        self,
+        patient_id: str,
+        *,
+        disposition: str,
+        completed_by: str,
+        disposition_note: str | None = None,
+    ) -> dict[str, Any]:
         self._guard()
         matches = [
             i
@@ -152,11 +182,72 @@ class FakePatientFlowRepository:
             if i["patient_id"] == patient_id and i["status"] != "completed"
         ]
         if not matches:
+            # Distinguish "already closed" from "never existed", as the real
+            # repository does.
+            if any(i["patient_id"] == patient_id for i in self.queue_store):
+                raise ConflictError(patient_id)
             raise NotFoundError(patient_id)
         item = sorted(matches, key=lambda i: i["created_at"])[-1]
+        completed_at = _utcnow()
         item["status"] = "completed"
-        item["completed_at"] = _utcnow()
+        item["completed_at"] = completed_at
+        item["disposition"] = disposition
+        item["completed_by"] = completed_by
+        if disposition_note:
+            item["disposition_note"] = disposition_note
+        created_at = item.get("created_at")
+        if isinstance(created_at, datetime):
+            item["time_to_completion_seconds"] = round(
+                max(0.0, (completed_at - created_at).total_seconds()), 3
+            )
         return dict(item)
+
+    async def queue_history(self, patient_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        self._guard()
+        rows = [i for i in self.queue_store if i["patient_id"] == patient_id]
+        return [dict(i) for i in sorted(rows, key=lambda i: i["created_at"], reverse=True)[:limit]]
+
+    async def queue_stats(
+        self, dept: str | None = None, since: datetime | None = None
+    ) -> dict[str, Any]:
+        self._guard()
+        rows = [i for i in self.queue_store if i["status"] == "completed"]
+        if dept:
+            rows = [i for i in rows if i.get("dept") == dept]
+        if since:
+            rows = [i for i in rows if i.get("created_at") and i["created_at"] >= since]
+
+        by_disposition: dict[str, int] = {}
+        durations: list[float] = []
+        for row in rows:
+            key = str(row.get("disposition") or "unrecorded")
+            by_disposition[key] = by_disposition.get(key, 0) + 1
+            created_at, completed_at = row.get("created_at"), row.get("completed_at")
+            if isinstance(created_at, datetime) and isinstance(completed_at, datetime):
+                durations.append(max(0.0, (completed_at - created_at).total_seconds()))
+
+        waiting = [i for i in self.queue_store if i["status"] == "waiting"]
+        if dept:
+            waiting = [i for i in waiting if i.get("dept") == dept]
+
+        total = len(rows)
+        lwbs = by_disposition.get("left_without_being_seen", 0)
+
+        def pct(values: list[float], p: int) -> float | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            rank = max(1, math.ceil(p / 100 * len(ordered)))
+            return round(ordered[min(rank, len(ordered)) - 1], 3)
+
+        return {
+            "completed": total,
+            "waiting": len(waiting),
+            "by_disposition": by_disposition,
+            "left_without_being_seen_rate": round(lwbs / total, 4) if total else 0.0,
+            "median_seconds": pct(durations, 50),
+            "p90_seconds": pct(durations, 90),
+        }
 
     # -- handoff notes -----------------------------------------------------
 

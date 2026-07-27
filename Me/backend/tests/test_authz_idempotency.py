@@ -141,7 +141,7 @@ class TestIdempotencyFlow:
         }
         r1 = client.post(
             "/queue",
-            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED"},
+            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers,
         )
         assert r1.status_code == 201
@@ -149,7 +149,7 @@ class TestIdempotencyFlow:
 
         r2 = client.post(
             "/queue",
-            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED"},
+            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers,
         )
         assert r2.status_code == 201
@@ -189,7 +189,7 @@ class TestIdempotencyFlow:
         }
         r = client.post(
             "/queue",
-            json={"patient_id": "MRN-2", "acuity": 1, "dept": "OR"},
+            json={"patient_id": "MRN-2", "acuity": 1, "dept": "OR", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers,
         )
         assert r.status_code == 403

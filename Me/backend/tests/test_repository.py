@@ -209,29 +209,40 @@ class TestQueue:
 
     def test_complete_marks_the_entry(self, repo):
         run(repo.enqueue("MRN-1", 3, "ED", "n"))
-        assert run(repo.complete("MRN-1"))["status"] == "completed"
+        assert run(repo.complete("MRN-1", disposition="discharged", completed_by="dr.test"))["status"] == "completed"
         assert run(repo.count_queue()) == 0
 
     def test_complete_unknown_patient_raises(self, repo):
         with pytest.raises(NotFoundError):
-            run(repo.complete("ghost"))
+            run(repo.complete("ghost", disposition="discharged", completed_by="dr.test"))
 
-    def test_completing_twice_raises(self, repo):
+    def test_completing_twice_is_a_conflict_not_a_not_found(self, repo):
+        """Re-completing must not silently rewrite the recorded outcome.
+
+        ConflictError rather than NotFoundError: the patient plainly exists,
+        and reporting "not found" for a closed entry sent the clinician
+        looking for a vanished patient. A conflict says what is actually
+        true — this is already closed.
+        """
         run(repo.enqueue("MRN-1", 3, "ED", "n"))
-        run(repo.complete("MRN-1"))
-        with pytest.raises(NotFoundError):
-            run(repo.complete("MRN-1"))
+        run(repo.complete("MRN-1", disposition="admitted", completed_by="dr.a"))
+        with pytest.raises(ConflictError):
+            run(repo.complete("MRN-1", disposition="discharged", completed_by="dr.b"))
+        # The original disposition survives the attempt.
+        history = run(repo.queue_history("MRN-1"))
+        assert history[0]["disposition"] == "admitted"
+        assert history[0]["completed_by"] == "dr.a"
 
     def test_requeue_after_completion(self, repo):
         run(repo.enqueue("MRN-1", 3, "ED", "n"))
-        run(repo.complete("MRN-1"))
+        run(repo.complete("MRN-1", disposition="discharged", completed_by="dr.test"))
         run(repo.enqueue("MRN-1", 1, "ED", "n"))
         assert run(repo.count_queue()) == 1
 
     def test_claimed_patient_can_be_completed(self, repo):
         run(repo.enqueue("MRN-1", 1, "ED", "n"))
         run(repo.claim_next("ED", "dr.a"))
-        assert run(repo.complete("MRN-1"))["status"] == "completed"
+        assert run(repo.complete("MRN-1", disposition="discharged", completed_by="dr.test"))["status"] == "completed"
 
 
 class TestMultiReplicaConsistency:

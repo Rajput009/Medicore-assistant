@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo.errors import PyMongoError
 
 from backend.common import audit_store
@@ -192,11 +193,139 @@ class BedUpdate(BaseModel):
         return v.strip() if v else None
 
 
+# Closed set, because free text cannot be reported on. Each value is one an
+# emergency department is measured on.
+DISPOSITIONS: frozenset[str] = frozenset(
+    {
+        "admitted",
+        "discharged",
+        "transferred",
+        # Deliberately its own value rather than folded into "other": it is
+        # the outcome a department is most accountable for and must be
+        # countable without parsing prose.
+        "left_without_being_seen",
+        "deceased",
+        "other",
+    }
+)
+
+# A disposition that says nothing on its own needs a note to be reviewable.
+DISPOSITIONS_REQUIRING_NOTE: frozenset[str] = frozenset(
+    {"left_without_being_seen", "other"}
+)
+
+# Below this, a reason adds nothing but keystrokes. At or above this urgency
+# (numerically <=), the escalation needs a justification someone can review.
+REASON_REQUIRED_AT_ACUITY = 2
+MIN_REASON_LENGTH = 10
+MAX_REASON_LENGTH = 500
+MAX_NOTE_LENGTH = 500
+
+
+class VitalsSnapshot(BaseModel):
+    """The vitals behind a NEWS2 score, copied at escalation time.
+
+    Bounds mirror the CDS service so a value that could not be scored can
+    never be recorded as the justification for an escalation.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    respiratory_rate: float | None = Field(default=None, gt=0, le=80)
+    spo2: float | None = Field(default=None, ge=1, le=100)
+    temperature: float | None = Field(default=None, ge=25, le=45)
+    systolic_bp: float | None = Field(default=None, gt=0, le=300)
+    pulse: float | None = Field(default=None, gt=0, le=300)
+    consciousness: str | None = Field(default=None, max_length=1)
+
+
 class QueueItem(BaseModel):
     patient_id: str = _IDENTIFIER
     # ESI acuity: 1 = most urgent, 5 = least.
     acuity: int = Field(..., ge=1, le=5)
     dept: str = _IDENTIFIER
+
+    # --- Why this patient is being escalated -----------------------------
+    # Optional in the model, conditionally required in the validator: a
+    # clinician must be able to escalate on judgement alone, but an urgent
+    # escalation with no stated reason is unreviewable.
+    reason: str | None = Field(default=None, max_length=MAX_REASON_LENGTH)
+    news2_score: int | None = Field(default=None, ge=0, le=25)
+    news2_band: str | None = Field(default=None, max_length=32)
+    red_flag: bool | None = None
+    vitals_snapshot: VitalsSnapshot | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_substantive(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = " ".join(v.split())
+        if not cleaned:
+            return None
+        if len(cleaned) < MIN_REASON_LENGTH:
+            raise ValueError(
+                f"reason must be at least {MIN_REASON_LENGTH} characters and "
+                "describe the clinical concern"
+            )
+        return cleaned
+
+    @field_validator("news2_band")
+    @classmethod
+    def _known_band(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        band = v.strip().lower()
+        if band not in {"low", "low-medium", "medium", "high"}:
+            raise ValueError("news2_band must be low, low-medium, medium or high")
+        return band
+
+    @model_validator(mode="after")
+    def _urgent_escalations_need_a_reason(self) -> QueueItem:
+        if self.acuity <= REASON_REQUIRED_AT_ACUITY and not self.reason:
+            raise ValueError(
+                f"reason is required for acuity {self.acuity} "
+                f"(mandatory at acuity {REASON_REQUIRED_AT_ACUITY} or more urgent)"
+            )
+        return self
+
+
+class QueueCompletion(BaseModel):
+    """What actually happened to the patient.
+
+    Required, not optional: a patient leaving the queue without a recorded
+    outcome is the gap this endpoint exists to close.
+    """
+
+    disposition: str = Field(..., max_length=64)
+    disposition_note: str | None = Field(default=None, max_length=MAX_NOTE_LENGTH)
+
+    @field_validator("disposition")
+    @classmethod
+    def _known_disposition(cls, v: str) -> str:
+        value = v.strip().lower()
+        if value not in DISPOSITIONS:
+            raise ValueError(
+                "disposition must be one of: " + ", ".join(sorted(DISPOSITIONS))
+            )
+        return value
+
+    @field_validator("disposition_note")
+    @classmethod
+    def _clean_note(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = " ".join(v.split())
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def _ambiguous_dispositions_need_a_note(self) -> QueueCompletion:
+        if self.disposition in DISPOSITIONS_REQUIRING_NOTE and not self.disposition_note:
+            raise ValueError(
+                f"disposition_note is required when disposition is "
+                f"'{self.disposition}'"
+            )
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -334,7 +463,19 @@ async def enqueue(
 
     try:
         doc = await repo.enqueue(
-            item.patient_id, item.acuity, item.dept, created_by=principal.sub
+            item.patient_id,
+            item.acuity,
+            item.dept,
+            created_by=principal.sub,
+            reason=item.reason,
+            news2_score=item.news2_score,
+            news2_band=item.news2_band,
+            red_flag=item.red_flag,
+            vitals_snapshot=(
+                item.vitals_snapshot.model_dump(exclude_none=True)
+                if item.vitals_snapshot
+                else None
+            ),
         )
     except ConflictError as exc:
         raise HTTPException(
@@ -399,14 +540,51 @@ async def claim_next(
     return body
 
 
+@app.get("/queue/stats", tags=["queue"])
+async def queue_stats(
+    repo: Repo,
+    principal: ClinicalUser,
+    dept: str | None = Query(default=None, max_length=64),
+    since_hours: int = Query(default=24, ge=1, le=24 * 90),
+) -> dict[str, Any]:
+    """Counts by disposition, LWBS rate and time-to-completion percentiles.
+
+    This is what the ward gets back for the extra keystrokes at completion.
+    Without it, recording a disposition is pure data entry, and data entry
+    that returns nothing to the person doing it degrades quickly.
+    """
+    require_department_access(dept, principal)
+    since = datetime.now(UTC) - timedelta(hours=since_hours)
+    try:
+        stats = await repo.queue_stats(dept=dept, since=since)
+    except PyMongoError as exc:
+        raise _unavailable(exc) from exc
+    return {
+        "dept": dept,
+        "since": since.isoformat(),
+        "window_hours": since_hours,
+        **stats,
+    }
+
+
+# NOTE: literal segments must be declared before "/{patient_id}" routes.
+# FastAPI matches in declaration order, so a future GET /queue/{patient_id}
+# declared above this would swallow /queue/stats and treat "stats" as a
+# patient id. Guarded by test_queue_outcomes.py::test_stats_route_is_not_shadowed.
 @app.post("/queue/{patient_id}/complete", response_model=None, tags=["queue"])
 async def complete(
     patient_id: str,
+    completion: QueueCompletion,
     repo: Repo,
     principal: ClinicalUser,
     request: Request,
 ):
-    """Mark a triage entry completed.
+    """Close a triage entry with a record of what happened to the patient.
+
+    ``disposition`` is required. "Completed" previously meant only "removed
+    from the list", which could not distinguish a patient admitted to ICU
+    from one who walked out unseen — the two ends of the safety spectrum a
+    department is accountable for.
 
     Honours ``Idempotency-Key``. Without it a retry after a lost response
     returns 404 ("no active queue entry") even though the completion
@@ -420,7 +598,19 @@ async def complete(
             return replay_response(hit[0], hit[1])
 
     try:
-        doc = await repo.complete(patient_id)
+        doc = await repo.complete(
+            patient_id,
+            disposition=completion.disposition,
+            completed_by=principal.sub,
+            disposition_note=completion.disposition_note,
+        )
+    except ConflictError as exc:
+        # Already closed. Refusing protects the recorded outcome from being
+        # quietly rewritten; a genuine correction is a separate action.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Queue entry for {patient_id} is already completed",
+        ) from exc
     except NotFoundError as exc:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"No active queue entry for {patient_id}"
@@ -432,6 +622,25 @@ async def complete(
     if idem_key:
         idem_store(principal.sub, route, idem_key, 200, body)
     return body
+
+
+@app.get("/queue/{patient_id}/history", tags=["queue"])
+async def queue_history(
+    patient_id: str,
+    repo: Repo,
+    principal: ClinicalUser,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Every queue entry for a patient, newest first.
+
+    A patient can pass through triage more than once; the escalation evidence
+    and the disposition are only useful if the whole sequence is retrievable.
+    """
+    try:
+        entries = await repo.queue_history(patient_id, limit=limit)
+    except PyMongoError as exc:
+        raise _unavailable(exc) from exc
+    return {"patient_id": patient_id, "entries": entries, "count": len(entries)}
 
 
 # --------------------------------------------------------------------------

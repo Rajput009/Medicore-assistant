@@ -441,7 +441,7 @@ class TestLiveClinicalWorkflow:
             "POST",
             f"{live_stack['flow']}/queue",
             token=token,
-            body={"patient_id": "MRN-LIVE-1", "acuity": 1, "dept": "ED"},
+            body={"patient_id": "MRN-LIVE-1", "acuity": 1, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
         )
         assert code == 201
         assert enq["ok"] is True
@@ -451,7 +451,7 @@ class TestLiveClinicalWorkflow:
             "POST",
             f"{live_stack['flow']}/queue",
             token=token,
-            body={"patient_id": "MRN-LIVE-1", "acuity": 2, "dept": "ED"},
+            body={"patient_id": "MRN-LIVE-1", "acuity": 2, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
         )
         assert code == 409
 
@@ -487,9 +487,14 @@ class TestLiveClinicalWorkflow:
             "POST",
             f"{live_stack['flow']}/queue/MRN-LIVE-1/complete",
             token=token,
+            body={"disposition": "admitted"},
         )
         assert code == 200
         assert done["item"]["status"] == "completed"
+        # The loop is closed: what happened, who decided, and how long it took.
+        assert done["item"]["disposition"] == "admitted"
+        assert done["item"]["completed_by"]
+        assert done["item"]["time_to_completion_seconds"] >= 0
 
     def test_anonymous_clinical_calls_are_rejected(self, live_stack):
         code, _, _ = _http("GET", f"{live_stack['flow']}/beds")

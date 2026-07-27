@@ -159,7 +159,7 @@ class TestScopeOverride:
         client, _ = flow
         r = client.post(
             "/queue",
-            json={"patient_id": "MRN-2", "acuity": 1, "dept": "ICU"},
+            json={"patient_id": "MRN-2", "acuity": 1, "dept": "ICU", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers(departments=["ED"], reason=REASON),
         )
         assert r.status_code in (200, 201)

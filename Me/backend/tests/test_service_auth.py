@@ -80,7 +80,7 @@ class TestPatientFlowAuth:
     )
     def test_anonymous_access_is_rejected(self, flow, method, path):
         client, queue = flow
-        payload: dict = {"patient_id": "MRN-1", "acuity": 1, "dept": "ED"}
+        payload: dict = {"patient_id": "MRN-1", "acuity": 1, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"}
         if method == "patch":
             payload = {"occupied": True, "patient_id": "MRN-1"}
         resp = getattr(client, method)(
@@ -97,7 +97,7 @@ class TestPatientFlowAuth:
     def test_anonymous_writes_never_reach_the_database(self, flow):
         client, repo = flow
         before = len(repo.queue_store)
-        client.post("/queue", json={"patient_id": "MRN-9", "acuity": 1, "dept": "ED"})
+        client.post("/queue", json={"patient_id": "MRN-9", "acuity": 1, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"})
         assert len(repo.queue_store) == before
 
     def test_health_stays_public_for_probes(self, flow):
@@ -122,7 +122,7 @@ class TestPatientFlowAuth:
         client, repo = flow
         r = client.post(
             "/queue",
-            json={"patient_id": "MRN-7", "acuity": 2, "dept": "ICU"},
+            json={"patient_id": "MRN-7", "acuity": 2, "dept": "ICU", "reason": "Deteriorating observations requiring urgent review"},
             headers=auth("clinician"),
         )
         assert r.status_code == 201
