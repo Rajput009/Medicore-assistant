@@ -6,12 +6,27 @@ metadata:
   labels: { app: gateway }
 spec:
   replicas: 2
+  # Never drop below full capacity during a rollout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels: { app: gateway }
   template:
     metadata:
       labels: { app: gateway }
     spec:
+      # Allow in-flight requests to finish before the container is killed.
+      terminationGracePeriodSeconds: 30
+      # Spread replicas so a single node failure cannot take out the service.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: gateway }
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -40,7 +55,9 @@ spec:
             failureThreshold: 30
             periodSeconds: 2
           readinessProbe:
-            httpGet: { path: /health, port: http }
+            # /ready verifies dependencies, so a pod with a dead database is
+            # removed from the Service instead of blackholing traffic.
+            httpGet: { path: /ready, port: http }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:

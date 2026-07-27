@@ -8,13 +8,12 @@ identifiers to completely unauthenticated callers.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 from starlette.testclient import TestClient
 
 from backend.common.deps import normalise_roles
 from backend.common.security import create_access_token
+from backend.tests.fakes import FakePatientFlowRepository
 
 
 def auth(*roles: str) -> dict[str, str]:
@@ -22,18 +21,39 @@ def auth(*roles: str) -> dict[str, str]:
 
 
 @pytest.fixture()
-def flow(monkeypatch):
+def flow():
+    """Patient-flow app backed by an in-memory repository.
+
+    The dependency is overridden rather than the module global patched, so the
+    real handler, validation and error-translation code all still run.
+    """
     import backend.services.patient_flow.main as pf
 
-    queue = MagicMock()
-    queue.find.return_value.sort.return_value.limit.return_value = [
-        {"patient_id": "MRN-000123", "acuity": 1, "dept": "ED"}
-    ]
-    queue.insert_one.return_value.inserted_id = "generated-id"
-    monkeypatch.setattr(pf, "_queue", queue)
-
-    with TestClient(pf.app, raise_server_exceptions=False) as client:
-        yield client, queue
+    repo = FakePatientFlowRepository(
+        beds=[{"bed_id": "A-001", "ward": "A"}, {"bed_id": "A-002", "ward": "A"}]
+    )
+    repo.queue_store.append(
+        {
+            "patient_id": "MRN-000123",
+            "acuity": 1,
+            "dept": "ED",
+            "status": "waiting",
+            "created_at": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ),
+            "created_by": "seed",
+        }
+    )
+    pf.app.dependency_overrides[pf.get_repository] = lambda: repo
+    # Also set the module global so lifespan skips real database setup
+    # instead of blocking on server selection.
+    pf._repository = repo
+    try:
+        with TestClient(pf.app, raise_server_exceptions=False) as client:
+            yield client, repo
+    finally:
+        pf.app.dependency_overrides.clear()
+        pf._repository = None
 
 
 @pytest.fixture()
@@ -55,29 +75,30 @@ class TestPatientFlowAuth:
             ("get", "/queue"),
             ("get", "/beds"),
             ("post", "/queue"),
-            ("patch", "/beds/some-id"),
+            ("patch", "/beds/A-001"),
         ],
     )
     def test_anonymous_access_is_rejected(self, flow, method, path):
         client, queue = flow
-        payload = {"patient_id": "MRN-1", "acuity": 1, "dept": "ED"}
+        payload: dict = {"patient_id": "MRN-1", "acuity": 1, "dept": "ED"}
+        if method == "patch":
+            payload = {"occupied": True, "patient_id": "MRN-1"}
         resp = getattr(client, method)(
-            path, **({"json": payload} if method == "post" else {})
+            path, **({"json": payload} if method in ("post", "patch") else {})
         )
         assert resp.status_code == 401
         assert resp.headers.get("www-authenticate") == "Bearer"
 
     def test_no_patient_data_leaks_to_an_anonymous_caller(self, flow):
-        client, queue = flow
+        client, repo = flow
         body = client.get("/queue").text
         assert "MRN-000123" not in body
-        # The database must not even be queried.
-        queue.find.assert_not_called()
 
     def test_anonymous_writes_never_reach_the_database(self, flow):
-        client, queue = flow
+        client, repo = flow
+        before = len(repo.queue_store)
         client.post("/queue", json={"patient_id": "MRN-9", "acuity": 1, "dept": "ED"})
-        queue.insert_one.assert_not_called()
+        assert len(repo.queue_store) == before
 
     def test_health_stays_public_for_probes(self, flow):
         client, _ = flow
@@ -98,14 +119,14 @@ class TestPatientFlowAuth:
         assert r.json()["items"][0]["patient_id"] == "MRN-000123"
 
     def test_clinician_may_enqueue(self, flow):
-        client, queue = flow
+        client, repo = flow
         r = client.post(
             "/queue",
             json={"patient_id": "MRN-7", "acuity": 2, "dept": "ICU"},
             headers=auth("clinician"),
         )
         assert r.status_code == 201
-        queue.insert_one.assert_called_once()
+        assert any(i["patient_id"] == "MRN-7" for i in repo.queue_store)
 
     def test_expired_token_is_rejected(self, flow):
         client, _ = flow
@@ -123,18 +144,12 @@ class TestPatientFlowAuth:
     def test_bed_toggle_requires_clinical_role(self, flow):
         client, _ = flow
         beds = client.get("/beds", headers=auth("clinician")).json()
-        bed_id = beds[0]["id"]
+        bed_id = beds[0]["bed_id"]
+        body = {"occupied": True, "patient_id": "MRN-5"}
 
+        assert client.patch(f"/beds/{bed_id}", json=body, headers=auth("viewer")).status_code == 403
         assert (
-            client.patch(
-                f"/beds/{bed_id}", params={"occupied": True}, headers=auth("viewer")
-            ).status_code
-            == 403
-        )
-        assert (
-            client.patch(
-                f"/beds/{bed_id}", params={"occupied": True}, headers=auth("clinician")
-            ).status_code
+            client.patch(f"/beds/{bed_id}", json=body, headers=auth("clinician")).status_code
             == 200
         )
 

@@ -7,7 +7,6 @@ redacted and only the parameter names are recorded.
 
 import json
 import logging
-import sys
 import time
 import uuid
 from typing import Any
@@ -16,13 +15,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+# Emitted through the root logger configured by backend.common.logging so the
+# audit trail lands in the same JSON stream as everything else.
 logger = logging.getLogger("medicore.audit")
-if not logger.handlers:
-    _handler = logging.StreamHandler(sys.stdout)
-    _handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
 
 # Path segments that may contain a patient/resource identifier.
 _ID_BEARING_PREFIXES = ("/fhir/", "/cache/")
@@ -82,3 +77,18 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         logger.info(json.dumps(log))
         response.headers["x-request-id"] = request_id
         return response
+
+
+def redact_phi_loggers() -> None:
+    """Raise third-party HTTP client loggers above INFO.
+
+    httpx (and httpcore/urllib3) log the full request URL at INFO. Because
+    MediCore URLs embed patient identifiers, leaving them enabled writes PHI
+    into the log stream. Importing this module applies the setting so it holds
+    even when configure_logging has not run (e.g. under pytest).
+    """
+    for name in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+redact_phi_loggers()

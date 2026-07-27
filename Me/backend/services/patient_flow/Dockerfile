@@ -27,6 +27,6 @@ USER appuser
 EXPOSE 8082
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/health', timeout=4).status==200 else 1)"
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/ready', timeout=4).status==200 else 1)"
 
 CMD ["uvicorn", "backend.services.patient_flow.main:app", "--host", "0.0.0.0", "--port", "8082"]

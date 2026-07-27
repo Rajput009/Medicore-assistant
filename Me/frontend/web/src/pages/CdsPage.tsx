@@ -71,8 +71,8 @@ export const CdsPage: React.FC = () => {
       </header>
 
       <Alert kind="info">
-        Demonstration scoring only. Not a validated clinical model — do not use for patient care
-        decisions.
+        Scoring follows NEWS2 (Royal College of Physicians, 2017). It is a track-and-trigger aid
+        for escalation, not a diagnosis, and is not validated for children or pregnancy.
       </Alert>
 
       <Card title="Vital signs">
@@ -135,7 +135,29 @@ export const CdsPage: React.FC = () => {
                 {risk.state.data.class_label}
               </Badge>
             </div>
+            <div>
+              <div className="muted" style={{ fontSize: '0.8rem' }}>
+                NEWS2 aggregate
+              </div>
+              <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>
+                {risk.state.data.news2_score}
+              </div>
+            </div>
           </div>
+
+          {/* A single extreme parameter mandates review even at a low total. */}
+          {risk.state.data.red_flag && (
+            <div style={{ marginTop: 12 }}>
+              <Alert kind="error">
+                Red flag: a single parameter is severely abnormal. Escalate regardless of the
+                aggregate score.
+              </Alert>
+            </div>
+          )}
+
+          <p style={{ marginTop: 12, marginBottom: 0 }}>
+            <strong>Recommended response:</strong> {risk.state.data.recommended_response}
+          </p>
           {/* Visual scale; aria attributes expose the value to screen readers. */}
           <div
             role="meter"

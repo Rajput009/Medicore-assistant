@@ -4,15 +4,28 @@ Edge service: enforces JWT auth + RBAC and proxies FHIR reads/searches with a
 Postgres-backed response cache.
 """
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 
-from backend.common.cache import close_pool, get_cached, invalidate_cache, set_cached
+from backend.common.cache import (
+    close_pool,
+    get_cached,
+    init_pool,
+    invalidate_cache,
+    set_cached,
+    start_janitor,
+    stop_janitor,
+)
+from backend.common.cache import (
+    ping as cache_ping,
+)
 from backend.common.config import settings
 from backend.common.fhir_client import FHIRError, default_fhir_client
+from backend.common.logging import configure_logging
 from backend.common.middleware import AuditLogMiddleware
 from backend.common.telemetry import instrument_fastapi
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
@@ -33,12 +46,25 @@ CACHE_TTL = {
 KNOWN_RESOURCES = frozenset(CACHE_TTL)
 
 
+logger = logging.getLogger(__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    # Release the FHIR connection pool and DB pool on shutdown.
-    await fhir.aclose()
-    await close_pool()
+    configure_logging(settings.log_level, service="gateway")
+    try:
+        # Create the pool (and cache table) up front so the first request does
+        # not pay the setup cost, and readiness reflects reality immediately.
+        await init_pool()
+        await start_janitor()
+    except Exception:
+        logger.exception("cache initialisation failed; continuing degraded")
+    try:
+        yield
+    finally:
+        await stop_janitor()
+        await fhir.aclose()
+        await close_pool()
 
 
 app = instrument_fastapi(
@@ -59,9 +85,23 @@ class Health(BaseModel):
     env: str
 
 
-@app.get("/health", response_model=Health)
+@app.get("/health", response_model=Health, tags=["ops"])
 def health() -> Health:
+    """Liveness only: must not touch dependencies, or a database outage would
+    restart otherwise-healthy pods."""
     return Health(status="ok", service="gateway", env=settings.env)
+
+
+@app.get("/ready", tags=["ops"])
+async def ready(response: Response) -> dict[str, Any]:
+    """Readiness: verifies the cache database before accepting traffic."""
+    try:
+        await cache_ping()
+    except Exception:
+        logger.warning("readiness check failed", exc_info=True)
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "degraded", "cache": "unavailable"}
+    return {"status": "ok", "cache": "ok"}
 
 
 @app.get("/secure")

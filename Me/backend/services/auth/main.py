@@ -12,12 +12,15 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend.common.config import settings
+from backend.common.logging import configure_logging
 from backend.common.middleware import AuditLogMiddleware
 from backend.common.security import create_access_token
 from backend.common.telemetry import instrument_fastapi
 
+configure_logging(settings.log_level, service="auth")
+
 app = instrument_fastapi(
-    FastAPI(title="MediCore Auth", version="0.1.0"), service_name="auth"
+    FastAPI(title="MediCore Auth", version="1.0.0"), service_name="auth"
 )
 
 # Session cookie is required for the OIDC state/nonce round-trip.
@@ -56,9 +59,16 @@ class Health(BaseModel):
     env: str
 
 
-@app.get("/health", response_model=Health)
+@app.get("/health", response_model=Health, tags=["ops"])
 def health() -> Health:
     return Health(status="ok", service="auth", env=settings.env)
+
+
+@app.get("/ready", tags=["ops"])
+def ready() -> dict[str, Any]:
+    """Readiness reports whether SSO is wired up; the service still serves
+    token verification for existing sessions either way."""
+    return {"status": "ok", "oidc": "configured" if _OIDC_CONFIGURED else "disabled"}
 
 
 # --------------------------------------------------------------------------

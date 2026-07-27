@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     postgres_host: str = "postgres"
     postgres_port: int = 5432
     database_url: str | None = None
+    postgres_min_pool_size: int = 1
+    postgres_max_pool_size: int = 10
+    postgres_command_timeout_seconds: float = 10.0
+    # Cached FHIR rows older than this are purged by the janitor task.
+    cache_max_age_seconds: int = 3600
+    cache_cleanup_interval_seconds: int = 300
 
     redis_host: str = "redis"
     redis_port: int = 6379
@@ -37,6 +43,16 @@ class Settings(BaseSettings):
     # --- MongoDB ---
     mongo_uri: str = "mongodb://mongo:27017"
     mongo_db: str = "medicore"
+    # Bounded timeouts: the driver otherwise waits ~30s to select a server,
+    # turning a brief outage into cascading upstream timeouts.
+    mongo_server_selection_timeout_ms: int = 5000
+    mongo_connect_timeout_ms: int = 5000
+    mongo_socket_timeout_ms: int = 10000
+    mongo_min_pool_size: int = 0
+    mongo_max_pool_size: int = 50
+
+    # Ward layout seeded on first start. Format: "WARD:COUNT,WARD:COUNT".
+    bed_layout: str = "A:8,B:8,ICU:4"
 
     # --- FHIR ---
     fhir_base_url: str = "https://example-fhir-server/fhir"
@@ -62,6 +78,33 @@ class Settings(BaseSettings):
     otel_exporter_otlp_endpoint: str = "http://jaeger:4318"
     otel_service_namespace: str = "medicore"
     otel_enabled: bool = True
+
+    @property
+    def parsed_bed_layout(self) -> list[tuple[str, int]]:
+        """Parse ``bed_layout`` into (ward, count) pairs."""
+        wards: list[tuple[str, int]] = []
+        for chunk in self.bed_layout.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            ward, _, raw_count = chunk.partition(":")
+            ward = ward.strip()
+            if not ward:
+                continue
+            try:
+                count = int(raw_count)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid BED_LAYOUT entry {chunk!r}; expected 'WARD:COUNT'"
+                ) from exc
+            if count < 0:
+                raise ValueError(f"Bed count for ward {ward!r} cannot be negative")
+            wards.append((ward, count))
+        return wards
+
+    @property
+    def is_production(self) -> bool:
+        return self.env.lower() not in ("local", "test", "dev", "development")
 
     @property
     def sqlalchemy_dsn(self) -> str:

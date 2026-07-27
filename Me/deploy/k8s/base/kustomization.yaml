@@ -11,3 +11,4 @@ resources:
   - patient-flow.yaml
   - cds.yaml
   - ingress.yaml
+  - pdb.yaml

@@ -14,7 +14,7 @@ x-backend-env: &backend-env
   POSTGRES_USER: ${POSTGRES_USER:-medicore}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medicore_pw}
   POSTGRES_DB: ${POSTGRES_DB:-medicore}
-  MONGO_URI: mongodb://mongo:27017
+  MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
   KAFKA_BROKERS: kafka:9092
   OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
   ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
@@ -45,14 +45,22 @@ services:
 
   mongo:
     image: mongo:7
-    # NOTE: was previously duplicated and set to Redis' 6379.
+    # A single-node replica set: retryable writes and transactions require one,
+    # and it keeps local behaviour consistent with production.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
     ports: ["27017:27017"]
     volumes: ["mongodata:/data/db"]
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      # Initiates the replica set on first run, then reports readiness.
+      test: >
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }
+        "
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 10
+      start_period: 20s
 
   zookeeper:
     image: bitnami/zookeeper:3.9
@@ -112,7 +120,9 @@ services:
     build:
       <<: *backend-build
       dockerfile: services/patient_flow/Dockerfile
-    environment: *backend-env
+    environment:
+      <<: *backend-env
+      BED_LAYOUT: ${BED_LAYOUT:-A:8,B:8,ICU:4}
     ports: ["8082:8082"]
     depends_on:
       mongo:

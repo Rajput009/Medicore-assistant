@@ -178,16 +178,24 @@ describe('api endpoints', () => {
     expect(seen).toEqual(['', '?patient=42'])
   })
 
-  it('passes bed occupancy as a query parameter', async () => {
-    let search = ''
+  it('sends the bed update as a JSON body including the concurrency check', async () => {
+    let body: unknown
     server.use(
-      http.patch('/flow/beds/:id', ({ request: req }) => {
-        search = new URL(req.url).search
-        return HttpResponse.json({ id: 'b', ward: 'A', occupied: true })
+      http.patch('/flow/beds/:id', async ({ request: req }) => {
+        body = await req.json()
+        return HttpResponse.json({ bed_id: 'b', ward: 'A', occupied: true })
       }),
     )
-    await api.setBedOccupancy('b', true, 'tok')
-    expect(search).toBe('?occupied=true')
+    await api.setBedOccupancy(
+      'b',
+      { occupied: true, patient_id: 'MRN-1', expected_occupied: false },
+      'tok',
+    )
+    expect(body).toEqual({
+      occupied: true,
+      patient_id: 'MRN-1',
+      expected_occupied: false,
+    })
   })
 
   it('sends the bearer token to patient-flow and CDS', async () => {

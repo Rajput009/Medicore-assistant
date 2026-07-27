@@ -9,6 +9,7 @@
 
 import type {
   Bed,
+  BedUpdate,
   CacheInvalidationResponse,
   FhirBundle,
   FhirResource,
@@ -231,16 +232,21 @@ export const api = {
     })
   },
 
+  /**
+   * Update a bed. Pass `expected_occupied` for an optimistic-concurrency
+   * check: the server returns 409 if someone else changed the bed first,
+   * rather than silently overwriting their assignment.
+   */
   setBedOccupancy(
     id: string,
-    occupied: boolean,
+    update: BedUpdate,
     token: string | null,
     signal?: AbortSignal,
   ): Promise<Bed> {
     return request<Bed>(`${BASE.patientFlow}/beds/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       token,
-      params: { occupied },
+      body: update,
       signal,
     })
   },

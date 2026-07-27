@@ -13,9 +13,10 @@ export type TokenResponse = {
 }
 
 export type Bed = {
-  id: string
+  bed_id: string
   ward: string
   occupied: boolean
+  patient_id?: string | null
 }
 
 export type QueueItem = {
@@ -23,11 +24,16 @@ export type QueueItem = {
   acuity: number
   dept: string
   created_at?: string
+  status?: 'waiting' | 'in_progress' | 'completed'
+  created_by?: string
 }
 
 export type QueueListResponse = {
   items: QueueItem[]
+  /** Items in this page. */
   count: number
+  /** Total matching the filter, so the UI can show "25 of 108". */
+  total: number
 }
 
 export type RiskRequest = {
@@ -39,6 +45,16 @@ export type RiskRequest = {
 export type RiskResponse = {
   score: number
   class_label: 'low' | 'medium' | 'high'
+  news2_score: number
+  red_flag: boolean
+  recommended_response: string
+  disclaimer: string
+}
+
+export type BedUpdate = {
+  occupied: boolean
+  patient_id?: string | null
+  expected_occupied?: boolean
 }
 
 export type CacheInvalidationResponse = {

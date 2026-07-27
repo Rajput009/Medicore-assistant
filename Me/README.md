@@ -55,6 +55,35 @@ make lint      # ruff + tsc --noEmit
 
 Browser e2e requires `npx playwright install` once to download browsers.
 
+## Production notes
+
+**State.** Beds and the triage queue live in MongoDB, never in process memory,
+so the services scale horizontally. Bed ids are derived deterministically from
+`BED_LAYOUT`, so every replica agrees on them and seeding is idempotent.
+
+**Concurrency.** Bed assignment accepts an `expected_occupied` precondition and
+returns `409` when another clinician got there first, instead of silently
+overwriting. Claiming the next triage patient is a single atomic
+`find_one_and_update`, so two clinicians can never be handed the same patient.
+A partial unique index prevents a patient from occupying two waiting slots.
+
+**Probes.** `/health` is liveness (process only) and `/ready` is readiness
+(verifies dependencies). Kubernetes readiness uses `/ready` so a pod with a
+dead database leaves the Service; liveness deliberately does *not* check
+dependencies, or a database outage would restart every healthy pod.
+
+**Clinical scoring.** CDS implements NEWS2 (Royal College of Physicians, 2017)
+with a per-parameter breakdown and the single-parameter red-flag rule, rather
+than an ad-hoc formula. See `backend/services/cds/scoring.py`.
+
+**Logging.** Structured JSON on stdout with trace correlation. Third-party HTTP
+client loggers are raised above INFO because they log full URLs, which in this
+system contain patient identifiers.
+
+**Data retention.** A background sweep purges FHIR cache rows older than
+`CACHE_MAX_AGE_SECONDS`; the table would otherwise grow without bound and
+retain PHI indefinitely.
+
 ## Web console
 
 The clinician/admin console is a React + TypeScript SPA. It exposes the FHIR
@@ -102,8 +131,10 @@ Makefile                 # DX helpers
 
 - **gateway**: Edge API, request fan-out to internal services, OpenAPI docs at `/docs`.
 - **auth**: Login, token mint/refresh, RBAC, OIDC plumbing.
-- **patient-flow**: Real-time bed/queue endpoints (placeholder logic + pub/sub topics).
-- **cds**: Decision support stub with example risk score endpoint and ML serving hook.
+- **patient-flow**: Bed management and ED triage queue, persisted in MongoDB
+  with optimistic-concurrency updates and atomic patient claiming.
+- **cds**: NEWS2 deterioration scoring with a per-parameter breakdown and
+  escalation guidance.
 
 ## Security Notes
 
@@ -124,9 +155,12 @@ Makefile                 # DX helpers
 - Configure `.env` / `backend/.env` with `FHIR_BASE_URL`, `FHIR_OAUTH_TOKEN_URL`, `FHIR_CLIENT_ID`, `FHIR_CLIENT_SECRET`.
 - Sample proxy: `GET /fhir/patient/{id}` on the **gateway** calls the FHIR API via OAuth2.
 
-## MongoDB (Documents & Logs)
-- `MONGO_URI`, `MONGO_DB` envs.
-- Example endpoints in **patient_flow**: `POST /queue`, `GET /queue` use Mongo.
+## MongoDB (beds & triage queue)
+- `MONGO_URI`, `MONGO_DB`, and pool/timeout envs (see `backend/.env.example`).
+- **patient_flow** endpoints:
+  - `GET /beds`, `GET /beds/{id}`, `PATCH /beds/{id}` (assign/discharge)
+  - `POST /queue`, `GET /queue`, `POST /queue/claim`, `POST /queue/{id}/complete`
+- Requires a replica set for retryable writes; compose runs a single-node `rs0`.
 
 ## Observability (OpenTelemetry + Jaeger)
 - All services auto-instrumented; spans exported to `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://jaeger:4318`).

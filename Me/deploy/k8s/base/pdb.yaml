@@ -1,0 +1,41 @@
+# Prevents voluntary disruptions (node drains, cluster upgrades) from taking
+# every replica of a service down at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: medicore
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: gateway }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: auth
+  namespace: medicore
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: auth }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: patient-flow
+  namespace: medicore
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: patient-flow }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cds
+  namespace: medicore
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: cds }

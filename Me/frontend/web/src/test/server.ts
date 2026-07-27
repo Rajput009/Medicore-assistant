@@ -63,16 +63,21 @@ export const handlers = [
     const denied = requireAuth(request)
     if (denied) return denied
     return HttpResponse.json([
-      { id: 'bed-aaaaaaaa-1', ward: 'A', occupied: false },
-      { id: 'bed-bbbbbbbb-2', ward: 'A', occupied: true },
+      { bed_id: 'A-001', ward: 'A', occupied: false, patient_id: null },
+      { bed_id: 'A-002', ward: 'A', occupied: true, patient_id: 'MRN-8' },
     ])
   }),
 
-  http.patch('/flow/beds/:id', ({ params, request }) => {
+  http.patch('/flow/beds/:id', async ({ params, request }) => {
     const denied = requireAuth(request)
     if (denied) return denied
-    const occupied = new URL(request.url).searchParams.get('occupied') === 'true'
-    return HttpResponse.json({ id: params.id, ward: 'A', occupied })
+    const body = (await request.json()) as { occupied: boolean; patient_id?: string | null }
+    return HttpResponse.json({
+      bed_id: params.id,
+      ward: 'A',
+      occupied: body.occupied,
+      patient_id: body.occupied ? (body.patient_id ?? null) : null,
+    })
   }),
 
   http.get('/flow/queue', ({ request }) => {
@@ -84,6 +89,7 @@ export const handlers = [
         { patient_id: 'pat-2', acuity: 4, dept: 'ED' },
       ],
       count: 2,
+      total: 2,
     })
   }),
 
@@ -103,9 +109,14 @@ export const handlers = [
         Math.max(95 - body.spo2, 0) / 95,
       1,
     )
+    const label = score > 0.8 ? 'high' : score > 0.4 ? 'medium' : 'low'
     return HttpResponse.json({
       score: Number(score.toFixed(3)),
-      class_label: score > 0.8 ? 'high' : score > 0.4 ? 'medium' : 'low',
+      class_label: label,
+      news2_score: Math.round(score * 20),
+      red_flag: label === 'high',
+      recommended_response: 'Continue routine monitoring.',
+      disclaimer: 'NEWS2 is a track-and-trigger aid, not a diagnosis.',
     })
   }),
 ]

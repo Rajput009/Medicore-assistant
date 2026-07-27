@@ -3,7 +3,7 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import React from 'react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { makeToken, renderWithProviders } from '../test/helpers'
 import { server } from '../test/server'
@@ -245,19 +245,62 @@ describe('PatientFlowPage', () => {
     expect(await screen.findByText(/1 of 2 available/i)).toBeInTheDocument()
   })
 
-  it('toggles bed occupancy', async () => {
-    let patched = false
+  it('assigns a bed with a patient id and a concurrency check', async () => {
+    let body: Record<string, unknown> | null = null
     server.use(
-      http.patch('/flow/beds/:id', ({ request }) => {
-        patched = true
-        const occupied = new URL(request.url).searchParams.get('occupied') === 'true'
-        return HttpResponse.json({ id: 'bed-aaaaaaaa-1', ward: 'A', occupied })
+      http.patch('/flow/beds/:id', async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({
+          bed_id: 'A-001',
+          ward: 'A',
+          occupied: true,
+          patient_id: 'MRN-42',
+        })
       }),
     )
+    vi.spyOn(window, 'prompt').mockReturnValue('MRN-42')
+
     const { user } = renderWithProviders(<PatientFlowPage />, { token: makeToken() })
-    const btn = await screen.findByRole('button', { name: /mark occupied/i })
-    await user.click(btn)
-    await waitFor(() => expect(patched).toBe(true))
+    await user.click(await screen.findByRole('button', { name: /assign/i }))
+
+    await waitFor(() =>
+      expect(body).toEqual({
+        occupied: true,
+        patient_id: 'MRN-42',
+        expected_occupied: false,
+      }),
+    )
+  })
+
+  it('does not call the server when the assign prompt is cancelled', async () => {
+    let called = false
+    server.use(
+      http.patch('/flow/beds/:id', () => {
+        called = true
+        return HttpResponse.json({ bed_id: 'A-001', ward: 'A', occupied: true })
+      }),
+    )
+    vi.spyOn(window, 'prompt').mockReturnValue(null)
+
+    const { user } = renderWithProviders(<PatientFlowPage />, { token: makeToken() })
+    await user.click(await screen.findByRole('button', { name: /assign/i }))
+    expect(called).toBe(false)
+  })
+
+  it('surfaces a 409 when another clinician took the bed first', async () => {
+    server.use(
+      http.patch('/flow/beds/:id', () =>
+        HttpResponse.json(
+          { detail: 'Bed was modified by another user; reload and retry' },
+          { status: 409 },
+        ),
+      ),
+    )
+    vi.spyOn(window, 'prompt').mockReturnValue('MRN-42')
+
+    const { user } = renderWithProviders(<PatientFlowPage />, { token: makeToken() })
+    await user.click(await screen.findByRole('button', { name: /assign/i }))
+    expect(await screen.findByText(/modified by another user/i)).toBeInTheDocument()
   })
 
   it('renders the triage queue ordered as returned', async () => {
@@ -357,9 +400,38 @@ describe('CdsPage', () => {
     expect(await screen.findByText(/must be between 1 and 100/i)).toBeInTheDocument()
   })
 
-  it('warns that the model is not clinically validated', () => {
+  it('states the standard used and its clinical limits', () => {
     renderWithProviders(<CdsPage />, { token: makeToken() })
-    expect(screen.getByText(/not a validated clinical model/i)).toBeInTheDocument()
+    const banner = screen.getByText(/NEWS2/i)
+    expect(banner).toBeInTheDocument()
+    expect(banner).toHaveTextContent(/not a diagnosis/i)
+    expect(banner).toHaveTextContent(/not validated for children or pregnancy/i)
+  })
+
+  it('shows the NEWS2 aggregate and the recommended response', async () => {
+    const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
+    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    expect(await screen.findByText(/NEWS2 aggregate/i)).toBeInTheDocument()
+    expect(screen.getByText(/recommended response/i)).toBeInTheDocument()
+  })
+
+  it('escalates visibly when a single parameter is critical', async () => {
+    server.use(
+      http.post('/cds/risk', () =>
+        HttpResponse.json({
+          score: 0.15,
+          class_label: 'medium',
+          news2_score: 3,
+          red_flag: true,
+          recommended_response: 'Urgent review by a clinician.',
+          disclaimer: 'NEWS2 is a track-and-trigger aid.',
+        }),
+      ),
+    )
+    const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
+    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    // A low aggregate must not hide a severely abnormal single parameter.
+    expect(await screen.findByText(/red flag/i)).toBeInTheDocument()
   })
 
   it('validateVitals covers empty, non-numeric and out-of-range input', () => {

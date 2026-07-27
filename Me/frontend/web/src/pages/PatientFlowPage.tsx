@@ -18,12 +18,28 @@ const BedsCard: React.FC = () => {
   const { state, reload } = useAsyncData<Bed[]>((signal) => api.listBeds(null, token, signal), [
     token,
   ])
-  const toggle = useAsyncAction<[string, boolean], Bed>((signal, id, occupied) =>
-    api.setBedOccupancy(id, occupied, token, signal),
+  const toggle = useAsyncAction<[Bed, string | null], Bed>((signal, bed, patientId) =>
+    api.setBedOccupancy(
+      bed.bed_id,
+      {
+        occupied: !bed.occupied,
+        patient_id: bed.occupied ? null : patientId,
+        // Conditional write: fail loudly if another clinician changed the bed
+        // first instead of silently overwriting their assignment.
+        expected_occupied: bed.occupied,
+      },
+      token,
+      signal,
+    ),
   )
 
   const onToggle = async (bed: Bed) => {
-    const updated = await toggle.run(bed.id, !bed.occupied)
+    let patientId: string | null = null
+    if (!bed.occupied) {
+      patientId = window.prompt(`Patient ID to assign to bed ${bed.bed_id}:`)?.trim() || null
+      if (!patientId) return
+    }
+    const updated = await toggle.run(bed, patientId)
     if (updated) reload()
   }
 
@@ -59,6 +75,7 @@ const BedsCard: React.FC = () => {
                     <th scope="col">Bed</th>
                     <th scope="col">Ward</th>
                     <th scope="col">Status</th>
+                    <th scope="col">Patient</th>
                     <th scope="col">
                       <span className="visually-hidden">Actions</span>
                     </th>
@@ -66,21 +83,22 @@ const BedsCard: React.FC = () => {
                 </thead>
                 <tbody>
                   {beds.map((bed) => (
-                    <tr key={bed.id}>
-                      <td className="mono">{bed.id.slice(0, 8)}</td>
+                    <tr key={bed.bed_id}>
+                      <td className="mono">{bed.bed_id}</td>
                       <td>{bed.ward}</td>
                       <td>
                         <Badge tone={bed.occupied ? 'err' : 'ok'} withDot>
                           {bed.occupied ? 'occupied' : 'available'}
                         </Badge>
                       </td>
+                      <td className="mono">{bed.patient_id ?? '—'}</td>
                       <td>
                         <button
                           type="button"
                           onClick={() => void onToggle(bed)}
                           disabled={toggle.state.status === 'loading'}
                         >
-                          Mark {bed.occupied ? 'available' : 'occupied'}
+                          {bed.occupied ? 'Discharge' : 'Assign'}
                         </button>
                       </td>
                     </tr>
@@ -109,6 +127,7 @@ const QueueCard: React.FC = () => {
   }, [])
 
   const items = list.state.status === 'success' ? list.state.data.items : []
+  const total = list.state.status === 'success' ? list.state.data.total : 0
 
   return (
     <Card
@@ -165,6 +184,9 @@ const QueueCard: React.FC = () => {
             <EmptyState message="Queue is empty" hint="Add a patient using the form below." />
           ) : (
             <div className="table-wrap">
+              <p className="muted" style={{ marginTop: 0 }}>
+                Showing {items.length} of {total} waiting
+              </p>
               <table>
                 <caption className="visually-hidden">Triage queue, most urgent first</caption>
                 <thead>
