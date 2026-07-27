@@ -31,6 +31,7 @@ describe('AuthProvider', () => {
     seedToken(makeToken({ expiresInSeconds: -10 }))
     const { result } = renderHook(() => useAuth(), { wrapper })
     expect(result.current.isAuthenticated).toBe(false)
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBeNull()
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
@@ -38,17 +39,18 @@ describe('AuthProvider', () => {
     seedToken('not-a-jwt')
     const { result } = renderHook(() => useAuth(), { wrapper })
     expect(result.current.isAuthenticated).toBe(false)
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBeNull()
   })
 
-  it('logs in and persists the token', async () => {
+  it('logs in and persists the token in sessionStorage only', async () => {
     const { result } = renderHook(() => useAuth(), { wrapper })
     await act(async () => {
       const ok = await result.current.login('dr.smith', 'correct-horse')
       expect(ok).toBe(true)
     })
     expect(result.current.user?.sub).toBe('dr.smith')
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBeTruthy()
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBeTruthy()
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
   it('reports wrong credentials without authenticating', async () => {
@@ -138,8 +140,11 @@ describe('AuthProvider', () => {
     expect(result.current.isAuthenticated).toBe(true)
 
     act(() => {
+      window.sessionStorage.removeItem('medicore.session.token')
       window.localStorage.removeItem(STORAGE_KEY)
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY }))
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'medicore.session.token' }),
+      )
     })
     await waitFor(() => expect(result.current.isAuthenticated).toBe(false))
   })

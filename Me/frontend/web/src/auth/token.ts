@@ -1,10 +1,18 @@
 /**
- * JWT helpers.
+ * JWT helpers and session storage.
  *
- * These decode the token purely to drive UI affordances (which nav items to
- * show, whether the session looks expired). The gateway remains the only
- * authority: every protected call is still verified server-side, so a user who
- * tampers with a token in localStorage gains nothing but a 401.
+ * Decode is used only to drive UI affordances (which nav items to show,
+ * whether the session looks expired). The gateway remains the only authority:
+ * every protected call is still verified server-side.
+ *
+ * Storage strategy (defence in depth against XSS):
+ *   1. Preferred: httpOnly Secure cookie set by the auth service. JS never
+ *      sees the raw JWT; fetch uses `credentials: 'include'`.
+ *   2. In-memory hold of the token for Authorization headers (API clients that
+ *      cannot rely on cookies, and to populate UI claims without a /session round-trip).
+ *   3. sessionStorage fallback (tab-scoped) when cookies are unavailable — never
+ *      localStorage. sessionStorage is cleared when the tab closes and is not
+ *      shared with other tabs' long-lived state the way localStorage is.
  */
 
 import type { AuthUser, Role } from '../api/types'
@@ -77,25 +85,73 @@ export function hasAnyRole(user: AuthUser | null, required: readonly Role[]): bo
   return required.some((r) => user.roles.includes(r))
 }
 
+/** Legacy key — migrated away from localStorage on read. */
 export const STORAGE_KEY = 'medicore.token'
+export const SESSION_STORAGE_KEY = 'medicore.session.token'
 
-/** localStorage access guarded for Safari private mode / disabled storage. */
+/** Process-lifetime hold; never written to durable storage by default. */
+let memoryToken: string | null = null
+
+/**
+ * Session token access.
+ *
+ * - `write` keeps the token in memory and (optionally) tab-scoped sessionStorage
+ *   so a refresh within the same tab can restore UI state. It never writes to
+ *   localStorage.
+ * - On first `read`, any legacy localStorage value is migrated to sessionStorage
+ *   and removed from localStorage.
+ */
 export const tokenStorage = {
   read(): string | null {
+    if (memoryToken) return memoryToken
     try {
-      return window.localStorage.getItem(STORAGE_KEY)
+      // Migrate away from localStorage (XSS-durable) if a prior build left a value.
+      const legacy = window.localStorage.getItem(STORAGE_KEY)
+      if (legacy) {
+        try {
+          window.sessionStorage.setItem(SESSION_STORAGE_KEY, legacy)
+        } catch {
+          /* ignore */
+        }
+        try {
+          window.localStorage.removeItem(STORAGE_KEY)
+        } catch {
+          /* ignore */
+        }
+        memoryToken = legacy
+        return legacy
+      }
+      const tab = window.sessionStorage.getItem(SESSION_STORAGE_KEY)
+      if (tab) {
+        memoryToken = tab
+        return tab
+      }
     } catch {
-      return null
+      /* private mode / disabled storage */
     }
+    return null
   },
   write(token: string): void {
+    memoryToken = token
     try {
-      window.localStorage.setItem(STORAGE_KEY, token)
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, token)
     } catch {
-      /* non-fatal: session becomes tab-scoped */
+      /* non-fatal: memory-only for this tab */
+    }
+    // Ensure we never leave a durable copy behind.
+    try {
+      window.localStorage.removeItem(STORAGE_KEY)
+    } catch {
+      /* ignore */
     }
   },
   clear(): void {
+    memoryToken = null
+    try {
+      window.sessionStorage.removeItem(SESSION_STORAGE_KEY)
+    } catch {
+      /* ignore */
+    }
     try {
       window.localStorage.removeItem(STORAGE_KEY)
     } catch {

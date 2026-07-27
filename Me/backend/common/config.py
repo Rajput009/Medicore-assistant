@@ -60,8 +60,21 @@ class Settings(BaseSettings):
 
     redis_host: str = "redis"
     redis_port: int = 6379
+    redis_db: int = 0
+    redis_password: str = ""
+    # When False, rate-limit and revocation stay in-process (tests / single pod).
+    # Default False so a missing Redis never blocks local boot; production
+    # ConfigMap sets REDIS_ENABLED=true so budgets and denylists are shared.
+    redis_enabled: bool = False
+    redis_socket_timeout_seconds: float = 0.5
 
     kafka_brokers: str = "kafka:9092"
+    # httpOnly session cookie name used by the auth service. The SPA never
+    # needs to read the raw JWT when cookie sessions are enabled.
+    auth_cookie_name: str = "medicore_session"
+    # Emit the access token as an httpOnly Secure cookie on login/OIDC callback.
+    # The JSON body still carries access_token for non-browser clients.
+    auth_set_cookie: bool = True
 
     # --- MongoDB ---
     mongo_uri: str = "mongodb://mongo:27017"

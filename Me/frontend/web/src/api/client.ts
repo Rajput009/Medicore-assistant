@@ -142,6 +142,9 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
+      // Send the httpOnly session cookie set by /auth/login. Harmless when
+      // the SPA still holds a bearer token in memory for Authorization.
+      credentials: 'include',
     })
   } catch (err) {
     // Re-throw aborts untouched so callers can ignore them. `instanceof
@@ -177,6 +180,22 @@ export const api = {
     return request<TokenResponse>(`${BASE.auth}/login`, {
       method: 'POST',
       body: { username, password },
+      signal,
+    })
+  },
+
+  /** Revoke the current token server-side and clear the httpOnly cookie. */
+  logout(token?: string | null, signal?: AbortSignal): Promise<{ status: string }> {
+    return request<{ status: string }>(`${BASE.auth}/logout`, {
+      method: 'POST',
+      token,
+      signal,
+    })
+  },
+
+  /** Claims for the current cookie/bearer session (no raw token returned). */
+  session(signal?: AbortSignal): Promise<{ sub: string; roles: string[]; exp?: number }> {
+    return request<{ sub: string; roles: string[]; exp?: number }>(`${BASE.auth}/session`, {
       signal,
     })
   },

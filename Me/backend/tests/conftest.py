@@ -13,6 +13,10 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("ENV", "test")
 os.environ.setdefault("OTEL_ENABLED", "false")
 os.environ.setdefault("JWT_SECRET", "test-secret")
+# Unit tests must not depend on a live Redis; the in-process fallback covers
+# rate-limit and revocation semantics. Integration against real Redis is
+# optional and gated behind REDIS_ENABLED=true.
+os.environ.setdefault("REDIS_ENABLED", "false")
 
 # pgserver registers an atexit handler that talks to logging after pytest has
 # already torn the logging handlers down, which floods the suite summary with

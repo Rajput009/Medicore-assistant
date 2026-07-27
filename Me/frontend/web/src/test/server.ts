@@ -32,8 +32,16 @@ export const handlers = [
     return HttpResponse.json({
       access_token: makeToken({ sub: body.username ?? 'user', roles: ['clinician'] }),
       token_type: 'bearer',
+      expires_in: 900,
     })
   }),
+
+  http.post('/auth/logout', () => HttpResponse.json({ status: 'ok' })),
+
+  http.get('/auth/session', () =>
+    // Default: no cookie session. Specs that need a cookie session override this.
+    HttpResponse.json({ detail: 'Not authenticated' }, { status: 401 }),
+  ),
 
   http.get('/api/fhir/patient/search', () =>
     HttpResponse.json({

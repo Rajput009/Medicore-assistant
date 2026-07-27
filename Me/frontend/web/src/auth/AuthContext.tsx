@@ -9,7 +9,14 @@ import React, {
 
 import { api, ApiError } from '../api/client'
 import type { AuthUser, Role } from '../api/types'
-import { decodeToken, isExpired, millisUntilExpiry, tokenStorage } from './token'
+import {
+  decodeToken,
+  isExpired,
+  millisUntilExpiry,
+  SESSION_STORAGE_KEY,
+  STORAGE_KEY,
+  tokenStorage,
+} from './token'
 
 type AuthContextValue = {
   token: string | null
@@ -40,16 +47,20 @@ function loadInitialToken(): string | null {
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [token, setToken] = useState<string | null>(loadInitialToken)
+  const [userOverride, setUserOverride] = useState<AuthUser | null>(null)
   const [loginError, setLoginError] = useState<string | null>(null)
   const [isLoggingIn, setIsLoggingIn] = useState(false)
 
-  const user = useMemo(() => decodeToken(token), [token])
+  const user = useMemo(() => userOverride ?? decodeToken(token), [token, userOverride])
 
   const logout = useCallback(() => {
+    // Best-effort server revoke; never block the UI on network failure.
+    void api.logout(token).catch(() => undefined)
     tokenStorage.clear()
     setToken(null)
+    setUserOverride(null)
     setLoginError(null)
-  }, [])
+  }, [token])
 
   // Expire the session in-place so the UI can't keep showing privileged nav
   // for a token the gateway will reject.
@@ -67,12 +78,54 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => window.clearTimeout(timer)
   }, [user, logout])
 
-  // Keep multiple tabs consistent: signing out in one signs out the rest.
+  // Cookie-only sessions (no JS-visible token): hydrate claims from /session
+  // once, after mount. Gated so a failed probe does not loop, and so tests
+  // that start anonymous are not flipped mid-assertion by a late response.
+  const [sessionProbed, setSessionProbed] = useState(false)
+  useEffect(() => {
+    if (token || userOverride || sessionProbed) return
+    let cancelled = false
+    void api
+      .session()
+      .then((s) => {
+        if (cancelled || !s?.sub) return
+        setUserOverride({
+          sub: s.sub,
+          roles: (s.roles ?? []).filter(
+            (r): r is Role => r === 'admin' || r === 'clinician' || r === 'viewer',
+          ),
+          exp: typeof s.exp === 'number' ? s.exp : undefined,
+        })
+      })
+      .catch(() => {
+        /* anonymous is fine */
+      })
+      .finally(() => {
+        if (!cancelled) setSessionProbed(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [token, userOverride, sessionProbed])
+
+  // Cross-tab sync via sessionStorage (and legacy localStorage key).
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
-      if (e.key !== null && e.key !== 'medicore.token') return
+      if (
+        e.key !== null &&
+        e.key !== STORAGE_KEY &&
+        e.key !== SESSION_STORAGE_KEY
+      ) {
+        return
+      }
+      // Another tab cleared storage — drop our in-memory copy too so
+      // loadInitialToken does not resurrect a just-revoked session.
+      if (e.newValue === null || e.newValue === '') {
+        tokenStorage.clear()
+      }
       const next = loadInitialToken()
       setToken((prev) => (prev === next ? prev : next))
+      if (!next) setUserOverride(null)
     }
     window.addEventListener('storage', onStorage)
     return () => window.removeEventListener('storage', onStorage)
@@ -83,6 +136,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!decoded || isExpired(decoded)) return false
     tokenStorage.write(raw)
     setToken(raw)
+    setUserOverride(null)
     setLoginError(null)
     return true
   }, [])

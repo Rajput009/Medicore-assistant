@@ -48,7 +48,7 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression + e2e | `backend/tests/test_*.py` | 342 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 353 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
 
@@ -103,10 +103,18 @@ access-token TTL is outside 1–60 minutes. Booting with the default signing key
 token, and nothing downstream would notice.
 
 **Tokens.** Access tokens default to a **15-minute** lifetime
-(`ACCESS_TOKEN_TTL_MINUTES`) and carry a `token_use=access` claim so a future
-refresh token cannot be replayed as an access token. Demo username/password
-login is forced off in production and returns 404 so the endpoint is not
-advertised.
+(`ACCESS_TOKEN_TTL_MINUTES`), carry a unique `jti` and a `token_use=access`
+claim. Logout hits `/auth/logout`, which places the `jti` on a denylist
+(Redis when available, in-process otherwise) so a stolen token dies before
+natural expiry. Demo username/password login is forced off in production.
+
+**Sessions.** Login/OIDC also set an **httpOnly Secure** session cookie. The
+SPA prefers that cookie (`credentials: 'include'`) and keeps any JS-visible
+token in memory + tab-scoped `sessionStorage` only — never `localStorage`
+(XSS-durable). Legacy localStorage values are migrated away on read.
+
+**Rate limits.** Prefer Redis so N replicas share one global budget; fall back
+to in-process when Redis is down so a cache outage cannot take the API with it.
 
 **API surface.** Interactive OpenAPI docs (`/docs`, `/redoc`, `/openapi.json`)
 are disabled outside local/test. `/ready` stays public (probes send no auth)

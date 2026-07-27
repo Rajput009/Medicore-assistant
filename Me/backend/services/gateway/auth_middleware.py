@@ -83,16 +83,12 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         if path in {p.rstrip("/") or "/" for p in self.exempt_paths}:
             return await call_next(request)
 
-        auth = request.headers.get("authorization")
-        if not auth:
+        token = _extract_token(request)
+        if not token:
             return _unauthorized("missing auth header")
 
-        scheme, _, token = auth.partition(" ")
-        if scheme.lower() != "bearer" or not token.strip():
-            return _unauthorized("invalid authorization scheme")
-
         try:
-            payload = verify_access_token(token.strip())
+            payload = verify_access_token(token)
         except Exception:
             # Never echo the exception: it can leak token/key details.
             return _unauthorized("token invalid or expired")
@@ -103,3 +99,24 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
             "claims": payload,
         }
         return await call_next(request)
+
+
+def _extract_token(request: Request) -> str | None:
+    """Prefer Authorization: Bearer; fall back to the httpOnly session cookie.
+
+    Cookie auth lets the SPA avoid holding the JWT in JavaScript-accessible
+    storage. Bearer remains first-class for non-browser clients and tests.
+    """
+    auth = request.headers.get("authorization")
+    if auth:
+        scheme, _, token = auth.partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            return token.strip()
+        # Non-bearer Authorization is always a hard failure — do not silently
+        # fall through to a stale cookie.
+        if scheme:
+            return None
+    cookie = request.cookies.get(settings.auth_cookie_name)
+    if cookie and cookie.strip():
+        return cookie.strip()
+    return None

@@ -1,18 +1,27 @@
-"""MediCore auth service: local login stub + OIDC SSO + internal token minting."""
+"""MediCore auth service: local login stub + OIDC SSO + internal token minting.
+
+Issues short-lived access tokens and, for browser clients, an httpOnly Secure
+session cookie so the SPA never has to hold the JWT in JavaScript-accessible
+storage (XSS cannot exfiltrate it). Logout revokes the token's ``jti`` so the
+credential dies before natural expiry.
+"""
+
+from __future__ import annotations
 
 import os
 import secrets
 from typing import Any
 
 from authlib.integrations.starlette_client import OAuth, OAuthError
-from fastapi import HTTPException, Request, status
+from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend.common.app import create_service_app
 from backend.common.config import settings
-from backend.common.security import create_access_token
+from backend.common.revocation import revoke_payload
+from backend.common.security import create_access_token, verify_access_token
 
 # Session cookie is required for the OIDC state/nonce round-trip.
 _session_secret = os.getenv("SESSION_SECRET", settings.session_secret)
@@ -65,6 +74,52 @@ def ready() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Cookie helpers
+# --------------------------------------------------------------------------
+
+
+def _cookie_secure() -> bool:
+    # Secure cookies on anything that is not a plain local/test HTTP setup.
+    return settings.is_production or settings.env.lower() not in ("local", "test")
+
+
+def _set_session_cookie(response: Response, token: str, max_age: int) -> None:
+    if not settings.auth_set_cookie:
+        return
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=token,
+        max_age=max_age,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.auth_cookie_name,
+        path="/",
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+    )
+
+
+def _extract_bearer_or_cookie(request: Request) -> str | None:
+    auth = request.headers.get("authorization")
+    if auth:
+        scheme, _, token = auth.partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            return token.strip()
+    cookie = request.cookies.get(settings.auth_cookie_name)
+    if cookie and cookie.strip():
+        return cookie.strip()
+    return None
+
+
+# --------------------------------------------------------------------------
 # Local (development) login
 # --------------------------------------------------------------------------
 
@@ -91,7 +146,7 @@ def _demo_login_enabled() -> bool:
 
 
 @app.post("/login", response_model=TokenResp)
-def login(req: LoginReq) -> TokenResp:
+def login(req: LoginReq, response: Response) -> TokenResp:
     if not _demo_login_enabled():
         # 404 rather than 403: do not advertise that a password endpoint exists.
         raise HTTPException(
@@ -112,7 +167,58 @@ def login(req: LoginReq) -> TokenResp:
 
     ttl = settings.access_token_ttl_minutes
     token = create_access_token(sub=req.username.strip(), roles=["clinician"])
-    return TokenResp(access_token=token, expires_in=ttl * 60)
+    body = TokenResp(access_token=token, expires_in=ttl * 60)
+    _set_session_cookie(response, token, max_age=ttl * 60)
+    return body
+
+
+@app.post("/logout", tags=["auth"])
+def logout(request: Request, response: Response) -> dict[str, str]:
+    """Revoke the current access token and clear the session cookie.
+
+    Safe to call anonymously: a missing/invalid token still clears the cookie
+    so a half-broken browser session can always recover.
+    """
+    raw = _extract_bearer_or_cookie(request)
+    if raw:
+        try:
+            payload = verify_access_token(raw)
+            revoke_payload(payload)
+        except Exception:
+            # Token already invalid/expired — still clear the cookie.
+            pass
+    _clear_session_cookie(response)
+    return {"status": "ok"}
+
+
+@app.get("/session", tags=["auth"])
+def session(request: Request) -> dict[str, Any]:
+    """Return the caller's claims without exposing the raw token.
+
+    The SPA uses this after a cookie-based login so it never has to read the
+    JWT out of storage. Returns 401 when no valid session is present.
+    """
+    raw = _extract_bearer_or_cookie(request)
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        payload = verify_access_token(raw)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+    return {
+        "sub": payload.get("sub"),
+        "roles": payload.get("roles") or [],
+        "exp": payload.get("exp"),
+        "jti": payload.get("jti"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -203,16 +309,18 @@ async def oidc_callback(request: Request):
             {"error": "IdP response contained no subject"}, status_code=400
         )
 
+    ttl = settings.access_token_ttl_minutes
     internal = create_access_token(sub=str(sub), roles=_map_roles(userinfo))
-    return JSONResponse(
-        {
-            "access_token": internal,
-            "token_type": "bearer",
-            "expires_in": settings.access_token_ttl_minutes * 60,
-            "user": {
-                "sub": sub,
-                "email": userinfo.get("email"),
-                "name": userinfo.get("name"),
-            },
-        }
-    )
+    body = {
+        "access_token": internal,
+        "token_type": "bearer",
+        "expires_in": ttl * 60,
+        "user": {
+            "sub": sub,
+            "email": userinfo.get("email"),
+            "name": userinfo.get("name"),
+        },
+    }
+    response = JSONResponse(body)
+    _set_session_cookie(response, internal, max_age=ttl * 60)
+    return response

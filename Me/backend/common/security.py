@@ -7,6 +7,7 @@ Supports:
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,6 +15,7 @@ from jose import JWTError, jwt
 
 from .config import settings
 from .jwks import JWKSFetcher
+from .revocation import is_revoked
 
 # Algorithms we are willing to verify. Anything else (notably "none") is rejected
 # outright so a caller cannot downgrade the algorithm via the token header.
@@ -31,6 +33,9 @@ def create_access_token(
     Default lifetime comes from ``settings.access_token_ttl_minutes`` (15m) so a
     stolen token stops working quickly. Callers that need a different window
     (tests, short-lived bootstrap) pass ``expires_minutes`` explicitly.
+
+    Every token carries a unique ``jti`` so logout / compromise can revoke it
+    before natural expiry via the denylist.
     """
     ttl = (
         settings.access_token_ttl_minutes
@@ -49,6 +54,8 @@ def create_access_token(
         "roles": roles or ["viewer"],
         "iat": int(now.timestamp()),
         "exp": int((now + delta).timestamp()),
+        # Unique id for revocation (denylist keyed by jti until exp).
+        "jti": uuid.uuid4().hex,
         # Explicit token type so a future refresh token cannot be replayed as
         # an access token if we ever issue both from the same secret.
         "token_use": "access",
@@ -111,6 +118,10 @@ def _finalise(payload: dict[str, Any]) -> dict[str, Any]:
     token_use = payload.get("token_use")
     if token_use is not None and token_use != "access":
         raise JWTError("token is not an access token")
+    # Honour the denylist so logout / compromise takes effect before exp.
+    jti = payload.get("jti")
+    if jti and is_revoked(str(jti)):
+        raise JWTError("token has been revoked")
     return payload
 
 

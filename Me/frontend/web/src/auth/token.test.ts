@@ -144,14 +144,23 @@ describe('hasAnyRole', () => {
 })
 
 describe('tokenStorage', () => {
-  it('round-trips a value', () => {
+  it('round-trips a value via sessionStorage, not localStorage', () => {
     tokenStorage.write('abc')
     expect(tokenStorage.read()).toBe('abc')
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBe('abc')
+    expect(window.localStorage.getItem('medicore.token')).toBeNull()
     tokenStorage.clear()
     expect(tokenStorage.read()).toBeNull()
   })
 
-  it('degrades gracefully when localStorage throws', () => {
+  it('migrates a legacy localStorage value and deletes it', () => {
+    window.localStorage.setItem('medicore.token', 'legacy-jwt')
+    expect(tokenStorage.read()).toBe('legacy-jwt')
+    expect(window.localStorage.getItem('medicore.token')).toBeNull()
+    expect(window.sessionStorage.getItem('medicore.session.token')).toBe('legacy-jwt')
+  })
+
+  it('degrades gracefully when storage throws', () => {
     // Safari private mode / storage disabled by policy.
     vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
       throw new Error('denied')
@@ -163,8 +172,9 @@ describe('tokenStorage', () => {
       throw new Error('denied')
     })
 
-    expect(tokenStorage.read()).toBeNull()
+    // Memory still works after a successful write path that swallows errors.
     expect(() => tokenStorage.write('x')).not.toThrow()
+    expect(tokenStorage.read()).toBe('x')
     expect(() => tokenStorage.clear()).not.toThrow()
   })
 })

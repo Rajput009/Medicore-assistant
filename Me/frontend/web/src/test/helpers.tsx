@@ -5,7 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
 
 import type { Role } from '../api/types'
 import { AuthProvider } from '../auth/AuthContext'
-import { STORAGE_KEY } from '../auth/token'
+import { SESSION_STORAGE_KEY, STORAGE_KEY, tokenStorage } from '../auth/token'
 
 /** base64url encode, matching what a JWT issuer produces. */
 function b64url(value: string): string {
@@ -36,7 +36,16 @@ export function makeToken(opts: {
 }
 
 export function seedToken(token: string): void {
-  window.localStorage.setItem(STORAGE_KEY, token)
+  // Prefer the real storage helper so tests exercise the same path as prod
+  // (memory + sessionStorage; never durable localStorage).
+  tokenStorage.write(token)
+  // Also seed sessionStorage directly for specs that construct AuthProvider
+  // before any write() call.
+  try {
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, token)
+  } catch {
+    window.localStorage.setItem(STORAGE_KEY, token)
+  }
 }
 
 /** Renders a tree inside the router + auth providers. */

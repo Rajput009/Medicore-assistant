@@ -60,11 +60,29 @@ def _unauthorized(detail: str = "Not authenticated") -> HTTPException:
     )
 
 
+def _token_from_request(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    if credentials and credentials.credentials:
+        return credentials.credentials
+    # httpOnly session cookie set by the auth service on login/OIDC callback.
+    try:
+        from .config import settings
+
+        cookie = request.cookies.get(settings.auth_cookie_name)
+        if cookie and cookie.strip():
+            return cookie.strip()
+    except Exception:
+        pass
+    return None
+
+
 def get_principal(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
 ) -> Principal:
-    """Verify the bearer token and return the caller.
+    """Verify the bearer token (or session cookie) and return the caller.
 
     Reuses claims already validated by upstream middleware (the gateway) when
     present, so a token is not verified twice on the same request.
@@ -73,10 +91,11 @@ def get_principal(
     if state_user:
         claims = state_user.get("claims") or state_user
     else:
-        if not credentials or not credentials.credentials:
+        raw = _token_from_request(request, credentials)
+        if not raw:
             raise _unauthorized("Missing bearer token")
         try:
-            claims = verify_access_token(credentials.credentials)
+            claims = verify_access_token(raw)
         except Exception:
             # Never echo the underlying error: it can leak key/token details.
             raise _unauthorized("Invalid or expired token") from None
