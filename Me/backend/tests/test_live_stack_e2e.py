@@ -652,6 +652,34 @@ class TestLiveAuditSearch:
             item["path"] == "/fhir/observation/{id}" for item in body["items"]
         ), body["items"]
 
+    def test_a_patient_found_by_search_is_findable_in_the_index(self, live_stack):
+        """SECURITY.md R12, end to end: a search discloses the patients it
+        returned, and each must be findable afterwards even though the query
+        was not filtered by any of them."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.searcher", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        # Filtered by name, not by patient id — the R12 case.
+        code, _, bundle = _http(
+            "GET",
+            f"{live_stack['gateway']}/fhir/patient/search?name=Ada",
+            token=clinician,
+        )
+        assert code == 200
+        assert bundle["entry"][0]["resource"]["id"] == "123"
+
+        admin = self._admin_token()
+        # Patient 123 was never named in the query, only in the results.
+        body = self._search(live_stack, "patient=123&actor=dr.searcher", admin)
+        assert body["total"] >= 1
+        event = body["items"][0]
+        assert event["path"] == "/fhir/patient/search"
+        assert event["subject_count"] >= 1
+
     def test_accessor_summary_names_the_clinician(self, live_stack):
         _, _, login = _http(
             "POST",

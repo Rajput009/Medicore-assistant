@@ -147,6 +147,10 @@ export type AuditEvent = {
   /** True when scope was overridden under break-glass. */
   break_glass?: boolean | null
   break_glass_reason?: string | null
+  /** Patients disclosed by a search result (pseudonymised, truncated). */
+  subject_refs?: string[] | null
+  /** True number disclosed, even when subject_refs was truncated. */
+  subject_count?: number | null
 }
 
 export type AuditSearchResponse = {

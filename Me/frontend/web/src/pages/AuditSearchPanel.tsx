@@ -71,6 +71,13 @@ const EventRow: React.FC<{ event: AuditEvent }> = ({ event }) => (
     </td>
     <td className="mono" title={event.resource_ref ?? event.patient_ref ?? undefined}>
       {shortRef(event.resource_ref ?? event.patient_ref)}
+      {/* A search discloses a page of patients; the count is the honest
+          measure of how many, since the stored list is truncated. */}
+      {typeof event.subject_count === 'number' && event.subject_count > 0 && (
+        <div className="muted" style={{ fontSize: '0.78rem' }}>
+          {event.subject_count} {event.subject_count === 1 ? 'patient' : 'patients'} returned
+        </div>
+      )}
     </td>
     <td className="mono">{event.client_ip ?? '—'}</td>
   </tr>

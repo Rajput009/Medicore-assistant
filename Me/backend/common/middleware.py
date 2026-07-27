@@ -178,6 +178,38 @@ def note_audit_patient(request: Request, patient_id: str | None) -> None:
         pass
 
 
+# A search can legitimately disclose a page of patients. The audit record
+# names them so each disclosure is attributable, but the list is bounded: an
+# unbounded one would let a wide search write an enormous row, and past a
+# certain size the useful signal is "this query returned a lot of people",
+# which `subject_count` already carries.
+MAX_AUDITED_SUBJECTS = 25
+
+
+def note_audit_patients(request: Request, patient_ids: list[str]) -> None:
+    """Attribute a request to every patient it disclosed.
+
+    A search filtered by name or date range returns a set of patients, and
+    each of those is a disclosure that belongs in that person's accounting.
+    Recording only the query shape means a broad search is invisible in every
+    affected patient's trail.
+    """
+    unique: list[str] = []
+    for pid in patient_ids:
+        if pid and pid not in unique:
+            unique.append(pid)
+    if not unique:
+        return
+    try:
+        request.state.audit_patient_ids = unique
+        # Keep the primary column populated for a single-subject result, so
+        # the common case still answers "who viewed MRN-X?" via patient_ref.
+        if len(unique) == 1 and not getattr(request.state, "audit_patient_id", None):
+            request.state.audit_patient_id = unique[0]
+    except Exception:  # pragma: no cover - state is always assignable
+        pass
+
+
 class AuditLogMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, service: str | None = None):
         super().__init__(app)
@@ -297,6 +329,17 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         resolved = getattr(request.state, "audit_patient_id", None)
         if resolved and not record.get("patient_ref"):
             record["patient_ref"] = self._reference(str(resolved))
+
+        # A search discloses a page of patients, not just one. Name them all
+        # so each person's accounting is complete; the count is recorded
+        # separately because the list is truncated for very wide results.
+        disclosed = getattr(request.state, "audit_patient_ids", None)
+        if disclosed:
+            record["subject_count"] = len(disclosed)
+            record["subject_refs"] = [
+                self._reference(str(pid))
+                for pid in disclosed[:MAX_AUDITED_SUBJECTS]
+            ]
 
         # An emergency override is the single most review-worthy event in the
         # trail, so it is carried on the record itself rather than left to be

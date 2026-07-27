@@ -240,6 +240,26 @@ describe('AuditSearchPanel', () => {
   })
 })
 
+describe('search disclosure (R12)', () => {
+  it('shows how many patients a search returned', async () => {
+    /** A search that returned three patients disclosed three, and the
+        reviewer needs to see that, not just the query shape. */
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    const events = await screen.findByRole('table', { name: /audit events/i })
+    expect(within(events).getByText(/3 patients returned/i)).toBeInTheDocument()
+  })
+
+  it('does not label a single-target read as a disclosure set', async () => {
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    const events = await screen.findByRole('table', { name: /audit events/i })
+    // The denied row carries no subject_count.
+    const snoop = within(events).getByText('dr.snoop').closest('tr')!
+    expect(within(snoop).queryByText(/patients returned/i)).not.toBeInTheDocument()
+  })
+})
+
 describe('break-glass review', () => {
   it('shows the override and its reason on the event', async () => {
     const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)

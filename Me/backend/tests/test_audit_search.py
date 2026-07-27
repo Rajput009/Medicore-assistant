@@ -239,10 +239,22 @@ class TestSchema:
 class TestRowProjection:
     def test_maps_every_column(self, audit):
         row = audit.row_from_record(record())
-        assert len(row) == 19
+        assert len(row) == 21
         assert row[3] == "dr.smith"
         assert row[4] == ["clinician"]
         assert row[7] == 200
+
+    def test_search_subjects_are_projected(self, audit):
+        row = audit.row_from_record(
+            record(subject_refs=["sha256:a", "sha256:b"], subject_count=2)
+        )
+        assert row[19] == ["sha256:a", "sha256:b"]
+        assert row[20] == 2
+
+    def test_a_single_target_read_has_no_subject_list(self, audit):
+        row = audit.row_from_record(record())
+        assert row[19] is None
+        assert row[20] is None
 
     def test_break_glass_defaults_to_false(self, audit):
         """A missing flag must never read as an override."""
@@ -548,6 +560,43 @@ class TestSearch:
     def test_no_filters_returns_everything_within_the_page(self, audit):
         insert(audit, *[record() for _ in range(4)])
         assert run(audit.search())["total"] == 4
+
+    def test_a_patient_returned_by_a_search_is_findable(self, audit):
+        """SECURITY.md R12: a search that returned ten patients disclosed all
+        ten, so each must be findable in their own accounting — not just the
+        one the query happened to be filtered by."""
+        insert(
+            audit,
+            record(
+                sub="dr.browser",
+                path="/fhir/patient/search",
+                patient_ref=None,
+                resource_ref=None,
+                subject_refs=["sha256:in-results", "sha256:also-here"],
+                subject_count=2,
+            ),
+        )
+        found = run(audit.search(subject_ref="sha256:in-results"))
+        assert found["total"] == 1
+        assert found["items"][0]["actor_sub"] == "dr.browser"
+        assert found["items"][0]["subject_count"] == 2
+
+        # And the other patient in the same result set.
+        assert run(audit.search(subject_ref="sha256:also-here"))["total"] == 1
+        # But not someone who was never returned.
+        assert run(audit.search(subject_ref="sha256:elsewhere"))["total"] == 0
+
+    def test_search_disclosure_appears_in_the_accessor_summary(self, audit):
+        """'Who has seen this patient?' must include whoever ran a search
+        that returned them."""
+        insert(
+            audit,
+            record(sub="dr.browser", patient_ref=None, resource_ref=None,
+                   subject_refs=["sha256:p1"], subject_count=1),
+            record(sub="dr.direct", patient_ref="sha256:p1"),
+        )
+        actors = {r["actor_sub"] for r in run(audit.actors_for_subject("sha256:p1"))}
+        assert actors == {"dr.browser", "dr.direct"}
 
     def test_break_glass_filter_isolates_overrides(self, audit):
         """'Show me every emergency override' is the review query."""

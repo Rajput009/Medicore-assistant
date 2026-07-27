@@ -273,6 +273,144 @@ class TestGatewayAttribution:
         refs = [r.get("patient_ref") for r in seen if r.get("patient_ref")]
         assert audit_reference("MRN-77") in refs
 
+    def test_a_search_names_every_patient_it_disclosed(self, gateway, monkeypatch, caplog):
+        """SECURITY.md R12: a search returning several patients discloses all
+        of them, so each belongs in the record — not just the query shape."""
+        import backend.services.gateway.main as gw
+
+        async def multi_result(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [
+                    {"resource": {"resourceType": "Patient", "id": "MRN-A"}},
+                    {"resource": {"resourceType": "Patient", "id": "MRN-B"}},
+                ],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", multi_result)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Smith", headers=auth())
+        record = records(caplog)[-1]
+        assert record["subject_count"] == 2
+        assert set(record["subject_refs"]) == {
+            audit_reference("MRN-A"),
+            audit_reference("MRN-B"),
+        }
+
+    def test_search_results_are_not_logged_raw(self, gateway, monkeypatch, caplog):
+        import backend.services.gateway.main as gw
+
+        async def multi_result(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [{"resource": {"resourceType": "Patient", "id": "MRN-LEAK"}}],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", multi_result)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Smith", headers=auth())
+        assert "MRN-LEAK" not in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_observation_search_attributes_to_the_subjects(self, gateway, monkeypatch, caplog):
+        """Non-Patient results are attributed via their subject reference."""
+        import backend.services.gateway.main as gw
+
+        async def obs_results(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Observation",
+                            "id": "o1",
+                            "subject": {"reference": "Patient/MRN-OBS"},
+                        }
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", obs_results)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/observation/search?date=2026-01-01", headers=auth())
+        record = records(caplog)[-1]
+        assert record["subject_refs"] == [audit_reference("MRN-OBS")]
+
+    def test_the_subject_list_is_bounded(self, gateway, monkeypatch, caplog):
+        """A very wide search must not write an unbounded audit row; the count
+        still reports the true scale of the disclosure."""
+        import backend.services.gateway.main as gw
+        from backend.common.middleware import MAX_AUDITED_SUBJECTS
+
+        async def many(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [
+                    {"resource": {"resourceType": "Patient", "id": f"MRN-{i}"}}
+                    for i in range(60)
+                ],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", many)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Common", headers=auth())
+        record = records(caplog)[-1]
+        assert record["subject_count"] == 60
+        assert len(record["subject_refs"]) == MAX_AUDITED_SUBJECTS
+
+    def test_an_empty_search_records_no_subjects(self, gateway, caplog):
+        """Finding nobody is not a disclosure."""
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Nobody", headers=auth())
+        record = records(caplog)[-1]
+        assert "subject_refs" not in record
+        assert "subject_count" not in record
+
+    def test_a_cache_hit_is_still_attributed(self, gateway, monkeypatch, caplog):
+        """Serving a search from cache still discloses those patients."""
+        import backend.services.gateway.main as gw
+
+        async def cached(resource, params, max_age_seconds=300):
+            return {
+                "resourceType": "Bundle",
+                "entry": [{"resource": {"resourceType": "Patient", "id": "MRN-CACHED"}}],
+            }
+
+        monkeypatch.setattr(gw, "get_cached", cached)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Smith", headers=auth())
+        record = records(caplog)[-1]
+        assert record["subject_refs"] == [audit_reference("MRN-CACHED")]
+
+    def test_a_single_result_still_populates_patient_ref(self, gateway, monkeypatch, caplog):
+        """The common 'who viewed MRN-X?' query reads patient_ref, so a
+        single-result search must keep filling it."""
+        import backend.services.gateway.main as gw
+
+        async def one(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [{"resource": {"resourceType": "Patient", "id": "MRN-ONE"}}],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", one)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Only", headers=auth())
+        assert records(caplog)[-1]["patient_ref"] == audit_reference("MRN-ONE")
+
+    def test_an_explicit_filter_still_wins_for_patient_ref(self, gateway, monkeypatch, caplog):
+        import backend.services.gateway.main as gw
+
+        async def one(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [{"resource": {"resourceType": "Patient", "id": "MRN-RESULT"}}],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", one)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/observation/search?patient=MRN-FILTER", headers=auth())
+        assert records(caplog)[-1]["patient_ref"] == audit_reference("MRN-FILTER")
+
     def test_a_broken_resource_body_does_not_fail_the_read(self, gateway, monkeypatch):
         """Attribution is best-effort; a weird upstream payload must not turn
         a successful clinical read into an error."""

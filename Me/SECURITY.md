@@ -69,7 +69,7 @@ honest: “designed” is not the same as “proven in your cluster”.
 | R8 | Supply-chain / CVE drift | Med | **Blocking** CI audits (`make audit`); exceptions documented + guarded by tests |
 | R9 | No formal pen-test | High (org) | External assessment before PHI |
 | R10 | Audit index is lossy under overload (bounded queue) | Med | Alert on `/audit/stats` dropped/failed; backfill from log stream |
-| R12 | Unfiltered searches are not attributed per result | Med | Attribute each entry in the returned bundle |
+| ~~R12~~ | ~~Unfiltered searches are not attributed per result~~ | — | **Closed**: searches record every patient disclosed (`subject_refs`/`subject_count`) |
 | ~~R11~~ | ~~Non-Patient reads are not attributed to a patient~~ | — | **Closed**: the read path resolves `subject`/`patient` and records the patient ref |
 
 ## AuthZ model (current)
@@ -142,10 +142,17 @@ would recognise. Attributing those would put unrelated accesses into
 someone's disclosure accounting. Resolution is best-effort and cannot fail a
 clinical read.
 
-Remaining gap: **searches** are attributed only when filtered by an
-identifying parameter. A search by name or date range that returns ten
-patients records the query shape, not the ten patients it disclosed.
-Closing that means attributing each entry in the result bundle.
+**Searches** are attributed per result, not only by query shape. A search by
+name or date range that returns ten patients records all ten in
+`subject_refs`, so each person's accounting includes it — a search filtered by
+nothing identifying is still a disclosure to everyone it returned. Cache hits
+are attributed too: serving from cache is still a disclosure.
+
+`subject_refs` is capped at 25 entries to bound the row size, but
+`subject_count` always carries the true number, so a very wide search reports
+its real scale rather than appearing to have returned 25 people. A GIN index
+makes "was this patient in anyone's search results?" a lookup rather than a
+scan.
 
 ## Break-glass (emergency scope override)
 

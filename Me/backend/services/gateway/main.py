@@ -42,6 +42,7 @@ from backend.common.idempotency import (
 from backend.common.middleware import (
     audit_reference,
     note_audit_patient,
+    note_audit_patients,
     patient_id_from_resource,
     set_audit_sink,
 )
@@ -295,11 +296,36 @@ async def _read(
     return result
 
 
-async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
+def _patients_in_bundle(bundle: Any) -> list[str]:
+    """Every distinct patient a search bundle disclosed.
+
+    A search filtered by name or date range returns a set of patients, and
+    each is a disclosure that belongs in that person's accounting. Without
+    this the audit trail records the query shape only, so a broad search is
+    invisible in every affected patient's trail.
+    """
+    if not isinstance(bundle, dict):
+        return []
+    found: list[str] = []
+    for entry in bundle.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        pid = patient_id_from_resource(entry.get("resource"))
+        if pid and pid not in found:
+            found.append(pid)
+    return found
+
+
+async def _search(
+    resource: str, params: dict[str, str], request: Request | None = None
+) -> dict[str, Any]:
     ttl = CACHE_TTL.get(resource, 300)
     try:
         cached = await get_cached(resource, params, max_age_seconds=ttl)
         if cached is not None:
+            # A cache hit is still a disclosure to this caller.
+            if request is not None:
+                note_audit_patients(request, _patients_in_bundle(cached))
             return cached
     except Exception:
         # A cache outage must not take the read path down with it.
@@ -325,6 +351,9 @@ async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
         await set_cached(resource, params, resp)
     except Exception:
         pass
+
+    if request is not None:
+        note_audit_patients(request, _patients_in_bundle(resp))
     return resp
 
 
@@ -342,7 +371,7 @@ async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
 async def search_patients(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Patient", _clean_params(request))
+    return await _search("Patient", _clean_params(request), request)
 
 
 @app.get("/fhir/patient/{patient_id}")
@@ -364,7 +393,7 @@ async def get_patient_protected(
 async def search_encounters(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Encounter", _clean_params(request))
+    return await _search("Encounter", _clean_params(request), request)
 
 
 @app.get("/fhir/encounter/{encounter_id}")
@@ -378,7 +407,7 @@ async def get_encounter(
 async def search_observations(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Observation", _clean_params(request))
+    return await _search("Observation", _clean_params(request), request)
 
 
 @app.get("/fhir/observation/{obs_id}")
@@ -392,7 +421,7 @@ async def get_observation(
 async def search_allergies(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("AllergyIntolerance", _clean_params(request))
+    return await _search("AllergyIntolerance", _clean_params(request), request)
 
 
 @app.get("/fhir/allergyintolerance/{allergy_id}")
@@ -406,7 +435,7 @@ async def get_allergy(
 async def search_conditions(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Condition", _clean_params(request))
+    return await _search("Condition", _clean_params(request), request)
 
 
 @app.get("/fhir/condition/{condition_id}")
@@ -420,7 +449,7 @@ async def get_condition(
 async def search_medication_requests(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("MedicationRequest", _clean_params(request))
+    return await _search("MedicationRequest", _clean_params(request), request)
 
 
 @app.get("/fhir/medicationrequest/{med_id}")

@@ -221,6 +221,8 @@ export const handlers = [
           resource_ref: 'sha256:0123456789abcdef',
           patient_ref: null,
           client_ip: '203.0.113.7',
+          subject_count: 3,
+          subject_refs: ['sha256:aaa', 'sha256:bbb', 'sha256:ccc'],
         },
         {
           ts: now,

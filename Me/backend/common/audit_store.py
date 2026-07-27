@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
     duration_ms  DOUBLE PRECISION,
     query_keys   TEXT[],
     break_glass  BOOLEAN NOT NULL DEFAULT false,
-    break_glass_reason TEXT
+    break_glass_reason TEXT,
+    subject_refs TEXT[],
+    subject_count INTEGER
 );
 """
 
@@ -96,6 +98,8 @@ _MIGRATIONS = (
     "ALTER TABLE audit_events "
     "ADD COLUMN IF NOT EXISTS break_glass BOOLEAN NOT NULL DEFAULT false;",
     "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS break_glass_reason TEXT;",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS subject_refs TEXT[];",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS subject_count INTEGER;",
 )
 
 # Every index below backs a question an investigator actually asks. Without
@@ -116,16 +120,21 @@ _INDEXES = (
     # ("show me every emergency override this month"), so the same applies.
     "CREATE INDEX IF NOT EXISTS audit_events_break_glass_idx "
     "ON audit_events (ts DESC) WHERE break_glass;",
+    # Searches list every patient they disclosed. Without a GIN index,
+    # "was MRN-X in anyone's search results?" is a sequential scan.
+    "CREATE INDEX IF NOT EXISTS audit_events_subject_refs_idx "
+    "ON audit_events USING GIN (subject_refs);",
 )
 
 _INSERT = """
 INSERT INTO audit_events (
     ts, request_id, service, actor_sub, actor_roles, method, path, status,
     outcome, resource_type, resource_ref, patient_ref, bed_id, client_ip,
-    user_agent, duration_ms, query_keys, break_glass, break_glass_reason
+    user_agent, duration_ms, query_keys, break_glass, break_glass_reason,
+    subject_refs, subject_count
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19
+    $17, $18, $19, $20, $21
 )
 """
 
@@ -149,6 +158,8 @@ _COLUMNS = (
     "query_keys",
     "break_glass",
     "break_glass_reason",
+    "subject_refs",
+    "subject_count",
 )
 
 
@@ -201,6 +212,10 @@ def row_from_record(record: dict[str, Any], *, now: datetime | None = None) -> t
         _string_list(record.get("query_keys")),
         bool(record.get("break_glass", False)),
         _text(record.get("break_glass_reason"), 500),
+        _string_list(record.get("subject_refs")),
+        int(record["subject_count"])
+        if isinstance(record.get("subject_count"), (int, float))
+        else None,
     )
 
 
@@ -564,7 +579,14 @@ async def search(
         where.append(clause_template.format(n=len(args)))
 
     if subject_ref:
-        add("(patient_ref = ${n} OR resource_ref = ${n})", subject_ref)
+        # A patient is "touched" by a request that targeted their record, or
+        # by a search that returned them in its results. Leaving the third
+        # case out would under-report disclosures in an accounting request.
+        add(
+            "(patient_ref = ${n} OR resource_ref = ${n} "
+            "OR subject_refs @> ARRAY[${n}]::text[])",
+            subject_ref,
+        )
     if actor:
         add("actor_sub = ${n}", actor)
     if outcome:
@@ -636,7 +658,8 @@ async def actors_for_subject(subject_ref: str, *, limit: int = 50) -> list[dict[
                    count(*) FILTER (WHERE outcome = 'denied') AS denied,
                    count(*) FILTER (WHERE break_glass)        AS break_glass
             FROM audit_events
-            WHERE (patient_ref = $1 OR resource_ref = $1)
+            WHERE (patient_ref = $1 OR resource_ref = $1
+                   OR subject_refs @> ARRAY[$1]::text[])
               AND actor_sub IS NOT NULL
             GROUP BY actor_sub
             ORDER BY max(ts) DESC
