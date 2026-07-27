@@ -48,7 +48,7 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression + e2e | `backend/tests/test_*.py` | 387 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 398 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
 
@@ -73,6 +73,13 @@ Backend DB / residual coverage notes:
 - **Mongo client shape:** ConfigMap URI requires `replicaSet` + `retryWrites`;
   driver enables `retryWrites=True`. Multi-doc transactions remain unproven on
   the mock (explicitly asserted).
+
+
+- **Live multi-process stack:** `tests/test_live_stack_e2e.py` boots real
+  uvicorn workers for auth, gateway, CDS and patient-flow on loopback against
+  genuine Postgres (`pgserver`), an HTTP FHIR stub, and mongomock for flow
+  state. Covers login → token → CDS/flow clinical workflow → gateway FHIR
+  cache round-trip → logout revocation. No Docker required.
 
 Suites `importorskip` cleanly when optional engines are missing.
 
