@@ -341,3 +341,20 @@ derived score, and filing it as a vital sign would corrupt flowsheets. All
 readings in one submission share an effective timestamp so a flowsheet groups
 them into a single column, and the patient's cached Observation searches are
 invalidated immediately so the clinician can see what they just saved.
+
+**Safety context in the chart.** The patient chart drawer loads allergies
+(`AllergyIntolerance`), the problem list (`Condition`) and medications
+(`MedicationRequest`) alongside vitals, and renders them *before* demographics
+— they are what a clinician checks before acting. Three rules are enforced in
+`safetySummary.ts` and covered by tests, because the dangerous failure mode for
+all three lists is an entry that silently does not render:
+
+- A resource that cannot be fully parsed is still displayed, labelled
+  "unknown", never filtered out.
+- An allergy with no `clinicalStatus` counts as **active**; absent is not
+  the same as resolved.
+- A failed allergy lookup renders an explicit error, never an empty list —
+  "no known allergies" must not be indistinguishable from "we could not ask".
+
+Resolved and inactive entries are collapsed rather than discarded, since a
+cleared allergy is still clinical history.

@@ -52,6 +52,10 @@ CACHE_TTL = {
     "Encounter": 300,
     "Observation": 60,
     "MedicationRequest": 300,
+    # Safety-critical context. Allergies change rarely but a stale allergy
+    # list is the kind of error that harms someone, so it gets a short TTL.
+    "AllergyIntolerance": 120,
+    "Condition": 300,
 }
 
 # Only these resource types may be targeted by cache invalidation, so a path
@@ -146,6 +150,7 @@ ALLOWED_SEARCH_PARAMS: frozenset[str] = frozenset(
         "name", "family", "given", "birthdate", "gender",
         "status", "category", "code", "date", "encounter",
         "class", "type", "intent", "authoredon", "requester",
+        "clinical-status", "verification-status", "criticality",
         "_count", "_sort", "_include", "_lastUpdated", "page",
     }
 )
@@ -330,6 +335,34 @@ async def get_observation(
     obs_id: str, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
     return await _read("Observation", obs_id)
+
+
+@app.get("/fhir/allergyintolerance/search")
+async def search_allergies(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("AllergyIntolerance", _clean_params(request))
+
+
+@app.get("/fhir/allergyintolerance/{allergy_id}")
+async def get_allergy(
+    allergy_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("AllergyIntolerance", allergy_id)
+
+
+@app.get("/fhir/condition/search")
+async def search_conditions(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("Condition", _clean_params(request))
+
+
+@app.get("/fhir/condition/{condition_id}")
+async def get_condition(
+    condition_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("Condition", condition_id)
 
 
 @app.get("/fhir/medicationrequest/search")

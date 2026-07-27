@@ -25,12 +25,24 @@ import {
   barWidthPercent,
   extractObservationPoints,
 } from './observationTrends'
+import {
+  partitionByActivity,
+  summariseAllergy,
+  summariseCondition,
+  summariseMedication,
+  type SafetyEntry,
+} from './safetySummary'
 import { rememberPatient } from './recentPatients'
 
 type ChartData = {
   patient: FhirResource | null
   observations: FhirResource[]
   encounters: FhirResource[]
+  allergies: SafetyEntry[]
+  problems: SafetyEntry[]
+  medications: SafetyEntry[]
+  /** True when the allergy request itself failed, as opposed to returning none. */
+  allergiesUnavailable: boolean
   beds: Bed[]
   queue: QueueItem[]
 }
@@ -38,6 +50,60 @@ type ChartData = {
 function patientLabel(p: FhirResource | null, fallbackId: string): string {
   if (!p) return fallbackId
   return summariseResource(p)
+}
+
+/** One safety list (allergies / problems / meds) with an active-first split. */
+const SafetyList: React.FC<{
+  entries: SafetyEntry[]
+  emptyMessage: string
+  inactiveLabel: string
+}> = ({ entries, emptyMessage, inactiveLabel }) => {
+  const { active, inactive } = partitionByActivity(entries)
+
+  if (entries.length === 0) {
+    return (
+      <p className="muted" style={{ margin: 0 }}>
+        {emptyMessage}
+      </p>
+    )
+  }
+
+  return (
+    <>
+      <ul className="chart-list">
+        {active.map((entry) => (
+          <li key={entry.id}>
+            {entry.critical && (
+              <>
+                <Badge tone="err" withDot>
+                  high risk
+                </Badge>{' '}
+              </>
+            )}
+            <strong>{entry.label}</strong>
+            {entry.detail && <div className="muted">{entry.detail}</div>}
+          </li>
+        ))}
+      </ul>
+      {/* Resolved entries are history, not noise - collapsed, never dropped. */}
+      {inactive.length > 0 && (
+        <details style={{ marginTop: 6 }}>
+          <summary className="muted">
+            {inactive.length} {inactiveLabel}
+          </summary>
+          <ul className="chart-list">
+            {inactive.map((entry) => (
+              <li key={entry.id}>
+                <span className="muted">
+                  {entry.label} ({entry.status})
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </>
+  )
 }
 
 export const PatientChartDrawer: React.FC = () => {
@@ -67,14 +133,39 @@ export const PatientChartDrawer: React.FC = () => {
 
     void (async () => {
       try {
-        const [patientResult, obsBundle, encBundle, beds, queue] = await Promise.all([
+        const emptyBundle = { resourceType: 'Bundle' as const, entry: [] }
+        // Allergies are tracked separately: "the request failed" and "this
+        // patient has no allergies" must never render the same way.
+        let allergiesFailed = false
+        const [
+          patientResult,
+          obsBundle,
+          encBundle,
+          allergyBundle,
+          conditionBundle,
+          medBundle,
+          beds,
+          queue,
+        ] = await Promise.all([
           api.fhirRead('Patient', patientId, null, ac.signal).catch(() => null),
           api
             .fhirSearch('Observation', { patient: patientId }, null, ac.signal)
-            .catch(() => ({ resourceType: 'Bundle' as const, entry: [] })),
+            .catch(() => emptyBundle),
           api
             .fhirSearch('Encounter', { patient: patientId }, null, ac.signal)
-            .catch(() => ({ resourceType: 'Bundle' as const, entry: [] })),
+            .catch(() => emptyBundle),
+          api
+            .fhirSearch('AllergyIntolerance', { patient: patientId }, null, ac.signal)
+            .catch(() => {
+              allergiesFailed = true
+              return emptyBundle
+            }),
+          api
+            .fhirSearch('Condition', { patient: patientId }, null, ac.signal)
+            .catch(() => emptyBundle),
+          api
+            .fhirSearch('MedicationRequest', { patient: patientId }, null, ac.signal)
+            .catch(() => emptyBundle),
           api.listBeds(null, null, ac.signal).catch(() => [] as Bed[]),
           api.listQueue(50, null, null, ac.signal).catch(
             () => ({ items: [], count: 0, total: 0 }) as QueueListResponse,
@@ -90,10 +181,19 @@ export const PatientChartDrawer: React.FC = () => {
           .map((e) => e.resource)
           .filter((r): r is FhirResource => Boolean(r))
 
+        const resourcesOf = (bundle: { entry?: { resource?: FhirResource }[] }) =>
+          (bundle.entry ?? [])
+            .map((e) => e.resource)
+            .filter((r): r is FhirResource => Boolean(r))
+
         setData({
           patient: patientResult,
           observations: observations.slice(0, 12),
           encounters: encounters.slice(0, 5),
+          allergies: resourcesOf(allergyBundle).map(summariseAllergy),
+          problems: resourcesOf(conditionBundle).map(summariseCondition),
+          medications: resourcesOf(medBundle).map(summariseMedication),
+          allergiesUnavailable: allergiesFailed,
           beds: beds.filter((b) => b.patient_id === patientId),
           queue: queue.items.filter((q) => q.patient_id === patientId),
         })
@@ -201,6 +301,45 @@ export const PatientChartDrawer: React.FC = () => {
                     <span className="muted">{q.status ?? 'waiting'}</span>
                   </div>
                 ))}
+              </section>
+
+              <section className="chart-section">
+                <h3>
+                  Allergies{' '}
+                  {data.allergies.some((a) => a.active && a.critical) && (
+                    <Badge tone="err">high risk</Badge>
+                  )}
+                </h3>
+                {data.allergiesUnavailable ? (
+                  // Never render a failed lookup as "no known allergies".
+                  <Alert kind="error">
+                    Allergy list unavailable — do not treat this as "no known allergies".
+                  </Alert>
+                ) : (
+                  <SafetyList
+                    entries={data.allergies}
+                    emptyMessage="No allergies recorded for this patient."
+                    inactiveLabel="resolved / inactive"
+                  />
+                )}
+              </section>
+
+              <section className="chart-section">
+                <h3>Problem list</h3>
+                <SafetyList
+                  entries={data.problems}
+                  emptyMessage="No conditions recorded."
+                  inactiveLabel="resolved / inactive"
+                />
+              </section>
+
+              <section className="chart-section">
+                <h3>Medications</h3>
+                <SafetyList
+                  entries={data.medications}
+                  emptyMessage="No medication requests found."
+                  inactiveLabel="stopped / completed"
+                />
               </section>
 
               <section className="chart-section">

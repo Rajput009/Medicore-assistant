@@ -142,6 +142,8 @@ export const FHIR_RESOURCES = [
   'Encounter',
   'Observation',
   'MedicationRequest',
+  'AllergyIntolerance',
+  'Condition',
 ] as const
 
 export type FhirResourceType = (typeof FHIR_RESOURCES)[number]
@@ -152,6 +154,8 @@ export const FHIR_ROUTE: Record<FhirResourceType, string> = {
   Encounter: 'encounter',
   Observation: 'observation',
   MedicationRequest: 'medicationrequest',
+  AllergyIntolerance: 'allergyintolerance',
+  Condition: 'condition',
 }
 
 export type Role = 'admin' | 'clinician' | 'viewer'
