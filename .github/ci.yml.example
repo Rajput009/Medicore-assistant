@@ -37,8 +37,10 @@ jobs:
         run: ruff check backend
 
       - name: Dependency audit
-        run: |
-          if [ -f scripts/audit_python.sh ]; then bash scripts/audit_python.sh; else pip-audit --progress-spinner=off || true; fi
+        # Blocking. Exceptions live in scripts/audit_python.sh with a written
+        # reason and a guard test, so an accepted risk cannot become a
+        # forgotten one.
+        run: bash scripts/audit_python.sh
 
       - name: Test
         env:
@@ -64,9 +66,11 @@ jobs:
         working-directory: Me/frontend/web
         run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
-      - name: npm audit (high+)
-        working-directory: Me/frontend/web
-        run: npm audit --audit-level=high || true
+      - name: Dependency audit
+        # Blocking for *runtime* dependencies only; dev-tool advisories are
+        # printed but do not fail the build (vite/esbuild never ship to a
+        # browser). Exceptions are documented in scripts/audit_node.sh.
+        run: bash scripts/audit_node.sh
 
       - name: Typecheck (app)
         working-directory: Me/frontend/web

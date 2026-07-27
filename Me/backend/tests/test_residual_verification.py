@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 from fastapi import FastAPI
+from jose import JWTError
 from starlette.testclient import TestClient
 
 from backend.common.config import Settings
@@ -70,7 +71,9 @@ class TestRedisBackedControls:
         assert revoke_payload(claims) is True
         # Key landed in Redis, not just the in-process map.
         assert fake_redis.exists(f"medicore:revoked:{claims['jti']}")
-        with pytest.raises(Exception):
+        # Specific: a bare Exception would still pass if verification broke
+        # for some reason unrelated to the denylist.
+        with pytest.raises(JWTError, match="revoked"):
             verify_access_token(token)
 
     def test_rate_limit_uses_redis_incr(self, fake_redis):
@@ -131,9 +134,10 @@ class TestMongoMockIndexSemantics:
     @pytest.fixture()
     def queue(self):
         pytest.importorskip("mongomock_motor", reason="mongomock_motor not installed")
+        import asyncio
+
         from mongomock_motor import AsyncMongoMockClient
         from pymongo import ASCENDING
-        import asyncio
 
         loop = asyncio.new_event_loop()
         client = AsyncMongoMockClient()
@@ -153,7 +157,6 @@ class TestMongoMockIndexSemantics:
 
     def test_two_waiting_slots_for_same_patient_are_rejected(self, queue):
         from pymongo.errors import DuplicateKeyError
-        import asyncio
 
         loop, q = queue
 
@@ -168,7 +171,6 @@ class TestMongoMockIndexSemantics:
 
     def test_completed_row_does_not_block_a_new_waiting_row(self, queue):
         """Partial filter: only status=waiting participates in the unique key."""
-        import asyncio
 
         loop, q = queue
 
@@ -188,12 +190,14 @@ class TestMongoMockIndexSemantics:
 
     def test_repository_enqueue_conflict_matches_index(self, queue):
         """End-to-end through PatientFlowRepository against the mock."""
+        import asyncio
+
+        from mongomock_motor import AsyncMongoMockClient
+
         from backend.services.patient_flow.repository import (
             ConflictError,
             PatientFlowRepository,
         )
-        from mongomock_motor import AsyncMongoMockClient
-        import asyncio
 
         loop = asyncio.new_event_loop()
         client = AsyncMongoMockClient()
@@ -403,9 +407,9 @@ class TestIngressPathRouting:
 
 class TestMongoClientProductionShape:
     def test_create_client_enables_retryable_writes(self):
-        from backend.services.patient_flow.repository import create_client
-        from backend.common import config
         import inspect
+
+        from backend.services.patient_flow.repository import create_client
 
         # Source-level pin: retryWrites=True must stay on the constructor.
         src = inspect.getsource(create_client)
@@ -427,8 +431,9 @@ class TestMongoClientProductionShape:
         is clearly additive rather than a silent replacement.
         """
         pytest.importorskip("mongomock_motor")
-        from mongomock_motor import AsyncMongoMockClient
         import asyncio
+
+        from mongomock_motor import AsyncMongoMockClient
 
         async def attempt():
             client = AsyncMongoMockClient()

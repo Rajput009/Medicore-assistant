@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/docker/docker-compose.yml
 
-.PHONY: help up down logs fmt lint test test-web test-e2e test-all build docker clean
+.PHONY: help up down logs fmt lint audit test test-web test-e2e test-all build docker clean
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -25,6 +25,10 @@ fmt: ## Format Python and web sources
 lint: ## Lint Python and web sources
 	python -m ruff check backend
 	cd frontend/web && npx tsc --noEmit
+
+audit: ## Fail on known vulnerabilities in shipped dependencies
+	bash scripts/audit_python.sh
+	bash scripts/audit_node.sh
 
 test: ## Run the backend test suite (unit + e2e)
 	python -m pytest backend/tests -q

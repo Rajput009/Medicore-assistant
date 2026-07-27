@@ -13,6 +13,7 @@ import time
 
 import pytest
 from fastapi import FastAPI
+from jose import JWTError
 from starlette.testclient import TestClient
 
 pytest.importorskip("fakeredis", reason="fakeredis not installed")
@@ -159,7 +160,10 @@ class TestMultiReplicaRevocation:
         # Clear any local in-process denylist so the check must hit Redis.
         reset_revocation_store()
         assert is_revoked(jti) is True
-        with pytest.raises(Exception):
+        # Assert the specific failure: a bare Exception would also be
+        # satisfied by an unrelated TypeError, so the test would keep passing
+        # even if revocation stopped being enforced.
+        with pytest.raises(JWTError, match="revoked"):
             verify_access_token(token)
 
     def test_local_only_revoke_is_invisible_across_pods(self, monkeypatch):

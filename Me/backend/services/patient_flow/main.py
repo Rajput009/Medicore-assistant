@@ -27,8 +27,12 @@ from backend.common.deps import (
 )
 from backend.common.idempotency import (
     extract_idempotency_key,
-    lookup as idem_lookup,
     replay_response,
+)
+from backend.common.idempotency import (
+    lookup as idem_lookup,
+)
+from backend.common.idempotency import (
     store as idem_store,
 )
 from backend.common.middleware import set_audit_sink

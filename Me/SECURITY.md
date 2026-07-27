@@ -66,7 +66,7 @@ honest: “designed” is not the same as “proven in your cluster”.
 | R5 | Patient ACL is ward/dept only (no encounter graph) | Med | Wire `can_access_patient` to encounter index |
 | R6 | No refresh tokens — 15m hard session | Low | Sliding session or step-up if UX requires |
 | R7 | In-process rate limit/revoke when Redis down | Med | Monitor fallback; require Redis in prod |
-| R8 | Supply-chain / CVE drift | Med | CI `pip-audit` + `npm audit` |
+| R8 | Supply-chain / CVE drift | Med | **Blocking** CI audits (`make audit`); exceptions documented + guarded by tests |
 | R9 | No formal pen-test | High (org) | External assessment before PHI |
 | R10 | Audit index is lossy under overload (bounded queue) | Med | Alert on `/audit/stats` dropped/failed; backfill from log stream |
 | R12 | Unfiltered searches are not attributed per result | Med | Attribute each entry in the returned bundle |
@@ -177,3 +177,29 @@ Note that patient-flow indexes audit records into the same Postgres the
 gateway searches. It has to: the browser reaches `/flow/*` directly, so
 without its own sink every bed assignment, triage claim and break-glass
 override would be missing from audit search.
+
+## Dependency audit policy
+
+`make audit` runs both gates and **fails the build**; CI runs the same two
+scripts. Previously the npm gate ended in `|| true`, which meant it reported
+findings nobody was obliged to act on.
+
+**What blocks.** Python: every advisory against an installed package. Node:
+*runtime* dependencies only (`--omit=dev`). Vite, Vitest and esbuild never
+reach a browser, so a dev-server advisory is a real bug but not a release
+blocker — and treating it as one trains people to wave the gate through. Dev
+advisories are still printed on every run.
+
+**Exceptions.** Listed in `scripts/audit_python.sh` / `scripts/audit_node.sh`
+with a status, a reason the vulnerable path is unreachable, and the condition
+that withdraws the exception. Each one is backed by a test that fails if the
+reasoning stops holding, because a suppressed advisory is exactly the kind of
+risk acceptance that outlives the person who accepted it.
+
+| Advisory | Package | Why suppressed | Guard |
+|---|---|---|---|
+| PYSEC-2026-1325 | `ecdsa` (Minerva timing attack) | No upstream fix exists. `python-jose[cryptography]` resolves EC keys to the OpenSSL backend, so the pure-Python code never runs. | `test_dependency_audit.py` runs a full ES256 round trip with the `ecdsa` module rigged to raise on any attribute access. |
+| GHSA-qwww-vcr4-c8h2 | `react-router` (RSC-mode CSRF) | Fix requires >=8.3.0, unreleased; we run the newest published 7.x. The flaw is in the data-router action pipeline, and this SPA is declarative-only. | `routerSurface.test.tsx` fails if `createBrowserRouter`/`RouterProvider`/route `action` appear in app sources. |
+
+Both guards were verified to fail when deliberately broken — a tripwire that
+cannot trip is worse than none, because it manufactures confidence.

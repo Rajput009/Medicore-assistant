@@ -313,12 +313,16 @@ uvicorn.run(pf.app, host="127.0.0.1", port={FLOW_PORT}, log_level="warning")
         "flow": f"http://127.0.0.1:{FLOW_PORT}",
     }
 
-    for name, proc in procs:
+    for _name, proc in procs:
         proc.send_signal(signal.SIGTERM)
     for name, proc in procs:
         try:
             proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
+            # Name the worker that would not shut down: a SIGTERM that is
+            # ignored usually means a lifespan hook is wedged, and without
+            # this the only symptom is a slow, silent teardown.
+            print(f"worker {name!r} ignored SIGTERM; killing")
             proc.kill()
     fhir_server.shutdown()
     try:
