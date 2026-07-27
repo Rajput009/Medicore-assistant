@@ -4,6 +4,7 @@ import { NavLink } from 'react-router-dom'
 import type { Role } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { Badge } from './components'
+import { PatientSearch } from './PatientSearch'
 
 type NavItem = { to: string; label: string; roles?: Role[] }
 
@@ -77,9 +78,12 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       <div className="main">
         <header className="topbar">
           <strong>Clinician console</strong>
-          <button type="button" onClick={logout}>
-            Sign out
-          </button>
+          <div className="topbar-actions">
+            <PatientSearch />
+            <button type="button" onClick={logout}>
+              Sign out
+            </button>
+          </div>
         </header>
         <main id="main-content" className="content" tabIndex={-1}>
           {children}

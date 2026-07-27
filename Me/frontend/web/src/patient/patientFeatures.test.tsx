@@ -5,10 +5,11 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import React from 'react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { AuthProvider } from '../auth/AuthContext'
 import { CdsPage, acuityFromRisk } from '../pages/CdsPage'
+import { DashboardPage } from '../pages/DashboardPage'
 import { groupBedsByWard, wardSummary, WardBoardPage } from '../pages/WardBoardPage'
 import { partitionWorklist, waitingDepartments, WorklistPage } from '../pages/WorklistPage'
 import { makeToken, renderWithProviders, seedToken } from '../test/helpers'
@@ -350,6 +351,99 @@ describe('Idempotency-Key on writes', () => {
     expect(seen.enqueue).toBe('key-enq-1')
     expect(seen.claim).toBe('key-claim-1')
     expect(seen.bed).toBe('key-bed-1')
+  })
+})
+
+describe('computeCensus', () => {
+  it('counts free beds and queue statuses', async () => {
+    const { computeCensus } = await import('../pages/DashboardPage')
+    const stats = computeCensus(
+      [
+        { bed_id: 'A-001', ward: 'A', occupied: true, patient_id: 'p' },
+        { bed_id: 'A-002', ward: 'A', occupied: false, patient_id: null },
+        { bed_id: 'B-001', ward: 'B', occupied: false, patient_id: null },
+      ],
+      {
+        items: [
+          { patient_id: 'w1', acuity: 1, dept: 'ED', status: 'waiting' },
+          { patient_id: 'w2', acuity: 2, dept: 'ED', status: 'waiting' },
+          {
+            patient_id: 'c1',
+            acuity: 1,
+            dept: 'ED',
+            status: 'in_progress',
+            claimed_by: 'dr.a',
+          },
+        ],
+        count: 3,
+        total: 3,
+      },
+    )
+    expect(stats).toEqual({
+      freeBeds: 2,
+      totalBeds: 3,
+      waiting: 2,
+      inProgress: 1,
+    })
+  })
+})
+
+
+describe('PatientSearch visibility', () => {
+  it('renders the search field for clinicians after bootstrap', async () => {
+    const user = userEvent.setup()
+    const { PatientSearch } = await import('../ui/PatientSearch')
+    seedToken(makeToken({ roles: ['clinician'] }))
+    render(
+      <MemoryRouter>
+        <AuthProvider>
+          <PatientChartProvider>
+            <PatientSearch />
+            <PatientChartDrawer />
+          </PatientChartProvider>
+        </AuthProvider>
+      </MemoryRouter>,
+    )
+    const input = await screen.findByPlaceholderText(/patient id \/ mrn/i)
+    await user.type(input, 'MRN-42')
+    await user.click(screen.getByRole('button', { name: /open chart/i }))
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByText('MRN-42')).toBeInTheDocument()
+  })
+})
+
+describe('Ward board assign', () => {
+  it('assigns a free bed via prompt', async () => {
+    const user = userEvent.setup()
+    let assigned: unknown = null
+    server.use(
+      http.get('/flow/beds', () =>
+        HttpResponse.json([
+          { bed_id: 'A-001', ward: 'A', occupied: false, patient_id: null },
+        ]),
+      ),
+      http.patch(/\/flow\/beds\//, async ({ request }) => {
+        assigned = await request.json()
+        return HttpResponse.json({
+          bed_id: 'A-001',
+          ward: 'A',
+          occupied: true,
+          patient_id: 'P-NEW',
+        })
+      }),
+    )
+    vi.spyOn(window, 'prompt').mockReturnValue('P-NEW')
+    renderWithProviders(<WardBoardPage />)
+    expect(await screen.findByText('A-001')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /^assign$/i }))
+    await waitFor(() =>
+      expect(assigned).toMatchObject({
+        occupied: true,
+        patient_id: 'P-NEW',
+        expected_occupied: false,
+      }),
+    )
+    expect(await screen.findByText(/Assigned P-NEW/i)).toBeInTheDocument()
   })
 })
 

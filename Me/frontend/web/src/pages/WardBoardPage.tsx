@@ -1,5 +1,5 @@
 /**
- * Ward whiteboard — beds grouped by ward for charge-nurse style overview.
+ * Ward whiteboard — beds grouped by ward with assign/discharge actions.
  */
 
 import React, { useMemo, useState } from 'react'
@@ -8,7 +8,7 @@ import { api } from '../api/client'
 import type { Bed } from '../api/types'
 import { useAsyncData } from '../hooks/useAsync'
 import { PatientLink } from '../patient/PatientChartDrawer'
-import { Alert, Badge, Card, EmptyState, Field, SkeletonRows } from '../ui/components'
+import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
 
 export function groupBedsByWard(beds: Bed[]): Record<string, Bed[]> {
   const groups: Record<string, Bed[]> = {}
@@ -29,6 +29,9 @@ export function wardSummary(beds: Bed[]): { free: number; total: number } {
 
 export const WardBoardPage: React.FC = () => {
   const [filter, setFilter] = useState('')
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionOk, setActionOk] = useState<string | null>(null)
   const { state, reload } = useAsyncData((signal) => api.listBeds(null, null, signal), [])
 
   const groups = useMemo(() => {
@@ -36,16 +39,61 @@ export const WardBoardPage: React.FC = () => {
     const all = groupBedsByWard(beds)
     const f = filter.trim().toLowerCase()
     if (!f) return all
-    return Object.fromEntries(Object.entries(all).filter(([ward]) => ward.toLowerCase().includes(f)))
+    return Object.fromEntries(
+      Object.entries(all).filter(([ward]) => ward.toLowerCase().includes(f)),
+    )
   }, [state, filter])
 
   const wards = Object.keys(groups).sort()
+
+  const onAssign = async (bed: Bed) => {
+    setActionError(null)
+    setActionOk(null)
+    const patientId = window.prompt(`Patient ID to assign to bed ${bed.bed_id}:`)?.trim()
+    if (!patientId) return
+    setBusyId(bed.bed_id)
+    try {
+      await api.setBedOccupancy(bed.bed_id, {
+        occupied: true,
+        patient_id: patientId,
+        expected_occupied: false,
+      })
+      setActionOk(`Assigned ${patientId} to ${bed.bed_id}.`)
+      reload()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Assign failed')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const onDischarge = async (bed: Bed) => {
+    setActionError(null)
+    setActionOk(null)
+    if (!window.confirm(`Discharge bed ${bed.bed_id}${bed.patient_id ? ` (${bed.patient_id})` : ''}?`)) {
+      return
+    }
+    setBusyId(bed.bed_id)
+    try {
+      await api.setBedOccupancy(bed.bed_id, {
+        occupied: false,
+        patient_id: null,
+        expected_occupied: true,
+      })
+      setActionOk(`Discharged ${bed.bed_id}.`)
+      reload()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Discharge failed')
+    } finally {
+      setBusyId(null)
+    }
+  }
 
   return (
     <>
       <header className="page-header">
         <h1>Ward board</h1>
-        <p>Live bed census by ward. Click a patient to open the chart.</p>
+        <p>Live bed census by ward. Assign, discharge, or open a chart.</p>
       </header>
 
       <div className="row" style={{ marginBottom: 14, alignItems: 'flex-end' }}>
@@ -63,6 +111,9 @@ export const WardBoardPage: React.FC = () => {
           Refresh
         </button>
       </div>
+
+      {actionError && <Alert kind="error">{actionError}</Alert>}
+      {actionOk && <Alert kind="success">{actionOk}</Alert>}
 
       {state.status === 'loading' && <SkeletonRows rows={6} />}
       {state.status === 'error' && <Alert kind="error">{state.error}</Alert>}
@@ -110,6 +161,38 @@ export const WardBoardPage: React.FC = () => {
                         <Badge tone="ok" withDot>
                           available
                         </Badge>
+                      )}
+                    </div>
+                    <div className="bed-tile-actions">
+                      {bed.occupied ? (
+                        <button
+                          type="button"
+                          disabled={busyId === bed.bed_id}
+                          onClick={() => void onDischarge(bed)}
+                        >
+                          {busyId === bed.bed_id ? (
+                            <>
+                              <Spinner label="Discharging" /> …
+                            </>
+                          ) : (
+                            'Discharge'
+                          )}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="primary"
+                          disabled={busyId === bed.bed_id}
+                          onClick={() => void onAssign(bed)}
+                        >
+                          {busyId === bed.bed_id ? (
+                            <>
+                              <Spinner label="Assigning" /> …
+                            </>
+                          ) : (
+                            'Assign'
+                          )}
+                        </button>
                       )}
                     </div>
                   </div>
