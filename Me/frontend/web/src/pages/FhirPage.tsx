@@ -3,7 +3,6 @@ import React, { useState } from 'react'
 import { api } from '../api/client'
 import type { FhirBundle, FhirResource, FhirResourceType } from '../api/types'
 import { FHIR_RESOURCES } from '../api/types'
-import { useAuth } from '../auth/AuthContext'
 import { useAsyncAction } from '../hooks/useAsync'
 import { Alert, Card, EmptyState, Field, JsonBlock, Spinner } from '../ui/components'
 
@@ -35,7 +34,6 @@ export function bundleResources(bundle: FhirBundle | undefined): FhirResource[] 
 }
 
 export const FhirPage: React.FC = () => {
-  const { token } = useAuth()
   const [resource, setResource] = useState<FhirResourceType>('Patient')
   const [mode, setMode] = useState<Mode>('search')
   const [resourceId, setResourceId] = useState('')
@@ -45,10 +43,10 @@ export const FhirPage: React.FC = () => {
   const [validation, setValidation] = useState<string | null>(null)
 
   const search = useAsyncAction<[FhirResourceType, Record<string, string>], FhirBundle>(
-    (signal, res, params) => api.fhirSearch(res, params, token, signal),
+    (signal, res, params) => api.fhirSearch(res, params, null, signal),
   )
   const read = useAsyncAction<[FhirResourceType, string], FhirResource>((signal, res, id) =>
-    api.fhirRead(res, id, token, signal),
+    api.fhirRead(res, id, null, signal),
   )
 
   const active = mode === 'search' ? search : read

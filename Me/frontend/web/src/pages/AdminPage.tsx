@@ -3,12 +3,10 @@ import React, { useState } from 'react'
 import { api } from '../api/client'
 import type { CacheInvalidationResponse, FhirResourceType } from '../api/types'
 import { FHIR_RESOURCES } from '../api/types'
-import { useAuth } from '../auth/AuthContext'
 import { useAsyncAction } from '../hooks/useAsync'
 import { Alert, Card, Field, Spinner } from '../ui/components'
 
 export const AdminPage: React.FC = () => {
-  const { token } = useAuth()
   const [resource, setResource] = useState<FhirResourceType>('Patient')
   const [patient, setPatient] = useState('')
   const [confirming, setConfirming] = useState(false)
@@ -16,7 +14,7 @@ export const AdminPage: React.FC = () => {
   const invalidate = useAsyncAction<
     [FhirResourceType, string | null],
     CacheInvalidationResponse
-  >((signal, res, pid) => api.invalidateCache(res, pid, token, signal))
+  >((signal, res, pid) => api.invalidateCache(res, pid, null, signal))
 
   const scope = patient.trim()
     ? `${resource} entries for patient ${patient.trim()}`

@@ -224,6 +224,44 @@ def session(request: Request) -> dict[str, Any]:
     }
 
 
+class EstablishSessionReq(BaseModel):
+    """One-shot handoff from an OIDC fragment / external token mint."""
+
+    access_token: str = Field(..., min_length=20, max_length=8192)
+
+
+@app.post("/session/establish", tags=["auth"])
+def establish_session(
+    req: EstablishSessionReq, response: Response
+) -> dict[str, Any]:
+    """Verify ``access_token`` and set the httpOnly session cookie.
+
+    Used by the SPA after an OIDC redirect that delivered the token in the
+    URL fragment. The browser then discards the fragment; only the cookie
+    remains. Returns claims (never echoes the raw token back for storage).
+    """
+    try:
+        payload = verify_access_token(req.access_token.strip())
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+
+    exp = int(payload.get("exp") or 0)
+    now = int(__import__("time").time())
+    max_age = max(1, exp - now) if exp else settings.access_token_ttl_minutes * 60
+    _set_session_cookie(response, req.access_token.strip(), max_age=max_age)
+    issue_csrf_cookie(response, secure=_cookie_secure())
+    return {
+        "sub": payload.get("sub"),
+        "roles": payload.get("roles") or [],
+        "exp": payload.get("exp"),
+        "jti": payload.get("jti"),
+    }
+
+
 # --------------------------------------------------------------------------
 # OIDC SSO
 # --------------------------------------------------------------------------

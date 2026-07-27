@@ -14,8 +14,15 @@ import { Alert, Card } from './components'
 
 /** Redirects unauthenticated users to the login page, preserving intent. */
 const RequireAuth: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { isAuthenticated } = useAuth()
+  const { isAuthenticated, isBootstrapping } = useAuth()
   const location = useLocation()
+  if (isBootstrapping) {
+    return (
+      <main className="login-page">
+        <p className="muted">Checking session…</p>
+      </main>
+    )
+  }
   if (!isAuthenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />
   }
@@ -57,6 +64,7 @@ const OidcCallback: React.FC = () => {
   const [error, setError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
+    let cancelled = false
     const fromHash = new URLSearchParams(location.hash.replace(/^#/, ''))
     const fromQuery = new URLSearchParams(location.search)
     const token = fromHash.get('access_token') ?? fromQuery.get('access_token')
@@ -65,12 +73,19 @@ const OidcCallback: React.FC = () => {
       setError('No access token was returned by the identity provider.')
       return
     }
-    if (!adoptToken(token)) {
-      setError('The identity provider returned an invalid or expired token.')
-      return
+    void (async () => {
+      const ok = await adoptToken(token)
+      if (cancelled) return
+      if (!ok) {
+        setError('The identity provider returned an invalid or expired token.')
+        return
+      }
+      // Strip the token from the address bar — cookie is the only credential.
+      navigate('/', { replace: true })
+    })()
+    return () => {
+      cancelled = true
     }
-    // Strip the token from the address bar.
-    navigate('/', { replace: true })
   }, [location, adoptToken, navigate])
 
   return (

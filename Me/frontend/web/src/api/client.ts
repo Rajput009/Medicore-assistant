@@ -163,8 +163,8 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
-      // Send the httpOnly session cookie set by /auth/login. Harmless when
-      // the SPA still holds a bearer token in memory for Authorization.
+      // Cookie-only auth: always include credentials so the httpOnly session
+      // cookie is sent. Bearer is optional for non-browser clients/tests.
       credentials: 'include',
     })
   } catch (err) {
@@ -188,8 +188,11 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
   }
 }
 
+export type SessionClaims = { sub: string; roles: string[]; exp?: number; jti?: string }
+
 // ---------------------------------------------------------------------------
-// Endpoints
+// Endpoints — cookie session is the default; `token` args are optional leftovers
+// for non-browser callers and are not used by the SPA.
 // ---------------------------------------------------------------------------
 
 export const api = {
@@ -205,18 +208,27 @@ export const api = {
     })
   },
 
-  /** Revoke the current token server-side and clear the httpOnly cookie. */
-  logout(token?: string | null, signal?: AbortSignal): Promise<{ status: string }> {
+  /** Revoke the current session (cookie) server-side and clear cookies. */
+  logout(signal?: AbortSignal): Promise<{ status: string }> {
     return request<{ status: string }>(`${BASE.auth}/logout`, {
       method: 'POST',
-      token,
       signal,
     })
   },
 
-  /** Claims for the current cookie/bearer session (no raw token returned). */
-  session(signal?: AbortSignal): Promise<{ sub: string; roles: string[]; exp?: number }> {
-    return request<{ sub: string; roles: string[]; exp?: number }>(`${BASE.auth}/session`, {
+  /** Claims for the current cookie session (no raw token returned). */
+  session(signal?: AbortSignal): Promise<SessionClaims> {
+    return request<SessionClaims>(`${BASE.auth}/session`, { signal })
+  },
+
+  /**
+   * One-shot OIDC handoff: exchange a bearer token for an httpOnly session
+   * cookie. The SPA never keeps the raw JWT after this call.
+   */
+  establishSession(accessToken: string, signal?: AbortSignal): Promise<SessionClaims> {
+    return request<SessionClaims>(`${BASE.auth}/session/establish`, {
+      method: 'POST',
+      body: { access_token: accessToken },
       signal,
     })
   },
@@ -228,11 +240,10 @@ export const api = {
   fhirSearch(
     resource: FhirResourceType,
     params: Record<string, string>,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<FhirBundle> {
     return request<FhirBundle>(`${BASE.gateway}/fhir/${FHIR_ROUTE[resource]}/search`, {
-      token,
       params,
       signal,
     })
@@ -241,32 +252,30 @@ export const api = {
   fhirRead(
     resource: FhirResourceType,
     id: string,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<FhirResource> {
     return request<FhirResource>(
       `${BASE.gateway}/fhir/${FHIR_ROUTE[resource]}/${encodeURIComponent(id)}`,
-      { token, signal },
+      { signal },
     )
   },
 
   invalidateCache(
     resource: FhirResourceType,
     patient: string | null,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<CacheInvalidationResponse> {
     return request<CacheInvalidationResponse>(`${BASE.gateway}/cache/${resource}`, {
       method: 'DELETE',
-      token,
       params: patient ? { patient } : {},
       signal,
     })
   },
 
-  listBeds(ward: string | null, token: string | null, signal?: AbortSignal): Promise<Bed[]> {
+  listBeds(ward: string | null, _token?: string | null, signal?: AbortSignal): Promise<Bed[]> {
     return request<Bed[]>(`${BASE.patientFlow}/beds`, {
-      token,
       params: ward ? { ward } : {},
       signal,
     })
@@ -280,12 +289,11 @@ export const api = {
   setBedOccupancy(
     id: string,
     update: BedUpdate,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<Bed> {
     return request<Bed>(`${BASE.patientFlow}/beds/${encodeURIComponent(id)}`, {
       method: 'PATCH',
-      token,
       body: update,
       signal,
     })
@@ -294,11 +302,10 @@ export const api = {
   listQueue(
     limit: number,
     dept: string | null,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<QueueListResponse> {
     return request<QueueListResponse>(`${BASE.patientFlow}/queue`, {
-      token,
       params: { limit, ...(dept ? { dept } : {}) },
       signal,
     })
@@ -306,12 +313,11 @@ export const api = {
 
   enqueue(
     item: QueueItem,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<{ ok: boolean; id: string }> {
     return request<{ ok: boolean; id: string }>(`${BASE.patientFlow}/queue`, {
       method: 'POST',
-      token,
       body: item,
       signal,
     })
@@ -319,12 +325,11 @@ export const api = {
 
   risk(
     payload: RiskRequest,
-    token: string | null,
+    _token?: string | null,
     signal?: AbortSignal,
   ): Promise<RiskResponse> {
     return request<RiskResponse>(`${BASE.cds}/risk`, {
       method: 'POST',
-      token,
       body: payload,
       signal,
     })

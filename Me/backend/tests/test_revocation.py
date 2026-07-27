@@ -166,3 +166,39 @@ class TestGatewayAcceptsCookie:
         revoke_payload(verify_access_token(token))
         gateway.cookies.set(settings.auth_cookie_name, token)
         assert gateway.get("/fhir/patient/abc").status_code == 401
+
+
+class TestEstablishSession:
+    @pytest.fixture()
+    def client(self):
+        import backend.services.auth.main as auth
+
+        with TestClient(auth.app, raise_server_exceptions=False) as c:
+            yield c
+
+    @staticmethod
+    def _ip(n: int) -> dict[str, str]:
+        return {"X-Forwarded-For": f"203.0.113.{n}"}
+
+    def test_establish_session_sets_cookie(self, client):
+        headers = self._ip(20)
+        token = create_access_token("oidc.user", roles=["clinician"])
+        r = client.post(
+            "/session/establish",
+            json={"access_token": token},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        assert r.json()["sub"] == "oidc.user"
+        assert "access_token" not in r.json()
+        s = client.get("/session", headers=headers)
+        assert s.status_code == 200
+        assert s.json()["sub"] == "oidc.user"
+
+    def test_establish_rejects_garbage(self, client):
+        r = client.post(
+            "/session/establish",
+            json={"access_token": "not-a-valid-jwt-token-value-xx"},
+            headers=self._ip(21),
+        )
+        assert r.status_code == 401

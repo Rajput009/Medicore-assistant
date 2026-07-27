@@ -151,7 +151,8 @@ describe('OIDC callback', () => {
     const token = makeToken({ sub: 'sso.user' })
     renderApp(`/oidc/callback#access_token=${token}`)
     expect(await screen.findByRole('heading', { name: /system overview/i })).toBeInTheDocument()
-    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBe(token)
+    // Cookie-only: raw JWT must never land in web storage.
+    expect(window.sessionStorage.getItem(SESSION_STORAGE_KEY)).toBeNull()
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 

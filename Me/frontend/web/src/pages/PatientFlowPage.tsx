@@ -2,7 +2,6 @@ import React, { useState } from 'react'
 
 import { api } from '../api/client'
 import type { Bed, QueueListResponse } from '../api/types'
-import { useAuth } from '../auth/AuthContext'
 import { useAsyncAction, useAsyncData } from '../hooks/useAsync'
 import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
 
@@ -14,9 +13,8 @@ export function acuityTone(acuity: number): 'err' | 'warn' | 'neutral' {
 }
 
 const BedsCard: React.FC = () => {
-  const { token } = useAuth()
-  const { state, reload } = useAsyncData<Bed[]>((signal) => api.listBeds(null, token, signal), [
-    token,
+  const { state, reload } = useAsyncData<Bed[]>((signal) => api.listBeds(null, null, signal), [
+    null,
   ])
   const toggle = useAsyncAction<[Bed, string | null], Bed>((signal, bed, patientId) =>
     api.setBedOccupancy(
@@ -28,7 +26,7 @@ const BedsCard: React.FC = () => {
         // first instead of silently overwriting their assignment.
         expected_occupied: bed.occupied,
       },
-      token,
+      null,
       signal,
     ),
   )
@@ -113,11 +111,10 @@ const BedsCard: React.FC = () => {
 }
 
 const QueueCard: React.FC = () => {
-  const { token } = useAuth()
   const [dept, setDept] = useState('')
   const [limit, setLimit] = useState(10)
   const list = useAsyncAction<[number, string | null], QueueListResponse>((signal, l, d) =>
-    api.listQueue(l, d, token, signal),
+    api.listQueue(l, d, null, signal),
   )
 
   // Load once on mount, then on demand.
@@ -216,14 +213,13 @@ const QueueCard: React.FC = () => {
 }
 
 const EnqueueCard: React.FC = () => {
-  const { token } = useAuth()
   const [patientId, setPatientId] = useState('')
   const [acuity, setAcuity] = useState(3)
   const [dept, setDept] = useState('')
   const [errors, setErrors] = useState<Record<string, string>>({})
   const enqueue = useAsyncAction<[string, number, string], { ok: boolean; id: string }>(
     (signal, pid, ac, d) =>
-      api.enqueue({ patient_id: pid, acuity: ac, dept: d }, token, signal),
+      api.enqueue({ patient_id: pid, acuity: ac, dept: d }, null, signal),
   )
 
   const onSubmit = async (e: React.FormEvent) => {

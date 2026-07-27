@@ -13,57 +13,89 @@ import {
   decodeToken,
   isExpired,
   millisUntilExpiry,
-  SESSION_STORAGE_KEY,
-  STORAGE_KEY,
-  tokenStorage,
+  purgeLegacyTokenStorage,
+  sessionUserFromClaims,
 } from './token'
 
 type AuthContextValue = {
+  /** Always null in cookie-only mode — kept for type compatibility. */
   token: string | null
   user: AuthUser | null
   isAuthenticated: boolean
+  /** True until the first /session probe finishes (avoids login flash). */
+  isBootstrapping: boolean
   loginError: string | null
   isLoggingIn: boolean
   login: (username: string, password: string) => Promise<boolean>
   logout: () => void
-  /** Adopt a token minted elsewhere (e.g. the OIDC callback). */
-  adoptToken: (token: string) => boolean
+  /**
+   * One-shot OIDC handoff: POSTs the IdP token to /auth/session/establish so
+   * the httpOnly cookie is set server-side. The raw JWT is never stored in JS.
+   */
+  adoptToken: (token: string) => Promise<boolean>
   hasRole: (...roles: Role[]) => boolean
+  /** Re-fetch claims from the cookie session (e.g. after tab focus). */
+  refreshSession: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
-/** Reads a persisted token, discarding it when malformed or already expired. */
-function loadInitialToken(): string | null {
-  const stored = tokenStorage.read()
-  if (!stored) return null
-  const decoded = decodeToken(stored)
-  if (!decoded || isExpired(decoded)) {
-    tokenStorage.clear()
-    return null
-  }
-  return stored
-}
-
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, setToken] = useState<string | null>(loadInitialToken)
-  const [userOverride, setUserOverride] = useState<AuthUser | null>(null)
+  const [user, setUser] = useState<AuthUser | null>(null)
   const [loginError, setLoginError] = useState<string | null>(null)
   const [isLoggingIn, setIsLoggingIn] = useState(false)
+  const [isBootstrapping, setIsBootstrapping] = useState(true)
 
-  const user = useMemo(() => userOverride ?? decodeToken(token), [token, userOverride])
+  // Drop any JWT an older build left in web storage.
+  useEffect(() => {
+    purgeLegacyTokenStorage()
+  }, [])
+
+  const applySession = useCallback((s: { sub: string; roles?: string[]; exp?: number }) => {
+    const next = sessionUserFromClaims(s)
+    if (!next || isExpired(next)) {
+      setUser(null)
+      return false
+    }
+    setUser(next)
+    return true
+  }, [])
+
+  const refreshSession = useCallback(async () => {
+    try {
+      const s = await api.session()
+      if (!applySession(s)) setUser(null)
+    } catch {
+      setUser(null)
+    }
+  }, [applySession])
+
+  // Boot: hydrate from httpOnly cookie via /session.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const s = await api.session()
+        if (!cancelled) applySession(s)
+      } catch {
+        if (!cancelled) setUser(null)
+      } finally {
+        if (!cancelled) setIsBootstrapping(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [applySession])
 
   const logout = useCallback(() => {
-    // Best-effort server revoke; never block the UI on network failure.
-    void api.logout(token).catch(() => undefined)
-    tokenStorage.clear()
-    setToken(null)
-    setUserOverride(null)
+    void api.logout().catch(() => undefined)
+    purgeLegacyTokenStorage()
+    setUser(null)
     setLoginError(null)
-  }, [token])
+  }, [])
 
-  // Expire the session in-place so the UI can't keep showing privileged nav
-  // for a token the gateway will reject.
+  // Expire the UI session when the cookie JWT would expire.
   useEffect(() => {
     if (!user) return
     const ms = millisUntilExpiry(user)
@@ -72,87 +104,87 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       logout()
       return
     }
-    // setTimeout saturates above ~24.8 days; clamp to stay well inside range.
     const delay = Math.min(ms, 2_147_483_000)
     const timer = window.setTimeout(logout, delay)
     return () => window.clearTimeout(timer)
   }, [user, logout])
 
-  // Cookie-only sessions (no JS-visible token): hydrate claims from /session
-  // once, after mount. Gated so a failed probe does not loop, and so tests
-  // that start anonymous are not flipped mid-assertion by a late response.
-  const [sessionProbed, setSessionProbed] = useState(false)
-  useEffect(() => {
-    if (token || userOverride || sessionProbed) return
-    let cancelled = false
-    void api
-      .session()
-      .then((s) => {
-        if (cancelled || !s?.sub) return
-        setUserOverride({
-          sub: s.sub,
-          roles: (s.roles ?? []).filter(
-            (r): r is Role => r === 'admin' || r === 'clinician' || r === 'viewer',
-          ),
-          exp: typeof s.exp === 'number' ? s.exp : undefined,
-        })
-      })
-      .catch(() => {
-        /* anonymous is fine */
-      })
-      .finally(() => {
-        if (!cancelled) setSessionProbed(true)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [token, userOverride, sessionProbed])
-
-  // Cross-tab sync via sessionStorage (and legacy localStorage key).
+  // Multi-tab: storage events only clear legacy keys; BroadcastChannel for logout.
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
-      if (
-        e.key !== null &&
-        e.key !== STORAGE_KEY &&
-        e.key !== SESSION_STORAGE_KEY
-      ) {
-        return
+      if (e.key === 'medicore.token' || e.key === 'medicore.session.token') {
+        purgeLegacyTokenStorage()
       }
-      // Another tab cleared storage — drop our in-memory copy too so
-      // loadInitialToken does not resurrect a just-revoked session.
-      if (e.newValue === null || e.newValue === '') {
-        tokenStorage.clear()
-      }
-      const next = loadInitialToken()
-      setToken((prev) => (prev === next ? prev : next))
-      if (!next) setUserOverride(null)
     }
     window.addEventListener('storage', onStorage)
-    return () => window.removeEventListener('storage', onStorage)
+
+    let bc: BroadcastChannel | null = null
+    try {
+      bc = new BroadcastChannel('medicore-auth')
+      bc.onmessage = (ev) => {
+        if (ev.data === 'logout') {
+          setUser(null)
+          purgeLegacyTokenStorage()
+        }
+        if (ev.data === 'login') {
+          void refreshSession()
+        }
+      }
+    } catch {
+      /* BroadcastChannel unavailable */
+    }
+
+    return () => {
+      window.removeEventListener('storage', onStorage)
+      bc?.close()
+    }
+  }, [refreshSession])
+
+  const broadcast = useCallback((msg: string) => {
+    try {
+      const bc = new BroadcastChannel('medicore-auth')
+      bc.postMessage(msg)
+      bc.close()
+    } catch {
+      /* ignore */
+    }
   }, [])
 
-  const adoptToken = useCallback((raw: string): boolean => {
-    const decoded = decodeToken(raw)
-    if (!decoded || isExpired(decoded)) return false
-    tokenStorage.write(raw)
-    setToken(raw)
-    setUserOverride(null)
-    setLoginError(null)
-    return true
-  }, [])
+  const adoptToken = useCallback(
+    async (raw: string): Promise<boolean> => {
+      const decoded = decodeToken(raw)
+      if (!decoded || isExpired(decoded)) return false
+      try {
+        const s = await api.establishSession(raw)
+        if (!applySession(s)) return false
+        purgeLegacyTokenStorage()
+        setLoginError(null)
+        broadcast('login')
+        return true
+      } catch {
+        return false
+      }
+    },
+    [applySession, broadcast],
+  )
 
   const login = useCallback(
     async (username: string, password: string): Promise<boolean> => {
       setIsLoggingIn(true)
       setLoginError(null)
       try {
-        const res = await api.login(username, password)
-        if (!res?.access_token || !adoptToken(res.access_token)) {
-          setLoginError('Server returned an unusable token.')
+        // Server sets httpOnly cookie; body token is ignored and never stored.
+        await api.login(username, password)
+        const s = await api.session()
+        if (!applySession(s)) {
+          setLoginError('Server did not establish a session cookie.')
           return false
         }
+        purgeLegacyTokenStorage()
+        broadcast('login')
         return true
       } catch (err) {
+        setUser(null)
         if (err instanceof ApiError) {
           setLoginError(
             err.status === 401
@@ -169,8 +201,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsLoggingIn(false)
       }
     },
-    [adoptToken],
+    [applySession, broadcast],
   )
+
+  const logoutAndBroadcast = useCallback(() => {
+    logout()
+    broadcast('logout')
+  }, [logout, broadcast])
 
   const hasRole = useCallback(
     (...roles: Role[]) => {
@@ -183,17 +220,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const value = useMemo<AuthContextValue>(
     () => ({
-      token,
+      token: null,
       user,
       isAuthenticated: Boolean(user),
+      isBootstrapping,
       loginError,
       isLoggingIn,
       login,
-      logout,
+      logout: logoutAndBroadcast,
       adoptToken,
       hasRole,
+      refreshSession,
     }),
-    [token, user, loginError, isLoggingIn, login, logout, adoptToken, hasRole],
+    [
+      user,
+      isBootstrapping,
+      loginError,
+      isLoggingIn,
+      login,
+      logoutAndBroadcast,
+      adoptToken,
+      hasRole,
+      refreshSession,
+    ],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
