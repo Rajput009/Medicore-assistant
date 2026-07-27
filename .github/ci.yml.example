@@ -24,10 +24,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pytest \
+          pip install ruff pytest pytest-asyncio \
             fastapi "uvicorn[standard]" "pydantic>=2" pydantic-settings \
-            "python-jose[cryptography]" httpx asyncpg pymongo authlib \
-            itsdangerous python-multipart
+            "python-jose[cryptography]" httpx asyncpg pymongo motor authlib \
+            itsdangerous python-multipart \
+            pgserver mongomock-motor
 
       - name: Lint
         run: ruff check backend
@@ -36,6 +37,7 @@ jobs:
         env:
           ENV: test
           OTEL_ENABLED: "false"
+          JWT_SECRET: "test-secret-at-least-32-chars-long!!"
         run: pytest backend/tests -q
 
   frontend:

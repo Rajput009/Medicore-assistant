@@ -41,6 +41,10 @@ black = "^24.4.0"
 ruff = "^0.5.0"
 mypy = "^1.10.0"
 types-requests = "^2.32.0.20240602"
+# Real PostgreSQL binary (no Docker) for cache integration tests.
+pgserver = "^0.1.4"
+# In-process MongoDB wire-semantics engine used by repository tests.
+mongomock-motor = "^0.0.34"
 
 [build-system]
 requires = ["poetry-core"]
