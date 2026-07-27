@@ -48,7 +48,7 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression + e2e | `backend/tests/test_*.py` | 379 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 387 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
 
@@ -62,13 +62,17 @@ Backend DB / residual coverage notes:
   `(patient_id) where status=waiting`, including re-queue after complete.
   **Not proven:** replica-set behaviour, retryable writes, multi-document
   transactions (real `mongod` download is TLS-blocked in this environment).
-- **Redis paths:** `tests/test_residual_verification.py` drives revocation and
-  rate-limit through `fakeredis` (same INCR/SETEX/EXISTS commands production
-  uses) and proves the in-process fallback when Redis errors.
-- **NetworkPolicy / Ingress:** residual suite parses the k8s YAML and asserts
-  default-deny ingress+egress, per-workload egress allow-lists, TLS ingress,
-  path routing for `/api` `/auth` `/flow` `/cds`, and that **no mesh mTLS
-  resources are claimed**.
+- **Redis multi-replica:** `tests/test_multi_replica_redis.py` uses one
+  `fakeredis.FakeServer` with two independent clients (two pods, one broker).
+  Proves a shared rate-limit budget and cross-pod revocation visibility, and
+  that the in-process fallback is **not** shared (control).
+- **NetworkPolicy / Ingress / mesh / FQDN:** residual suite asserts default-deny
+  ingress+egress, TLS ingress, path routing, **STRICT** Istio
+  `PeerAuthentication` + ServiceAccount identities (`istio-mtls.yaml`), and
+  Cilium `toFQDNs` allow-lists with no bare `*` (`cilium-egress.yaml`).
+- **Mongo client shape:** ConfigMap URI requires `replicaSet` + `retryWrites`;
+  driver enables `retryWrites=True`. Multi-doc transactions remain unproven on
+  the mock (explicitly asserted).
 
 Suites `importorskip` cleanly when optional engines are missing.
 

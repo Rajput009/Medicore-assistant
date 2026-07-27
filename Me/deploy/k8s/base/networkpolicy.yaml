@@ -82,8 +82,10 @@ spec:
             matchLabels: { app: redis }
       ports:
         - { protocol: TCP, port: 6379 }
-    # Upstream TLS (FHIR, IdP, OTLP). Tighten further with FQDN policies
-    # when the CNI supports them (Cilium/Calico).
+    # Upstream TLS fallback for clusters WITHOUT a FQDN-aware CNI.
+    # Prefer cilium-egress.yaml (toFQDNs) which replaces this open allow with
+    # an explicit IdP/FHIR/OTLP host list. Keep this only as a last resort and
+    # never on clusters that have Cilium installed.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

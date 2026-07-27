@@ -1,0 +1,113 @@
+# ---------------------------------------------------------------------------
+# Service-mesh mTLS (Istio).
+#
+# These manifests are inert until an Istio control plane is installed and the
+# medicore namespace is labelled `istio-injection=enabled` (or the pods carry
+# the sidecar annotation). They encode the intended policy so a cluster that
+# adopts Istio gets STRICT peer authentication and least-privilege
+# AuthorizationPolicies without further design work.
+#
+# Residual without a mesh: NetworkPolicy (L3/L4) still default-denies
+# east-west traffic. mTLS adds cryptographic pod identity on top of that.
+# ---------------------------------------------------------------------------
+
+# Namespace label is applied by operators (`kubectl label ns medicore
+# istio-injection=enabled`). Documented rather than forced here so clusters
+# without Istio keep working.
+
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: medicore
+spec:
+  # STRICT: plaintext between pods is rejected. Probes from the kubelet use
+  # the pod IP on the rewritten port and remain permitted by Istio.
+  mtls:
+    mode: STRICT
+---
+# Gateway may be reached from the ingress gateway only (plus same-namespace
+# health scrapers if you add them). Browser traffic terminates at ingress.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: gateway-inbound
+  namespace: medicore
+spec:
+  selector:
+    matchLabels: { app: gateway }
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["ingress-nginx", "istio-system"]
+      to:
+        - operation:
+            ports: ["8080"]
+---
+# Internal services: only the gateway workload identity may call them.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: internal-from-gateway
+  namespace: medicore
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [auth, patient-flow, cds]
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/medicore/sa/gateway"
+            # Fall back to namespace source when ambient mode / no SA principals.
+            namespaces: ["medicore"]
+      to:
+        - operation:
+            ports: ["8081", "8082", "8083"]
+    # Allow the workload to talk to itself (readiness) — source is empty for
+    # same-pod rewrites; Istio still permits health checks under STRICT.
+---
+# Data-plane destinations the workloads may dial. Without this, STRICT mTLS
+# still allows any authenticated identity to open a connection; Authorization
+# policies close that. Egress FQDNs are handled by CiliumNetworkPolicy when
+# present (see cilium-egress.yaml); DestinationRules pin TLS origination.
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: medicore-internal-mtls
+  namespace: medicore
+spec:
+  host: "*.medicore.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+---
+# ServiceAccounts used as SPIFFE identities in AuthorizationPolicy principals.
+# Deployments should set serviceAccountName to these (see patches below).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  namespace: medicore
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auth
+  namespace: medicore
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: patient-flow
+  namespace: medicore
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cds
+  namespace: medicore

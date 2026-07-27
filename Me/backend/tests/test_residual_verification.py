@@ -310,22 +310,55 @@ class TestNetworkPolicyStructure:
             ]
             assert (53, "UDP") in ports or (53, "TCP") in ports, f"{name} missing DNS"
 
-    def test_no_mesh_mtls_resources_are_claimed(self):
-        """Honest residual: we do not ship PeerAuthentication / DestinationRule.
+    def test_mesh_mtls_manifests_are_present_and_strict(self):
+        """Istio PeerAuthentication ships in STRICT mode with SA identities.
 
-        If someone adds Istio/Linkerd manifests later this test should be
-        updated deliberately, not accidentally.
+        Inert without an Istio control plane; the residual is "mesh not
+        running", not "policy not designed".
         """
-        texts = " ".join(p.read_text() for p in K8S.glob("*.yaml"))
-        for marker in (
-            "PeerAuthentication",
-            "DestinationRule",
-            "AuthorizationPolicy",
-            "kind: Mesh",
-            "linkerd.io",
-            "spiffe://",
+        path = K8S / "istio-mtls.yaml"
+        assert path.exists(), "istio-mtls.yaml missing"
+        docs = [d for d in yaml.safe_load_all(path.read_text()) if d]
+        kinds = {d.get("kind") for d in docs}
+        assert "PeerAuthentication" in kinds
+        assert "AuthorizationPolicy" in kinds
+        assert "DestinationRule" in kinds
+        assert "ServiceAccount" in kinds
+        peer = next(d for d in docs if d.get("kind") == "PeerAuthentication")
+        assert peer["spec"]["mtls"]["mode"] == "STRICT"
+        # Deployments must reference the SAs so SPIFFE principals resolve.
+        for deploy_name, sa in (
+            ("gateway.yaml", "gateway"),
+            ("auth.yaml", "auth"),
+            ("patient-flow.yaml", "patient-flow"),
+            ("cds.yaml", "cds"),
         ):
-            assert marker not in texts, f"unexpected mesh marker {marker!r}"
+            text = (K8S / deploy_name).read_text()
+            assert f"serviceAccountName: {sa}" in text, deploy_name
+
+    def test_fqdn_egress_config_forbids_wildcard_star(self):
+        """Cilium FQDN allow-list must never re-open 0.0.0.0/0 via '*'."""
+        path = K8S / "cilium-egress.yaml"
+        assert path.exists(), "cilium-egress.yaml missing"
+        docs = [d for d in yaml.safe_load_all(path.read_text()) if d]
+        cm = next(
+            d
+            for d in docs
+            if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == "medicore-egress-fqdns"
+        )
+        for key in ("fhir_hosts", "idp_hosts", "otlp_hosts"):
+            value = cm["data"][key].strip()
+            assert value, f"{key} must not be empty"
+            assert value != "*", f"{key} must not be a bare wildcard"
+            for part in value.split(","):
+                part = part.strip()
+                assert part and part != "*", f"{key} contains bare *"
+        # Cilium policies must use toFQDNs somewhere.
+        cilium = [d for d in docs if d.get("kind") == "CiliumNetworkPolicy"]
+        assert cilium, "expected CiliumNetworkPolicy objects"
+        blob = yaml.dump(cilium)
+        assert "toFQDNs" in blob
+        assert "0.0.0.0/0" not in blob, "Cilium policy must not re-open the world"
 
 
 # ---------------------------------------------------------------------------
@@ -361,3 +394,60 @@ class TestIngressPathRouting:
         docs = list(yaml.safe_load_all((K8S / "ingress.yaml").read_text()))
         tls = docs[0]["spec"].get("tls") or []
         assert tls, "Ingress must terminate TLS — PHI must not ride plaintext HTTP"
+
+
+# ---------------------------------------------------------------------------
+# 6. Mongo client configuration pins replica-set + retryable writes
+# ---------------------------------------------------------------------------
+
+
+class TestMongoClientProductionShape:
+    def test_create_client_enables_retryable_writes(self):
+        from backend.services.patient_flow.repository import create_client
+        from backend.common import config
+        import inspect
+
+        # Source-level pin: retryWrites=True must stay on the constructor.
+        src = inspect.getsource(create_client)
+        assert "retryWrites=True" in src
+        assert "serverSelectionTimeoutMS" in src
+
+    def test_configmap_mongo_uri_requests_replica_set(self):
+        docs = list(yaml.safe_load_all((K8S / "config.yaml").read_text()))
+        cm = next(d for d in docs if d and d.get("kind") == "ConfigMap")
+        uri = cm["data"]["MONGO_URI"]
+        low = uri.lower()
+        assert "replicaset=" in low
+        assert "retrywrites=true" in low
+
+    def test_mongomock_does_not_support_multi_doc_transactions(self):
+        """Honest residual: mongomock cannot prove transaction atomicity.
+
+        This test locks the current limitation so a future real-mongod suite
+        is clearly additive rather than a silent replacement.
+        """
+        pytest.importorskip("mongomock_motor")
+        from mongomock_motor import AsyncMongoMockClient
+        import asyncio
+
+        async def attempt():
+            client = AsyncMongoMockClient()
+            # mongomock_motor may not expose start_session; either way a
+            # multi-doc txn is not meaningful on the mock.
+            start = getattr(client, "start_session", None)
+            if start is None:
+                return "no-start_session"
+            try:
+                async with client.start_session() as session:
+                    async with session.start_transaction():
+                        await client["t"]["a"].insert_one({"x": 1}, session=session)
+                        await client["t"]["b"].insert_one({"x": 2}, session=session)
+                return "txn-ok"
+            except Exception as exc:
+                return f"txn-unsupported:{type(exc).__name__}"
+
+        result = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(attempt())
+        assert result != "txn-ok", (
+            "mongomock unexpectedly ran a multi-doc transaction; "
+            "update residual docs — real mongod coverage may now be redundant"
+        )

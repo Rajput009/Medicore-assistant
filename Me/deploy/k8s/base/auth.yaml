@@ -27,6 +27,9 @@ spec:
           whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels: { app: auth }
+      serviceAccountName: auth
+      # automount only what the mesh needs; SA is the SPIFFE identity.
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

@@ -8,7 +8,9 @@ data:
   POSTGRES_HOST: "postgres"
   POSTGRES_PORT: "5432"
   POSTGRES_DB: "medicore"
-  MONGO_URI: "mongodb://mongo:27017"
+  # replicaSet + retryWrites required for multi-document transactions and
+  # retryable writes. Single-node RS is fine; match the compose topology.
+  MONGO_URI: "mongodb://mongo:27017/?replicaSet=rs0&retryWrites=true&w=majority"
   MONGO_DB: "medicore"
   KAFKA_BROKERS: "kafka:9092"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"

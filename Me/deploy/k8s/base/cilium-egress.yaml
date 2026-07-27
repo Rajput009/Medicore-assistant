@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------------------
+# FQDN-aware egress (Cilium).
+#
+# The generic NetworkPolicy in networkpolicy.yaml allows HTTPS to the public
+# internet (0.0.0.0/0:443 minus RFC1918) because vanilla NetworkPolicy cannot
+# match on DNS names. That is wider than necessary.
+#
+# When Cilium is the cluster CNI these CiliumNetworkPolicy objects *replace*
+# the open HTTPS allow with an explicit FQDN allow-list. Hosts are supplied
+# via the medicore-config ConfigMap so each environment lists only the IdP,
+# FHIR base and OTLP collector it actually uses.
+#
+# Clusters without Cilium ignore this file (unknown CRD) if excluded from
+# kustomization; it is listed so Cilium clusters pick it up automatically.
+# ---------------------------------------------------------------------------
+
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gateway-egress-fqdn
+  namespace: medicore
+spec:
+  endpointSelector:
+    matchLabels: { app: gateway }
+  egress:
+    # DNS to CoreDNS / kube-dns (required before any FQDN rule can resolve).
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - { port: "53", protocol: ANY }
+          rules:
+            dns:
+              - matchPattern: "*"
+    # In-cluster dependencies by label (no FQDN needed).
+    - toEndpoints:
+        - matchLabels: { app: auth }
+      toPorts:
+        - ports: [{ port: "8081", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: patient-flow }
+      toPorts:
+        - ports: [{ port: "8082", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: cds }
+      toPorts:
+        - ports: [{ port: "8083", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: postgres }
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels: { app: redis }
+      toPorts:
+        - ports: [{ port: "6379", protocol: TCP }]
+    # Upstream HTTPS — FQDN allow-list. Edit to match your IdP / EHR / OTLP.
+    # Patterns accept a single subdomain level via *.
+    - toFQDNs:
+        # Example FHIR hosts — replace with the hospital EHR vendor.
+        - matchName: fhir.epic.com
+        - matchPattern: "*.fhir.epic.com"
+        - matchName: fhir.cerner.com
+        - matchPattern: "*.fhir.cerner.com"
+        # Example IdP
+        - matchPattern: "*.okta.com"
+        - matchPattern: "*.auth0.com"
+        - matchPattern: "*.microsoftonline.com"
+        # In-cluster / self-hosted Jaeger or cloud OTLP
+        - matchName: jaeger.medicore.svc.cluster.local
+      toPorts:
+        - ports:
+            - { port: "443", protocol: TCP }
+            - { port: "4318", protocol: TCP }
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: auth-egress-fqdn
+  namespace: medicore
+spec:
+  endpointSelector:
+    matchLabels: { app: auth }
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - { port: "53", protocol: ANY }
+          rules:
+            dns:
+              - matchPattern: "*"
+    - toEndpoints:
+        - matchLabels: { app: redis }
+      toPorts:
+        - ports: [{ port: "6379", protocol: TCP }]
+    - toFQDNs:
+        - matchPattern: "*.okta.com"
+        - matchPattern: "*.auth0.com"
+        - matchPattern: "*.microsoftonline.com"
+        - matchPattern: "*.okta-emea.com"
+      toPorts:
+        - ports:
+            - { port: "443", protocol: TCP }
+---
+# Document the intended ConfigMap keys for operators who need non-default FQDNs.
+# (Cilium cannot read ConfigMap values into toFQDNs directly; edit this file or
+# overlay it per environment.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: medicore-egress-fqdns
+  namespace: medicore
+data:
+  # Comma-separated. Kept as documentation + a single source of truth that
+  # CI asserts is non-empty and contains no bare "*".
+  fhir_hosts: "fhir.epic.com,*.fhir.epic.com,fhir.cerner.com,*.fhir.cerner.com"
+  idp_hosts: "*.okta.com,*.auth0.com,*.microsoftonline.com,*.okta-emea.com"
+  otlp_hosts: "jaeger.medicore.svc.cluster.local"
+  notes: >
+    Overlay these values per environment. The CiliumNetworkPolicy objects
+    above must be kept in sync (or generated) from this list. A bare "*" is
+    forbidden — that would re-open the 0.0.0.0/0:443 hole this file closes.
