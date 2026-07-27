@@ -217,8 +217,14 @@ const QueueCard: React.FC = () => {
 
       {(claim.state.status === 'error' || complete.state.status === 'error') && (
         <div style={{ marginTop: 10 }}>
+          {/* Read each error inside its own narrowed branch: TypeScript cannot
+              infer `complete.state` is the error variant from the || above. */}
           <Alert kind="error">
-            {claim.state.status === 'error' ? claim.state.error : complete.state.error}
+            {claim.state.status === 'error'
+              ? claim.state.error
+              : complete.state.status === 'error'
+                ? complete.state.error
+                : null}
           </Alert>
         </div>
       )}

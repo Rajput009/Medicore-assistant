@@ -109,4 +109,11 @@ export type AuthUser = {
   roles: Role[]
   /** Expiry as epoch seconds, when present in the token. */
   exp?: number
+  /**
+   * Ward / department scope from the IdP. An **empty list means
+   * unrestricted**, matching the server's `Principal.can_access_ward`. The UI
+   * uses these only to filter what it shows; the server enforces access.
+   */
+  wards: string[]
+  departments: string[]
 }

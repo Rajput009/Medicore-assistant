@@ -198,7 +198,15 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
   }
 }
 
-export type SessionClaims = { sub: string; roles: string[]; exp?: number; jti?: string }
+export type SessionClaims = {
+  sub: string
+  roles: string[]
+  exp?: number
+  jti?: string
+  /** Ward/department scope; empty means unrestricted. */
+  wards?: string[]
+  departments?: string[]
+}
 
 // ---------------------------------------------------------------------------
 // Endpoints — cookie session is the default; `token` args are optional leftovers

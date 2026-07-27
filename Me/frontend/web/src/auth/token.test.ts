@@ -101,6 +101,9 @@ describe('sessionUserFromClaims', () => {
       sub: 'a',
       roles: ['admin'],
       exp: undefined,
+      // Absent scope claims normalise to empty = unrestricted.
+      wards: [],
+      departments: [],
     })
   })
 })

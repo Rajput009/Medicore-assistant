@@ -6,6 +6,7 @@ import React, { useMemo, useState } from 'react'
 
 import { api } from '../api/client'
 import type { Bed } from '../api/types'
+import { useAuth } from '../auth/AuthContext'
 import { useAsyncData } from '../hooks/useAsync'
 import { PatientLink } from '../patient/PatientChartDrawer'
 import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
@@ -27,22 +28,39 @@ export function wardSummary(beds: Bed[]): { free: number; total: number } {
   return { free: beds.filter((b) => !b.occupied).length, total: beds.length }
 }
 
+/**
+ * Restrict a bed list to the caller's ward scope.
+ *
+ * An empty scope means unrestricted, mirroring `Principal.can_access_ward`
+ * server-side. This is presentation only — patient-flow filters the same way
+ * before responding, so a scoped user cannot see other wards by editing state.
+ */
+export function scopeBeds(beds: Bed[], wards: string[]): Bed[] {
+  if (!wards.length) return beds
+  const allowed = new Set(wards)
+  return beds.filter((b) => allowed.has(b.ward))
+}
+
 export const WardBoardPage: React.FC = () => {
+  const { user } = useAuth()
   const [filter, setFilter] = useState('')
   const [busyId, setBusyId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionOk, setActionOk] = useState<string | null>(null)
   const { state, reload } = useAsyncData((signal) => api.listBeds(null, null, signal), [])
 
+  const scope = user?.wards ?? []
+
   const groups = useMemo(() => {
-    const beds = state.status === 'success' ? state.data : []
+    const beds = scopeBeds(state.status === 'success' ? state.data : [], scope)
     const all = groupBedsByWard(beds)
     const f = filter.trim().toLowerCase()
     if (!f) return all
     return Object.fromEntries(
       Object.entries(all).filter(([ward]) => ward.toLowerCase().includes(f)),
     )
-  }, [state, filter])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, filter, scope.join(',')])
 
   const wards = Object.keys(groups).sort()
 
@@ -94,6 +112,11 @@ export const WardBoardPage: React.FC = () => {
       <header className="page-header">
         <h1>Ward board</h1>
         <p>Live bed census by ward. Assign, discharge, or open a chart.</p>
+        {scope.length > 0 && (
+          <p className="muted" style={{ marginTop: 4 }}>
+            Scoped to your wards: <strong>{scope.join(', ')}</strong>
+          </p>
+        )}
       </header>
 
       <div className="row" style={{ marginBottom: 14, alignItems: 'flex-end' }}>
