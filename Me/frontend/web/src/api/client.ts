@@ -365,10 +365,15 @@ export const api = {
     patientId: string,
     _token?: string | null,
     signal?: AbortSignal,
+    idempotencyKey?: string,
   ): Promise<{ ok: boolean; item: QueueItem }> {
     return request<{ ok: boolean; item: QueueItem }>(
       `${BASE.patientFlow}/queue/${encodeURIComponent(patientId)}/complete`,
-      { method: 'POST', signal },
+      {
+        method: 'POST',
+        signal,
+        idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
+      },
     )
   },
 
