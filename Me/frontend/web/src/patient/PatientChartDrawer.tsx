@@ -6,7 +6,7 @@
  * between FHIR / flow / CDS pages.
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import { api } from '../api/client'
@@ -14,6 +14,11 @@ import type { Bed, FhirResource, QueueItem, QueueListResponse } from '../api/typ
 import { summariseResource } from '../pages/FhirPage'
 import { Alert, Badge, Spinner } from '../ui/components'
 import { usePatientChart } from './PatientChartContext'
+import {
+  barWidthPercent,
+  extractObservationPoints,
+} from './observationTrends'
+import { rememberPatient } from './recentPatients'
 
 type ChartData = {
   patient: FhirResource | null
@@ -71,11 +76,12 @@ export const PatientChartDrawer: React.FC = () => {
 
         setData({
           patient: patientResult,
-          observations: observations.slice(0, 8),
+          observations: observations.slice(0, 12),
           encounters: encounters.slice(0, 5),
           beds: beds.filter((b) => b.patient_id === patientId),
           queue: queue.items.filter((q) => q.patient_id === patientId),
         })
+        rememberPatient(patientId)
       } catch (err) {
         if (ac.signal.aborted) return
         setError(err instanceof Error ? err.message : 'Failed to load chart')
@@ -98,9 +104,15 @@ export const PatientChartDrawer: React.FC = () => {
     return () => window.removeEventListener('keydown', onKey)
   }, [patientId, closePatient])
 
-  if (!patientId) return null
+  // Hooks must run unconditionally (before any early return).
+  const trendPoints = useMemo(
+    () => extractObservationPoints(data?.observations ?? [], 8),
+    [data?.observations],
+  )
+  const trendValues = trendPoints.map((p) => p.value)
+  const title = patientLabel(data?.patient ?? null, patientId ?? '')
 
-  const title = patientLabel(data?.patient ?? null, patientId)
+  if (!patientId) return null
 
   return (
     <div className="chart-root" role="presentation">
@@ -228,17 +240,37 @@ export const PatientChartDrawer: React.FC = () => {
               </section>
 
               <section className="chart-section">
-                <h3>Recent observations</h3>
-                {data.observations.length === 0 ? (
+                <h3>Observation trends</h3>
+                {trendPoints.length === 0 ? (
                   <p className="muted" style={{ margin: 0 }}>
-                    None returned.
+                    No numeric observations to chart.
                   </p>
                 ) : (
-                  <ul className="chart-list">
-                    {data.observations.map((o, i) => (
-                      <li key={o.id ?? i}>
-                        <span>{summariseResource(o)}</span>
-                        <span className="mono muted"> {o.id}</span>
+                  <ul className="trend-list">
+                    {trendPoints.map((p) => (
+                      <li key={p.id} className="trend-row">
+                        <div className="trend-meta">
+                          <span>{p.label}</span>
+                          <span className="mono">
+                            {p.value}
+                            {p.unit ? ` ${p.unit}` : ''}
+                          </span>
+                        </div>
+                        <div
+                          className="trend-bar-track"
+                          role="img"
+                          aria-label={`${p.label} ${p.value}${p.unit ? ` ${p.unit}` : ''}`}
+                        >
+                          <div
+                            className="trend-bar-fill"
+                            style={{ width: `${Math.max(8, barWidthPercent(p.value, trendValues))}%` }}
+                          />
+                        </div>
+                        {p.effective && (
+                          <div className="muted" style={{ fontSize: '0.75rem' }}>
+                            {p.effective}
+                          </div>
+                        )}
                       </li>
                     ))}
                   </ul>

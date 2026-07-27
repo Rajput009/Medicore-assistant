@@ -1,12 +1,8 @@
 /**
- * Clinician worklist — "my patients" across beds and triage.
- *
- * Pulls beds + queue once and partitions into: assigned to me (claimed),
- * waiting in triage, and occupied beds (ward census). Opens the chart drawer
- * without leaving the page.
+ * Clinician worklist — actionable "my patients" across beds and triage.
  */
 
-import React, { useMemo } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import { api } from '../api/client'
@@ -14,8 +10,9 @@ import type { Bed, QueueItem } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { useAsyncData } from '../hooks/useAsync'
 import { PatientLink } from '../patient/PatientChartDrawer'
+import { loadRecentPatients, type RecentPatient } from '../patient/recentPatients'
 import { acuityTone } from './PatientFlowPage'
-import { Alert, Badge, Card, EmptyState, SkeletonRows } from '../ui/components'
+import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
 
 export function partitionWorklist(
   beds: Bed[],
@@ -27,34 +24,40 @@ export function partitionWorklist(
   occupiedBeds: Bed[]
   freeBeds: number
 } {
-  const claimedByMe = queue.filter(
-    (q) =>
-      (q.status === 'in_progress' || Boolean((q as { claimed_by?: string }).claimed_by)) &&
-      (me
-        ? (q as { claimed_by?: string }).claimed_by === me || q.status === 'in_progress'
-        : false),
-  )
-  // Prefer explicit claimed_by when present; otherwise treat in_progress as "active".
   const claimed =
-    me && queue.some((q) => (q as { claimed_by?: string }).claimed_by)
-      ? queue.filter((q) => (q as { claimed_by?: string }).claimed_by === me)
+    me && queue.some((q) => q.claimed_by)
+      ? queue.filter((q) => q.claimed_by === me)
       : queue.filter((q) => q.status === 'in_progress')
 
   const waiting = queue.filter((q) => !q.status || q.status === 'waiting')
   const occupiedBeds = beds.filter((b) => b.occupied && b.patient_id)
   const freeBeds = beds.filter((b) => !b.occupied).length
   return {
-    claimedByMe: claimed.length ? claimed : claimedByMe,
+    claimedByMe: claimed,
     waiting,
     occupiedBeds,
     freeBeds,
   }
 }
 
+/** Distinct departments present in the waiting list (for claim control). */
+export function waitingDepartments(queue: QueueItem[]): string[] {
+  const set = new Set<string>()
+  for (const q of queue) {
+    if (!q.status || q.status === 'waiting') set.add(q.dept)
+  }
+  return [...set].sort()
+}
+
 export const WorklistPage: React.FC = () => {
   const { user } = useAuth()
   const beds = useAsyncData((signal) => api.listBeds(null, null, signal), [])
   const queue = useAsyncData((signal) => api.listQueue(50, null, null, signal), [])
+  const [claimDept, setClaimDept] = useState('ED')
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionOk, setActionOk] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [recent, setRecent] = useState<RecentPatient[]>(() => loadRecentPatients())
 
   const loading = beds.state.status === 'loading' || queue.state.status === 'loading'
   const error =
@@ -68,23 +71,119 @@ export const WorklistPage: React.FC = () => {
     return partitionWorklist(b, q, user?.sub)
   }, [beds.state, queue.state, user?.sub])
 
-  const reload = () => {
+  const depts = useMemo(() => {
+    const q = queue.state.status === 'success' ? queue.state.data.items : []
+    const d = waitingDepartments(q)
+    return d.length ? d : ['ED']
+  }, [queue.state])
+
+  useEffect(() => {
+    if (depts.length && !depts.includes(claimDept)) setClaimDept(depts[0])
+  }, [depts, claimDept])
+
+  // Refresh "recent" when returning to the tab / after chart views.
+  useEffect(() => {
+    const sync = () => setRecent(loadRecentPatients())
+    window.addEventListener('focus', sync)
+    const id = window.setInterval(sync, 2000)
+    return () => {
+      window.removeEventListener('focus', sync)
+      window.clearInterval(id)
+    }
+  }, [])
+
+  const reload = useCallback(() => {
     beds.reload()
     queue.reload()
+    setRecent(loadRecentPatients())
+  }, [beds, queue])
+
+  const onClaim = async () => {
+    setActionError(null)
+    setActionOk(null)
+    setBusy(true)
+    try {
+      const res = await api.claimNext(claimDept)
+      setActionOk(`Claimed ${res.item.patient_id} in ${claimDept}.`)
+      reload()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Claim failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const onComplete = async (patientId: string) => {
+    setActionError(null)
+    setActionOk(null)
+    setBusy(true)
+    try {
+      await api.completeQueue(patientId)
+      setActionOk(`Completed ${patientId}.`)
+      reload()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Complete failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
     <>
       <header className="page-header">
         <h1>My patients</h1>
-        <p>Worklist across triage and beds. Click any patient id to open the chart.</p>
+        <p>
+          Claim the next triage patient, finish encounters, and jump into charts — without leaving
+          the worklist.
+        </p>
       </header>
 
-      <div style={{ marginBottom: 12 }}>
-        <button type="button" className="ghost" onClick={reload}>
-          Refresh
-        </button>
-      </div>
+      <Card title="Quick actions">
+        <div className="row" style={{ alignItems: 'flex-end', gap: 12 }}>
+          <Field id="claim-dept" label="Claim next in">
+            {(props) => (
+              <select
+                {...props}
+                value={claimDept}
+                onChange={(e) => setClaimDept(e.target.value)}
+              >
+                {depts.map((d) => (
+                  <option key={d} value={d}>
+                    {d}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <button
+            type="button"
+            className="primary"
+            disabled={busy || loading}
+            onClick={() => void onClaim()}
+          >
+            {busy ? (
+              <>
+                <Spinner label="Claiming" /> Working…
+              </>
+            ) : (
+              'Claim next patient'
+            )}
+          </button>
+          <button type="button" className="ghost" onClick={reload} disabled={busy}>
+            Refresh
+          </button>
+        </div>
+        {actionError && (
+          <div style={{ marginTop: 10 }}>
+            <Alert kind="error">{actionError}</Alert>
+          </div>
+        )}
+        {actionOk && (
+          <div style={{ marginTop: 10 }}>
+            <Alert kind="success">{actionOk}</Alert>
+          </div>
+        )}
+      </Card>
 
       {error && <Alert kind="error">{error}</Alert>}
       {loading && <SkeletonRows rows={5} />}
@@ -94,15 +193,14 @@ export const WorklistPage: React.FC = () => {
           <Card
             title={
               <>
-                Claimed / in progress{' '}
-                <Badge tone="warn">{parts.claimedByMe.length}</Badge>
+                Claimed / in progress <Badge tone="warn">{parts.claimedByMe.length}</Badge>
               </>
             }
           >
             {parts.claimedByMe.length === 0 ? (
               <EmptyState
                 message="No patients claimed"
-                hint="Claim the next triage patient from Patient flow."
+                hint="Use Claim next patient above."
               />
             ) : (
               parts.claimedByMe.map((q) => (
@@ -111,15 +209,22 @@ export const WorklistPage: React.FC = () => {
                     <PatientLink id={q.patient_id} />
                     <div className="muted" style={{ fontSize: '0.8rem' }}>
                       {q.dept} · {q.status ?? 'in_progress'}
+                      {q.claimed_by ? ` · ${q.claimed_by}` : ''}
                     </div>
                   </div>
-                  <Badge tone={acuityTone(q.acuity)}>ESI {q.acuity}</Badge>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <Badge tone={acuityTone(q.acuity)}>ESI {q.acuity}</Badge>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void onComplete(q.patient_id)}
+                    >
+                      Complete
+                    </button>
+                  </div>
                 </div>
               ))
             )}
-            <div style={{ marginTop: 10 }}>
-              <Link to="/flow">Go to triage →</Link>
-            </div>
           </Card>
 
           <Card
@@ -144,13 +249,15 @@ export const WorklistPage: React.FC = () => {
                 </div>
               ))
             )}
+            <div style={{ marginTop: 10 }}>
+              <Link to="/flow">Full triage board →</Link>
+            </div>
           </Card>
 
           <Card
             title={
               <>
-                Occupied beds{' '}
-                <Badge tone="neutral">{parts.occupiedBeds.length}</Badge>
+                Occupied beds <Badge tone="neutral">{parts.occupiedBeds.length}</Badge>
               </>
             }
           >
@@ -181,6 +288,30 @@ export const WorklistPage: React.FC = () => {
             <div style={{ marginTop: 10 }}>
               <Link to="/wards">Open ward board →</Link>
             </div>
+          </Card>
+
+          <Card
+            title={
+              <>
+                Recently viewed <Badge tone="neutral">{recent.length}</Badge>
+              </>
+            }
+          >
+            {recent.length === 0 ? (
+              <EmptyState
+                message="No recent charts"
+                hint="Open a patient from beds, queue, or FHIR."
+              />
+            ) : (
+              recent.map((r) => (
+                <div key={r.id} className="worklist-item">
+                  <PatientLink id={r.id} />
+                  <span className="muted" style={{ fontSize: '0.75rem' }}>
+                    {new Date(r.viewedAt).toLocaleTimeString()}
+                  </span>
+                </div>
+              ))
+            )}
           </Card>
         </div>
       )}

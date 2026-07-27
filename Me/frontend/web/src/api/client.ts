@@ -323,6 +323,31 @@ export const api = {
     })
   },
 
+  /** Atomically claim the next waiting patient in a department. */
+  claimNext(
+    dept: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; item: QueueItem }> {
+    return request<{ ok: boolean; item: QueueItem }>(`${BASE.patientFlow}/queue/claim`, {
+      method: 'POST',
+      params: { dept },
+      signal,
+    })
+  },
+
+  /** Mark a triage entry completed. */
+  completeQueue(
+    patientId: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; item: QueueItem }> {
+    return request<{ ok: boolean; item: QueueItem }>(
+      `${BASE.patientFlow}/queue/${encodeURIComponent(patientId)}/complete`,
+      { method: 'POST', signal },
+    )
+  },
+
   risk(
     payload: RiskRequest,
     _token?: string | null,

@@ -26,6 +26,8 @@ export type QueueItem = {
   created_at?: string
   status?: 'waiting' | 'in_progress' | 'completed'
   created_by?: string
+  claimed_by?: string
+  claimed_at?: string
 }
 
 export type QueueListResponse = {

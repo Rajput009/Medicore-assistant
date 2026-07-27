@@ -225,13 +225,17 @@ export const handlers = [
     })
   }),
 
-  http.get('/flow/queue', ({ request }) => {
+  http.get(/\/flow\/queue\/?(\?.*)?$/, ({ request }) => {
     const denied = requireAuth(request)
     if (denied) return denied
+    // Don't match /queue/claim
+    if (new URL(request.url).pathname.includes('/claim')) {
+      return HttpResponse.json({ detail: 'method' }, { status: 405 })
+    }
     return HttpResponse.json({
       items: [
-        { patient_id: 'pat-1', acuity: 1, dept: 'ED' },
-        { patient_id: 'pat-2', acuity: 4, dept: 'ED' },
+        { patient_id: 'pat-1', acuity: 1, dept: 'ED', status: 'waiting' },
+        { patient_id: 'pat-2', acuity: 4, dept: 'ED', status: 'waiting' },
       ],
       count: 2,
       total: 2,
@@ -243,6 +247,40 @@ export const handlers = [
     if (denied) return denied
     const body = (await request.json()) as { patient_id: string }
     return HttpResponse.json({ ok: true, id: body.patient_id }, { status: 201 })
+  }),
+
+  http.post(/\/flow\/queue\/claim/, ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const url = new URL(request.url)
+    const dept = url.searchParams.get('dept') || 'ED'
+    return HttpResponse.json({
+      ok: true,
+      item: {
+        patient_id: 'claimed-1',
+        acuity: 1,
+        dept,
+        status: 'in_progress',
+        claimed_by: 'dr.smith',
+      },
+    })
+  }),
+
+  http.post(/\/flow\/queue\/[^/]+\/complete\/?$/, ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const parts = new URL(request.url).pathname.split('/').filter(Boolean)
+    // .../queue/:id/complete
+    const patientId = parts[parts.length - 2]
+    return HttpResponse.json({
+      ok: true,
+      item: {
+        patient_id: patientId,
+        acuity: 2,
+        dept: 'ED',
+        status: 'completed',
+      },
+    })
   }),
 
   http.post('/cds/risk', async ({ request }) => {

@@ -704,3 +704,32 @@ pre.json {
   padding-top: 14px;
   border-top: 1px solid var(--border);
 }
+
+/* ---- Observation trends ---- */
+.trend-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.trend-row {
+  margin-bottom: 10px;
+}
+.trend-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.88rem;
+  margin-bottom: 4px;
+}
+.trend-bar-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  overflow: hidden;
+}
+.trend-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+  min-width: 4px;
+}

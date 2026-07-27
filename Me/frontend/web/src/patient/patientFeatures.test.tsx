@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest'
 import { AuthProvider } from '../auth/AuthContext'
 import { CdsPage, acuityFromRisk } from '../pages/CdsPage'
 import { groupBedsByWard, wardSummary, WardBoardPage } from '../pages/WardBoardPage'
-import { partitionWorklist, WorklistPage } from '../pages/WorklistPage'
+import { partitionWorklist, waitingDepartments, WorklistPage } from '../pages/WorklistPage'
 import { makeToken, renderWithProviders, seedToken } from '../test/helpers'
 import { server } from '../test/server'
 import { PatientChartDrawer } from './PatientChartDrawer'
@@ -142,8 +142,11 @@ describe('WorklistPage', () => {
           { bed_id: 'A-002', ward: 'A', occupied: false, patient_id: null },
         ]),
       ),
-      http.get('/flow/queue', () =>
-        HttpResponse.json({
+      http.get(/\/flow\/queue\/?(\?.*)?$/, ({ request }) => {
+        if (new URL(request.url).pathname.includes('/claim')) {
+          return new HttpResponse(null, { status: 405 })
+        }
+        return HttpResponse.json({
           items: [
             { patient_id: 'pat-1', acuity: 1, dept: 'ED', status: 'waiting' },
             {
@@ -151,16 +154,18 @@ describe('WorklistPage', () => {
               acuity: 2,
               dept: 'ED',
               status: 'in_progress',
-              claimed_by: 'dr.smith',
+              claimed_by: 'test.user',
             },
           ],
           count: 2,
           total: 2,
-        }),
-      ),
+        })
+      }),
     )
 
-    renderWithProviders(<WorklistPage />)
+    renderWithProviders(<WorklistPage />, {
+      token: makeToken({ sub: 'test.user', roles: ['clinician'] }),
+    })
     expect(await screen.findByRole('heading', { name: /my patients/i })).toBeInTheDocument()
     expect(await screen.findByText('pat-1')).toBeInTheDocument()
     expect(screen.getByText('MRN-8')).toBeInTheDocument()
@@ -183,6 +188,106 @@ describe('WardBoardPage', () => {
     expect(screen.getByText(/Ward A/i)).toBeInTheDocument()
     expect(screen.getByText(/Ward ICU/i)).toBeInTheDocument()
     expect(screen.getByText('P9')).toBeInTheDocument()
+  })
+})
+
+describe('observationTrends', () => {
+  it('extracts numeric values and bar widths', async () => {
+    const { extractObservationPoints, barWidthPercent, observationNumericValue } =
+      await import('./observationTrends')
+    const obs = [
+      {
+        resourceType: 'Observation',
+        id: '1',
+        code: { text: 'HR' },
+        valueQuantity: { value: 60, unit: '/min' },
+      },
+      {
+        resourceType: 'Observation',
+        id: '2',
+        code: { text: 'HR' },
+        valueQuantity: { value: 100, unit: '/min' },
+      },
+      { resourceType: 'Observation', id: '3', code: { text: 'note' }, valueString: 'alert' },
+    ]
+    const points = extractObservationPoints(obs)
+    expect(points).toHaveLength(2)
+    expect(points[0].value).toBe(60)
+    expect(observationNumericValue(obs[2])).toBeNull()
+    expect(barWidthPercent(60, [60, 100])).toBe(0)
+    expect(barWidthPercent(100, [60, 100])).toBe(100)
+    expect(barWidthPercent(80, [80, 80])).toBe(50)
+  })
+})
+
+describe('recentPatients', () => {
+  it('remembers ids newest-first and caps length', async () => {
+    const { rememberPatient, loadRecentPatients, clearRecentPatients } = await import(
+      './recentPatients'
+    )
+    clearRecentPatients()
+    rememberPatient('A', 1)
+    rememberPatient('B', 2)
+    rememberPatient('A', 3)
+    const list = loadRecentPatients()
+    expect(list.map((p) => p.id)).toEqual(['A', 'B'])
+    expect(list[0].viewedAt).toBe(3)
+  })
+})
+
+describe('Worklist actions (API wiring)', () => {
+  it('claimNext posts dept and returns the claimed item', async () => {
+    let claimedDept: string | null = null
+    server.use(
+      http.post(/\/flow\/queue\/claim/, ({ request }) => {
+        claimedDept = new URL(request.url).searchParams.get('dept')
+        return HttpResponse.json({
+          ok: true,
+          item: {
+            patient_id: 'claimed-1',
+            acuity: 1,
+            dept: claimedDept,
+            status: 'in_progress',
+            claimed_by: 'dr.smith',
+          },
+        })
+      }),
+    )
+    document.cookie = 'medicore_session=test-session; path=/'
+    const { api } = await import('../api/client')
+    const res = await api.claimNext('ED')
+    expect(claimedDept).toBe('ED')
+    expect(res.item.patient_id).toBe('claimed-1')
+    expect(res.item.status).toBe('in_progress')
+  })
+
+  it('completeQueue posts the patient id path', async () => {
+    let completedId: string | null = null
+    server.use(
+      http.post(/\/flow\/queue\/[^/]+\/complete/, ({ request }) => {
+        const parts = new URL(request.url).pathname.split('/').filter(Boolean)
+        completedId = parts[parts.length - 2] ?? null
+        return HttpResponse.json({
+          ok: true,
+          item: { patient_id: completedId, acuity: 2, dept: 'ED', status: 'completed' },
+        })
+      }),
+    )
+    document.cookie = 'medicore_session=test-session; path=/'
+    const { api } = await import('../api/client')
+    const res = await api.completeQueue('pat-me')
+    expect(completedId).toBe('pat-me')
+    expect(res.item.status).toBe('completed')
+  })
+
+  it('waitingDepartments lists unique depts', () => {
+    expect(
+      waitingDepartments([
+        { patient_id: 'a', acuity: 1, dept: 'ED', status: 'waiting' },
+        { patient_id: 'b', acuity: 2, dept: 'ICU', status: 'waiting' },
+        { patient_id: 'c', acuity: 3, dept: 'ED', status: 'in_progress' },
+      ]),
+    ).toEqual(['ED', 'ICU'])
   })
 })
 
