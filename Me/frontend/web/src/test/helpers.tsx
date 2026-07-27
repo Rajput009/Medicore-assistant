@@ -26,10 +26,21 @@ export function makeToken(
     roles?: Role[] | string
     /** Seconds from now. Negative values produce an already-expired token. */
     expiresInSeconds?: number | null
+    /** Ward / department scope; omitted entirely when empty, as the server does. */
+    wards?: string[]
+    departments?: string[]
   } = {},
 ): string {
-  const { sub = 'test.user', roles = ['clinician'], expiresInSeconds = 3600 } = opts
+  const {
+    sub = 'test.user',
+    roles = ['clinician'],
+    expiresInSeconds = 3600,
+    wards,
+    departments,
+  } = opts
   const payload: Record<string, unknown> = { sub, roles }
+  if (wards?.length) payload.wards = wards
+  if (departments?.length) payload.departments = departments
   if (expiresInSeconds !== null) {
     payload.exp = Math.floor(Date.now() / 1000) + expiresInSeconds
   }
@@ -50,7 +61,13 @@ export function makeToken(
 export function seedToken(token: string): void {
   purgeLegacyTokenStorage()
   const payloadPart = token.split('.')[1]
-  let claims: { sub?: string; roles?: Role[] | string; exp?: number } = {
+  let claims: {
+    sub?: string
+    roles?: Role[] | string
+    exp?: number
+    wards?: string[]
+    departments?: string[]
+  } = {
     sub: 'test.user',
     roles: ['clinician'],
   }
@@ -73,6 +90,8 @@ export function seedToken(token: string): void {
         sub: claims.sub ?? 'test.user',
         roles,
         exp: claims.exp ?? Math.floor(Date.now() / 1000) + 3600,
+        wards: claims.wards ?? [],
+        departments: claims.departments ?? [],
       }),
     ),
   )

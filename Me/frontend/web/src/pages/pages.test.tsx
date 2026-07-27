@@ -367,45 +367,106 @@ describe('PatientFlowPage', () => {
 // ------------------------------------------------------------------ CDS
 
 describe('CdsPage', () => {
-  it('scores healthy vitals as low risk', async () => {
+  it('scores a healthy full vital set as low risk', async () => {
     const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
-    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
     expect(await screen.findByText('low')).toBeInTheDocument()
-    expect(screen.getByRole('meter')).toHaveAttribute('aria-valuenow', '0')
   })
 
   it('scores critical vitals as high risk', async () => {
     const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
-    const hr = screen.getByLabelText(/heart rate/i)
-    await user.clear(hr)
-    await user.type(hr, '190')
+    const rr = screen.getByLabelText(/respiratory rate/i)
+    await user.clear(rr)
+    await user.type(rr, '30')
     const sbp = screen.getByLabelText(/systolic/i)
     await user.clear(sbp)
-    await user.type(sbp, '60')
-    const spo2 = screen.getByLabelText(/oxygen/i)
+    await user.type(sbp, '80')
+    const spo2 = screen.getByLabelText(/oxygen saturation/i)
     await user.clear(spo2)
-    await user.type(spo2, '80')
-    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    await user.type(spo2, '85')
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
     expect(await screen.findByText('high')).toBeInTheDocument()
+  })
+
+  it('collects respiratory rate and temperature, which carry real NEWS2 weight', () => {
+    renderWithProviders(<CdsPage />, { token: makeToken() })
+    // The old 3-vital form assumed these were normal, so a tachypnoeic
+    // patient could score "low".
+    expect(screen.getByLabelText(/respiratory rate/i)).toBeInTheDocument()
+    expect(screen.getByLabelText(/temperature/i)).toBeInTheDocument()
+    expect(screen.getByLabelText(/consciousness/i)).toBeInTheDocument()
+  })
+
+  it('sends the full parameter set to /news2', async () => {
+    let received: Record<string, unknown> | null = null
+    server.use(
+      http.post('/cds/news2', async ({ request }) => {
+        received = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({
+          score: 0,
+          band: 'low',
+          red_flag: false,
+          recommended_response: 'Routine monitoring.',
+          monitoring_frequency: '12 hourly',
+          parameters: [],
+          disclaimer: 'aid',
+        })
+      }),
+    )
+    const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
+    await screen.findByText(/recommended response/i)
+    expect(received).toMatchObject({
+      respiratory_rate: 16,
+      spo2: 98,
+      temperature: 37,
+      systolic_bp: 120,
+      pulse: 72,
+      consciousness: 'A',
+    })
+  })
+
+  it('scores supplemental oxygen, which adds 2 points', async () => {
+    let received: Record<string, unknown> | null = null
+    server.use(
+      http.post('/cds/news2', async ({ request }) => {
+        received = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({
+          score: 2,
+          band: 'low-medium',
+          red_flag: false,
+          recommended_response: 'Nurse review.',
+          monitoring_frequency: '6 hourly',
+          parameters: [],
+          disclaimer: 'aid',
+        })
+      }),
+    )
+    const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
+    await user.click(screen.getByLabelText(/supplemental oxygen/i))
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
+    await screen.findByText(/recommended response/i)
+    expect(received).toMatchObject({ on_supplemental_oxygen: true })
   })
 
   it('rejects out-of-range vitals before calling the server', async () => {
     server.use(
-      http.post('/cds/risk', () => {
+      http.post('/cds/news2', () => {
         throw new Error('should not be called')
       }),
     )
     const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
-    const spo2 = screen.getByLabelText(/oxygen/i)
+    const spo2 = screen.getByLabelText(/oxygen saturation/i)
     await user.clear(spo2)
     await user.type(spo2, '400')
-    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
     expect(await screen.findByText(/must be between 1 and 100/i)).toBeInTheDocument()
   })
 
   it('states the standard used and its clinical limits', () => {
     renderWithProviders(<CdsPage />, { token: makeToken() })
-    const banner = screen.getByText(/NEWS2/i)
+    // "NEWS2" also appears on the submit button, so match the disclaimer text.
+    const banner = screen.getByText(/Royal College of Physicians/i)
     expect(banner).toBeInTheDocument()
     expect(banner).toHaveTextContent(/not a diagnosis/i)
     expect(banner).toHaveTextContent(/not validated for children or pregnancy/i)
@@ -413,38 +474,53 @@ describe('CdsPage', () => {
 
   it('shows the NEWS2 aggregate and the recommended response', async () => {
     const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
-    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
     expect(await screen.findByText(/NEWS2 aggregate/i)).toBeInTheDocument()
     expect(screen.getByText(/recommended response/i)).toBeInTheDocument()
   })
 
+  it('shows the per-parameter breakdown that explains the score', async () => {
+    const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
+    // An unexplained aggregate is not clinically actionable.
+    expect(await screen.findByText(/score breakdown by parameter/i)).toBeInTheDocument()
+  })
+
   it('escalates visibly when a single parameter is critical', async () => {
     server.use(
-      http.post('/cds/risk', () =>
+      http.post('/cds/news2', () =>
         HttpResponse.json({
-          score: 0.15,
-          class_label: 'medium',
-          news2_score: 3,
+          score: 3,
+          band: 'medium',
           red_flag: true,
           recommended_response: 'Urgent review by a clinician.',
+          monitoring_frequency: '1 hourly',
+          parameters: [],
           disclaimer: 'NEWS2 is a track-and-trigger aid.',
         }),
       ),
     )
     const { user } = renderWithProviders(<CdsPage />, { token: makeToken() })
-    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
     // A low aggregate must not hide a severely abnormal single parameter.
     expect(await screen.findByText(/red flag/i)).toBeInTheDocument()
   })
 
   it('validateVitals covers empty, non-numeric and out-of-range input', () => {
-    expect(validateVitals({ hr: '', sbp: '120', spo2: '98' }).hr).toMatch(/required/)
-    expect(validateVitals({ hr: 'abc', sbp: '120', spo2: '98' }).hr).toMatch(/must be a number/)
-    expect(validateVitals({ hr: '999', sbp: '120', spo2: '98' }).hr).toMatch(/between/)
-    expect(validateVitals({ hr: '72', sbp: '120', spo2: '98' })).toEqual({})
+    const base = {
+      respiratory_rate: '16',
+      spo2: '98',
+      temperature: '37',
+      systolic_bp: '120',
+      pulse: '72',
+    }
+    expect(validateVitals({ ...base, pulse: '' }).pulse).toMatch(/required/)
+    expect(validateVitals({ ...base, pulse: 'abc' }).pulse).toMatch(/must be a number/)
+    expect(validateVitals({ ...base, pulse: '999' }).pulse).toMatch(/between/)
+    expect(validateVitals(base)).toEqual({})
   })
 
-  it('maps risk labels to tones', () => {
+  it('maps NEWS2 bands to tones', () => {
     expect(riskTone('low')).toBe('ok')
     expect(riskTone('medium')).toBe('warn')
     expect(riskTone('high')).toBe('err')

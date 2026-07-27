@@ -315,3 +315,46 @@ Example:
 ```bash
 curl -X DELETE -H "Authorization: Bearer <admin_token>" "http://localhost:8080/cache/Observation?patient=123"
 ```
+
+## Clinical workflow notes
+
+**Ward / department scope.** Access tokens may carry `wards` and
+`departments` claims. An **absent or empty claim means unrestricted**, so
+legacy tokens and IdPs that publish no scope keep working unchanged. The auth
+service maps prefixed IdP groups (`medicore-ward-ICU`, `medicore-dept-ED`,
+configurable) onto those claims; `patient-flow` enforces them, and the console
+filters the ward board to match. `DEMO_WARDS` / `DEMO_DEPARTMENTS` exercise
+this locally without an IdP.
+
+**Retries.** Unsafe writes carry an `Idempotency-Key`. The console mints **one
+key per user intent** and reuses it across retries (`api/retry.ts`), so a
+dropped response cannot claim a second patient or double-file a set of vitals.
+Network errors, 5xx and 429 are retried with exponential backoff and jitter;
+409/403/404 are not, because repeating them only hides a real answer.
+
+**Vitals capture.** `POST /fhir/observation` on the gateway is the only write
+path. It accepts validated vital signs and emits properly coded FHIR
+Observations (LOINC codes, UCUM units, `vital-signs` category) rather than
+proxying arbitrary FHIR bodies, so what was recorded is always auditable. The
+NEWS2 aggregate is filed separately under the `survey` category — it is a
+derived score, and filing it as a vital sign would corrupt flowsheets. All
+readings in one submission share an effective timestamp so a flowsheet groups
+them into a single column, and the patient's cached Observation searches are
+invalidated immediately so the clinician can see what they just saved.
+
+**Safety context in the chart.** The patient chart drawer loads allergies
+(`AllergyIntolerance`), the problem list (`Condition`) and medications
+(`MedicationRequest`) alongside vitals, and renders them *before* demographics
+— they are what a clinician checks before acting. Three rules are enforced in
+`safetySummary.ts` and covered by tests, because the dangerous failure mode for
+all three lists is an entry that silently does not render:
+
+- A resource that cannot be fully parsed is still displayed, labelled
+  "unknown", never filtered out.
+- An allergy with no `clinicalStatus` counts as **active**; absent is not
+  the same as resolved.
+- A failed allergy lookup renders an explicit error, never an empty list —
+  "no known allergies" must not be indistinguishable from "we could not ask".
+
+Resolved and inactive entries are collapsed rather than discarded, since a
+cleared allergy is still clinical history.

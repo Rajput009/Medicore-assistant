@@ -131,9 +131,11 @@ npm run build
 | Page                  | Route    | Capabilities                                             | Required role      |
 | --------------------- | -------- | -------------------------------------------------------- | ------------------ |
 | **Overview**          | `/`      | Live health of all four services, refresh, resolved config | any                |
-| **FHIR explorer**     | `/fhir`  | Search or read Patient / Encounter / Observation / MedicationRequest; result table + raw bundle | clinician or admin |
+| **My patients**       | `/worklist` | Claimed queue, waiting triage, occupied beds, recent charts | clinician or admin |
+| **Ward board**        | `/wards` | Bed census by ward, filtered to your `wards` claim         | clinician or admin |
+| **FHIR explorer**     | `/fhir`  | Search or read Patient / Encounter / Observation / MedicationRequest / AllergyIntolerance / Condition; result table + raw bundle | clinician or admin |
 | **Patient flow**      | `/flow`  | Bed occupancy with toggle, triage queue with filters, enqueue form | clinician or admin |
-| **Decision support**  | `/cds`   | Risk scoring from vitals with a visual scale              | clinician or admin |
+| **Decision support**  | `/cds`   | Full NEWS2 (6 parameters + O2/Scale 2) with per-parameter breakdown, save vitals as FHIR Observations, escalate to triage | clinician or admin |
 | **Cache admin**       | `/admin` | Invalidate cached FHIR responses, optionally per patient  | admin              |
 
 Every destructive action (cache invalidation) requires explicit confirmation.

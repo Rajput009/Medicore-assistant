@@ -84,6 +84,24 @@ class OAuth2ClientCredentials:
         self._exp = 0.0
 
 
+def _id_from_location(response: httpx.Response) -> str | None:
+    """Pull the new resource id out of a Location/Content-Location header.
+
+    FHIR servers report the created id as ``[base]/[type]/[id]/_history/[vid]``.
+    """
+    location = response.headers.get("location") or response.headers.get(
+        "content-location"
+    )
+    if not location:
+        return None
+    parts = [p for p in location.split("/") if p]
+    if "_history" in parts:
+        history_at = parts.index("_history")
+        if history_at >= 1:
+            return parts[history_at - 1]
+    return parts[-1] if parts else None
+
+
 class FHIRClient:
     def __init__(
         self,
@@ -134,6 +152,45 @@ class FHIRClient:
                     url, headers=await self._headers(client), params=params
                 )
             r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as exc:
+            raise FHIRError(
+                f"FHIR server returned {exc.response.status_code} for {url}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise FHIRError(f"FHIR request failed: {exc}") from exc
+
+    async def create(self, resource: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create a resource (FHIR ``POST [base]/[type]``).
+
+        Kept separate from ``_request`` because writes must **not** be retried
+        blindly on 401 the way reads are: re-POSTing a creation can duplicate a
+        clinical record. We refresh the token and retry only when the first
+        attempt was rejected before the server could have acted on it.
+        """
+        client = await self._get_client()
+        url = f"{self.base_url}/{resource}"
+        headers = {
+            **await self._headers(client),
+            "Content-Type": "application/fhir+json",
+        }
+        try:
+            r = await client.post(url, headers=headers, json=dict(body))
+            if r.status_code == 401:
+                # 401 means the request was rejected at the auth layer, so no
+                # resource was created: retrying with a fresh token is safe.
+                self.oauth.invalidate()
+                headers = {
+                    **await self._headers(client),
+                    "Content-Type": "application/fhir+json",
+                }
+                r = await client.post(url, headers=headers, json=dict(body))
+            r.raise_for_status()
+            # A FHIR server may legitimately answer 201 with an empty body when
+            # the client did not ask for the created resource back.
+            if not r.content:
+                return {"resourceType": resource, "id": _id_from_location(r)}
             return r.json()
         except httpx.HTTPStatusError as exc:
             raise FHIRError(

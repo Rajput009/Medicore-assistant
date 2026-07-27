@@ -40,6 +40,24 @@ function normaliseRoles(raw: unknown): Role[] {
 }
 
 /**
+ * Normalise a ward/department scope claim. Accepts a list or a delimited
+ * string (IdPs emit both) and drops blanks. An empty result means
+ * "unrestricted", which is how the server reads an absent claim.
+ */
+export function normaliseScope(raw: unknown): string[] {
+  let list: unknown[] = []
+  if (Array.isArray(raw)) list = raw
+  else if (typeof raw === 'string') list = raw.split(/[,\s]+/)
+
+  const seen: string[] = []
+  for (const entry of list) {
+    const value = String(entry).trim()
+    if (value && !seen.includes(value)) seen.push(value)
+  }
+  return seen
+}
+
+/**
  * Decode a JWT payload without verifying its signature.
  * Returns null for anything malformed rather than throwing.
  */
@@ -62,36 +80,60 @@ export function decodeToken(token: string | null | undefined): AuthUser | null {
   const exp =
     typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp : undefined
 
-  return { sub, roles: normaliseRoles(payload.roles), exp }
+  return {
+    sub,
+    roles: normaliseRoles(payload.roles),
+    exp,
+    wards: normaliseScope(payload.wards),
+    departments: normaliseScope(payload.departments),
+  }
 }
 
 /** True when the token carries an `exp` that has already passed. */
-export function isExpired(user: AuthUser | null, nowMs: number = Date.now()): boolean {
+export function isExpired(
+  user: Partial<AuthUser> | null,
+  nowMs: number = Date.now(),
+): boolean {
   if (!user?.exp) return false
   return user.exp * 1000 <= nowMs
 }
 
 /** Milliseconds until expiry; null when the token never expires. */
-export function millisUntilExpiry(user: AuthUser | null, nowMs: number = Date.now()): number | null {
+export function millisUntilExpiry(
+  user: Partial<AuthUser> | null,
+  nowMs: number = Date.now(),
+): number | null {
   if (!user?.exp) return null
   return Math.max(0, user.exp * 1000 - nowMs)
 }
 
-export function hasAnyRole(user: AuthUser | null, required: readonly Role[]): boolean {
+export function hasAnyRole(
+  user: Partial<AuthUser> | null,
+  required: readonly Role[],
+): boolean {
   if (!user) return false
   if (required.length === 0) return true
-  return required.some((r) => user.roles.includes(r))
+  const roles = user.roles ?? []
+  return required.some((r) => roles.includes(r))
 }
 
 export function sessionUserFromClaims(s: {
   sub: string
   roles?: string[]
   exp?: number
+  wards?: string[]
+  departments?: string[]
 }): AuthUser | null {
   if (!s?.sub) return null
   const roles = normaliseRoles(s.roles ?? [])
   const exp = typeof s.exp === 'number' && Number.isFinite(s.exp) ? s.exp : undefined
-  return { sub: s.sub, roles, exp }
+  return {
+    sub: s.sub,
+    roles,
+    exp,
+    wards: normaliseScope(s.wards),
+    departments: normaliseScope(s.departments),
+  }
 }
 
 /**

@@ -27,6 +27,8 @@ def create_access_token(
     sub: str,
     roles: list[str] | None = None,
     expires_minutes: int | None = None,
+    wards: list[str] | None = None,
+    departments: list[str] | None = None,
 ) -> str:
     """Mint an internal HS-signed access token.
 
@@ -36,6 +38,12 @@ def create_access_token(
 
     Every token carries a unique ``jti`` so logout / compromise can revoke it
     before natural expiry via the denylist.
+
+    ``wards`` / ``departments`` carry the caller's data scope. They are emitted
+    **only when non-empty**: an empty list would be indistinguishable from
+    "claim absent", and :meth:`Principal.can_access_ward` treats an absent
+    scope as unrestricted. Omitting the claim keeps legacy tokens working
+    while letting a scoped IdP login actually restrict access.
     """
     ttl = (
         settings.access_token_ttl_minutes
@@ -60,7 +68,37 @@ def create_access_token(
         # an access token if we ever issue both from the same secret.
         "token_use": "access",
     }
+    # Only emit scope claims when they actually restrict something.
+    cleaned_wards = _clean_scope(wards)
+    if cleaned_wards:
+        payload["wards"] = cleaned_wards
+    cleaned_departments = _clean_scope(departments)
+    if cleaned_departments:
+        payload["departments"] = cleaned_departments
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_alg)
+
+
+# A scope entry must be a short, printable identifier. Anything else is dropped
+# rather than trusted: these values are compared against ward ids from the
+# database and echoed into audit records.
+_MAX_SCOPE_ENTRIES = 64
+_MAX_SCOPE_ENTRY_LENGTH = 64
+
+
+def _clean_scope(raw: list[str] | None) -> list[str]:
+    """Normalise a ward/department scope list: trimmed, deduped, bounded."""
+    if not raw:
+        return []
+    seen: list[str] = []
+    for entry in raw:
+        value = str(entry).strip()
+        if not value or len(value) > _MAX_SCOPE_ENTRY_LENGTH:
+            continue
+        if value not in seen:
+            seen.append(value)
+        if len(seen) >= _MAX_SCOPE_ENTRIES:
+            break
+    return seen
 
 
 _jwks_fetcher: JWKSFetcher | None = None

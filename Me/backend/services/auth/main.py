@@ -108,6 +108,24 @@ def _clear_session_cookie(response: Response) -> None:
     )
 
 
+def _claims_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Shape the claims the SPA is allowed to see.
+
+    Deliberately a subset of the token: the raw JWT never leaves the httpOnly
+    cookie. Ward/department scope is included so the console can filter to the
+    caller's own wards instead of showing a board they cannot act on — the
+    server still enforces the same scope independently.
+    """
+    return {
+        "sub": payload.get("sub"),
+        "roles": payload.get("roles") or [],
+        "exp": payload.get("exp"),
+        "jti": payload.get("jti"),
+        "wards": payload.get("wards") or [],
+        "departments": payload.get("departments") or [],
+    }
+
+
 def _extract_bearer_or_cookie(request: Request) -> str | None:
     auth = request.headers.get("authorization")
     if auth:
@@ -167,7 +185,17 @@ def login(req: LoginReq, response: Response) -> TokenResp:
         )
 
     ttl = settings.access_token_ttl_minutes
-    token = create_access_token(sub=req.username.strip(), roles=["clinician"])
+    # DEMO_WARDS / DEMO_DEPARTMENTS let a local run exercise ward-scoped
+    # behaviour without standing up an IdP. Unset means unrestricted, which
+    # keeps the existing developer experience unchanged.
+    token = create_access_token(
+        sub=req.username.strip(),
+        roles=["clinician"],
+        wards=[w for w in os.getenv("DEMO_WARDS", "").replace(",", " ").split() if w],
+        departments=[
+            d for d in os.getenv("DEMO_DEPARTMENTS", "").replace(",", " ").split() if d
+        ],
+    )
     body = TokenResp(access_token=token, expires_in=ttl * 60)
     _set_session_cookie(response, token, max_age=ttl * 60)
     issue_csrf_cookie(response, secure=_cookie_secure())
@@ -216,12 +244,7 @@ def session(request: Request) -> dict[str, Any]:
             detail="Invalid or expired session",
             headers={"WWW-Authenticate": "Bearer"},
         ) from None
-    return {
-        "sub": payload.get("sub"),
-        "roles": payload.get("roles") or [],
-        "exp": payload.get("exp"),
-        "jti": payload.get("jti"),
-    }
+    return _claims_response(payload)
 
 
 class EstablishSessionReq(BaseModel):
@@ -254,12 +277,7 @@ def establish_session(
     max_age = max(1, exp - now) if exp else settings.access_token_ttl_minutes * 60
     _set_session_cookie(response, req.access_token.strip(), max_age=max_age)
     issue_csrf_cookie(response, secure=_cookie_secure())
-    return {
-        "sub": payload.get("sub"),
-        "roles": payload.get("roles") or [],
-        "exp": payload.get("exp"),
-        "jti": payload.get("jti"),
-    }
+    return _claims_response(payload)
 
 
 # --------------------------------------------------------------------------
@@ -301,8 +319,16 @@ _ROLE_MAP = {
     "medicore-clinician": "clinician",
 }
 
+# Hospital IdPs express data scope as group membership. A group named
+# ``medicore-ward-ICU`` grants ward ICU; ``medicore-dept-ED`` grants
+# department ED. Prefixes are configurable so a site can match its own
+# naming convention without a code change.
+_WARD_GROUP_PREFIX = os.getenv("OIDC_WARD_GROUP_PREFIX", "medicore-ward-")
+_DEPT_GROUP_PREFIX = os.getenv("OIDC_DEPT_GROUP_PREFIX", "medicore-dept-")
 
-def _map_roles(userinfo: dict[str, Any]) -> list[str]:
+
+def _raw_group_claims(userinfo: dict[str, Any]) -> list[str]:
+    """Flatten the group/role claims an IdP may emit as a list or a string."""
     raw: list[str] = []
     for claim in ("roles", "groups"):
         value = userinfo.get(claim)
@@ -310,9 +336,60 @@ def _map_roles(userinfo: dict[str, Any]) -> list[str]:
             raw.extend(value.replace(",", " ").split())
         elif isinstance(value, (list, tuple)):
             raw.extend(str(v) for v in value)
+    return raw
+
+
+def _map_roles(userinfo: dict[str, Any]) -> list[str]:
+    raw = _raw_group_claims(userinfo)
     roles = {_ROLE_MAP[r] for r in raw if r in _ROLE_MAP}
     # Default to the least-privileged role rather than granting clinician.
     return sorted(roles) or ["viewer"]
+
+
+def _map_scopes(userinfo: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Derive (wards, departments) from IdP groups and/or dedicated claims.
+
+    Two sources are accepted, in order of preference:
+
+    1. Prefixed group membership (``medicore-ward-ICU``) — the common case,
+       because most hospital IdPs can only express scope as groups.
+    2. Dedicated ``wards`` / ``departments`` claims, when the IdP is
+       configured to emit them directly.
+
+    Returning empty lists means "no scope restriction", which
+    :meth:`Principal.can_access_ward` treats as unrestricted. That preserves
+    today's behaviour for IdPs that publish no scope at all.
+    """
+    wards: list[str] = []
+    departments: list[str] = []
+
+    for group in _raw_group_claims(userinfo):
+        if _WARD_GROUP_PREFIX and group.startswith(_WARD_GROUP_PREFIX):
+            value = group[len(_WARD_GROUP_PREFIX):].strip()
+            if value and value not in wards:
+                wards.append(value)
+        elif _DEPT_GROUP_PREFIX and group.startswith(_DEPT_GROUP_PREFIX):
+            value = group[len(_DEPT_GROUP_PREFIX):].strip()
+            if value and value not in departments:
+                departments.append(value)
+
+    def _direct(*names: str) -> list[str]:
+        for name in names:
+            value = userinfo.get(name)
+            if isinstance(value, str):
+                return [v.strip() for v in value.replace(",", " ").split() if v.strip()]
+            if isinstance(value, (list, tuple)):
+                return [str(v).strip() for v in value if str(v).strip()]
+        return []
+
+    for value in _direct("wards", "ward"):
+        if value not in wards:
+            wards.append(value)
+    for value in _direct("departments", "depts", "dept"):
+        if value not in departments:
+            departments.append(value)
+
+    return wards, departments
 
 
 @app.get("/oidc/login")
@@ -351,7 +428,13 @@ async def oidc_callback(request: Request):
         )
 
     ttl = settings.access_token_ttl_minutes
-    internal = create_access_token(sub=str(sub), roles=_map_roles(userinfo))
+    wards, departments = _map_scopes(userinfo)
+    internal = create_access_token(
+        sub=str(sub),
+        roles=_map_roles(userinfo),
+        wards=wards,
+        departments=departments,
+    )
     body = {
         "access_token": internal,
         "token_type": "bearer",
@@ -360,6 +443,9 @@ async def oidc_callback(request: Request):
             "sub": sub,
             "email": userinfo.get("email"),
             "name": userinfo.get("name"),
+            # Surfaced so the console can show the clinician their own scope.
+            "wards": wards,
+            "departments": departments,
         },
     }
     response = JSONResponse(body)

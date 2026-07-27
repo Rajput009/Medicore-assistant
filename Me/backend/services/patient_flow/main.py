@@ -371,10 +371,26 @@ async def claim_next(
     return body
 
 
-@app.post("/queue/{patient_id}/complete", tags=["queue"])
+@app.post("/queue/{patient_id}/complete", response_model=None, tags=["queue"])
 async def complete(
-    patient_id: str, repo: Repo, principal: ClinicalUser
-) -> dict[str, Any]:
+    patient_id: str,
+    repo: Repo,
+    principal: ClinicalUser,
+    request: Request,
+):
+    """Mark a triage entry completed.
+
+    Honours ``Idempotency-Key``. Without it a retry after a lost response
+    returns 404 ("no active queue entry") even though the completion
+    succeeded, which reads to the clinician as if the patient vanished.
+    """
+    route = f"POST /queue/{patient_id}/complete"
+    idem_key = extract_idempotency_key(request)
+    if idem_key:
+        hit = idem_lookup(principal.sub, route, idem_key)
+        if hit is not None:
+            return replay_response(hit[0], hit[1])
+
     try:
         doc = await repo.complete(patient_id)
     except NotFoundError as exc:
@@ -383,4 +399,8 @@ async def complete(
         ) from exc
     except PyMongoError as exc:
         raise _unavailable(exc) from exc
-    return {"ok": True, "item": doc}
+
+    body = {"ok": True, "item": doc}
+    if idem_key:
+        idem_store(principal.sub, route, idem_key, 200, body)
+    return body

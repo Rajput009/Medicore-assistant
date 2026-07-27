@@ -6,6 +6,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import { api } from '../api/client'
+import { retryWithIdempotency } from '../api/retry'
 import type { Bed, QueueItem } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { useAsyncData } from '../hooks/useAsync'
@@ -57,6 +58,7 @@ export const WorklistPage: React.FC = () => {
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionOk, setActionOk] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [retryNotice, setRetryNotice] = useState<string | null>(null)
   const [recent, setRecent] = useState<RecentPatient[]>(() => loadRecentPatients())
 
   const loading = beds.state.status === 'loading' || queue.state.status === 'loading'
@@ -101,12 +103,23 @@ export const WorklistPage: React.FC = () => {
   const onClaim = async () => {
     setActionError(null)
     setActionOk(null)
+    setRetryNotice(null)
     setBusy(true)
     try {
-      const res = await api.claimNext(claimDept)
+      // One key for the whole intent: a retry after a dropped response
+      // replays the original claim instead of grabbing a second patient.
+      const res = await retryWithIdempotency(
+        (key) => api.claimNext(claimDept, null, undefined, key),
+        {
+          onRetry: ({ attempt }) =>
+            setRetryNotice(`Connection problem — retrying (attempt ${attempt + 1})…`),
+        },
+      )
+      setRetryNotice(null)
       setActionOk(`Claimed ${res.item.patient_id} in ${claimDept}.`)
       reload()
     } catch (err) {
+      setRetryNotice(null)
       setActionError(err instanceof Error ? err.message : 'Claim failed')
     } finally {
       setBusy(false)
@@ -116,12 +129,21 @@ export const WorklistPage: React.FC = () => {
   const onComplete = async (patientId: string) => {
     setActionError(null)
     setActionOk(null)
+    setRetryNotice(null)
     setBusy(true)
     try {
-      await api.completeQueue(patientId)
+      await retryWithIdempotency(
+        (key) => api.completeQueue(patientId, null, undefined, key),
+        {
+          onRetry: ({ attempt }) =>
+            setRetryNotice(`Connection problem — retrying (attempt ${attempt + 1})…`),
+        },
+      )
+      setRetryNotice(null)
       setActionOk(`Completed ${patientId}.`)
       reload()
     } catch (err) {
+      setRetryNotice(null)
       setActionError(err instanceof Error ? err.message : 'Complete failed')
     } finally {
       setBusy(false)
@@ -173,6 +195,11 @@ export const WorklistPage: React.FC = () => {
             Refresh
           </button>
         </div>
+        {retryNotice && (
+          <div style={{ marginTop: 10 }}>
+            <Alert kind="info">{retryNotice}</Alert>
+          </div>
+        )}
         {actionError && (
           <div style={{ marginTop: 10 }}>
             <Alert kind="error">{actionError}</Alert>

@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 from fastapi import HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
 from starlette.responses import JSONResponse, Response
 
 from backend.common.redis_client import get_redis
@@ -80,16 +81,26 @@ def lookup(principal: str, route: str, key: str) -> tuple[int, Any] | None:
         hit = _local.get(ck)
         if not hit:
             return None
-        exp, status_code, body_json = hit
+        exp, status_code, payload_json = hit
         if exp <= now:
             _local.pop(ck, None)
             return None
-        return status_code, json.loads(body_json)
+        # ``store`` writes the same {"status", "body"} envelope on both paths,
+        # so unwrap it here too. Returning the envelope made an in-process
+        # replay answer {"status": 200, "body": {...}} instead of the original
+        # body — a silently different response shape whenever Redis was off.
+        return status_code, json.loads(payload_json)["body"]
 
 
 def store(principal: str, route: str, key: str, status_code: int, body: Any) -> None:
     ck = _composite_key(principal, route, key)
-    payload = json.dumps({"status": status_code, "body": body}, default=str)
+    # Encode exactly as FastAPI would, so a replay is byte-for-byte the
+    # response the client missed. Plain ``default=str`` renders datetimes as
+    # "2026-07-27 20:11:10+00:00" while FastAPI emits ISO-8601 with a "T" —
+    # a retry would then hand the caller a different timestamp format than
+    # the original, which any client parsing dates would choke on.
+    ck_body = jsonable_encoder(body)
+    payload = json.dumps({"status": status_code, "body": ck_body}, default=str)
     client = get_redis()
     if client is not None:
         try:

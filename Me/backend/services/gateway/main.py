@@ -10,8 +10,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
+from backend.common.app import create_service_app
 from backend.common.cache import (
     close_pool,
     get_cached,
@@ -24,11 +25,24 @@ from backend.common.cache import (
 from backend.common.cache import (
     ping as cache_ping,
 )
-from backend.common.app import create_service_app
 from backend.common.config import settings
 from backend.common.fhir_client import FHIRError, default_fhir_client
+from backend.common.idempotency import (
+    extract_idempotency_key,
+    replay_response,
+)
+from backend.common.idempotency import (
+    lookup as idem_lookup,
+)
+from backend.common.idempotency import (
+    store as idem_store,
+)
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
+from backend.services.gateway.observations import (
+    CONSCIOUSNESS_LABELS,
+    build_vitals_bundle,
+)
 
 fhir = default_fhir_client()
 
@@ -38,6 +52,10 @@ CACHE_TTL = {
     "Encounter": 300,
     "Observation": 60,
     "MedicationRequest": 300,
+    # Safety-critical context. Allergies change rarely but a stale allergy
+    # list is the kind of error that harms someone, so it gets a short TTL.
+    "AllergyIntolerance": 120,
+    "Condition": 300,
 }
 
 # Only these resource types may be targeted by cache invalidation, so a path
@@ -132,6 +150,7 @@ ALLOWED_SEARCH_PARAMS: frozenset[str] = frozenset(
         "name", "family", "given", "birthdate", "gender",
         "status", "category", "code", "date", "encounter",
         "class", "type", "intent", "authoredon", "requester",
+        "clinical-status", "verification-status", "criticality",
         "_count", "_sort", "_include", "_lastUpdated", "page",
     }
 )
@@ -318,6 +337,34 @@ async def get_observation(
     return await _read("Observation", obs_id)
 
 
+@app.get("/fhir/allergyintolerance/search")
+async def search_allergies(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("AllergyIntolerance", _clean_params(request))
+
+
+@app.get("/fhir/allergyintolerance/{allergy_id}")
+async def get_allergy(
+    allergy_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("AllergyIntolerance", allergy_id)
+
+
+@app.get("/fhir/condition/search")
+async def search_conditions(
+    request: Request, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _search("Condition", _clean_params(request))
+
+
+@app.get("/fhir/condition/{condition_id}")
+async def get_condition(
+    condition_id: str, user: User = Depends(clinician_or_admin)
+) -> dict[str, Any]:
+    return await _read("Condition", condition_id)
+
+
 @app.get("/fhir/medicationrequest/search")
 async def search_medication_requests(
     request: Request, user: User = Depends(clinician_or_admin)
@@ -330,6 +377,139 @@ async def get_medication_request(
     med_id: str, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
     return await _read("MedicationRequest", med_id)
+
+
+# --------------------------------------------------------------------------
+# Observation write (vitals capture)
+#
+# The only write path in the gateway. Everything else is read-only, so this
+# endpoint is deliberately narrow: it accepts validated vital signs and emits
+# properly coded Observations, rather than proxying arbitrary FHIR bodies. A
+# generic passthrough would let any caller write any resource, with no way to
+# audit what was actually recorded.
+# --------------------------------------------------------------------------
+
+
+class VitalsWrite(BaseModel):
+    """Bounds mirror the CDS service, so a value rejected for scoring can
+    never be persisted either."""
+
+    patient_id: str = Field(..., min_length=1, max_length=64)
+    respiratory_rate: float | None = Field(default=None, gt=0, le=80)
+    spo2: float | None = Field(default=None, ge=1, le=100)
+    temperature: float | None = Field(default=None, ge=25, le=45)
+    systolic_bp: float | None = Field(default=None, gt=0, le=300)
+    pulse: float | None = Field(default=None, gt=0, le=300)
+    consciousness: str | None = Field(default=None, max_length=1)
+    news2_score: int | None = Field(default=None, ge=0, le=25)
+    encounter_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("consciousness")
+    @classmethod
+    def _valid_acvpu(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        upper = v.strip().upper()
+        if upper not in CONSCIOUSNESS_LABELS:
+            raise ValueError(
+                f"consciousness must be one of {sorted(CONSCIOUSNESS_LABELS)}"
+            )
+        return upper
+
+
+@app.post("/fhir/observation", status_code=status.HTTP_201_CREATED, tags=["fhir"])
+async def create_observations(
+    payload: VitalsWrite,
+    request: Request,
+    user: User = Depends(clinician_or_admin),
+) -> dict[str, Any]:
+    """Persist a set of vitals as FHIR Observations.
+
+    Retries are deduplicated with ``Idempotency-Key``: without it, a lost
+    response would leave the clinician unsure whether to re-enter the reading,
+    and re-entering would double-file it.
+    """
+    _validate_id(payload.patient_id)
+    if payload.encounter_id:
+        _validate_id(payload.encounter_id)
+
+    vitals = {
+        key: value
+        for key, value in (
+            ("respiratory_rate", payload.respiratory_rate),
+            ("spo2", payload.spo2),
+            ("temperature", payload.temperature),
+            ("systolic_bp", payload.systolic_bp),
+            ("pulse", payload.pulse),
+        )
+        if value is not None
+    }
+    if not vitals and payload.consciousness is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one vital sign is required",
+        )
+
+    route = "POST /fhir/observation"
+    idem_key = extract_idempotency_key(request)
+    if idem_key:
+        hit = idem_lookup(user.sub, route, idem_key)
+        if hit is not None:
+            return replay_response(hit[0], hit[1])
+
+    resources = build_vitals_bundle(
+        vitals,
+        payload.patient_id,
+        consciousness=payload.consciousness,
+        news2_score=payload.news2_score,
+        encounter_id=payload.encounter_id,
+        performer=user.sub,
+    )
+
+    created: list[dict[str, str]] = []
+    for resource in resources:
+        try:
+            result = await fhir.create("Observation", resource)
+        except FHIRError as exc:
+            logger.warning(
+                "upstream FHIR observation write failed",
+                extra={
+                    "status_code": exc.status_code,
+                    "error_type": type(exc).__name__,
+                    # Never log the resource: it carries PHI.
+                    "written": len(created),
+                },
+            )
+            # Partial success is reported rather than hidden: the clinician
+            # needs to know some readings were filed before deciding whether
+            # to re-enter the rest.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Upstream clinical data service rejected the write "
+                    f"after saving {len(created)} of {len(resources)} observations"
+                ),
+            ) from exc
+        created.append(
+            {
+                "id": str(result.get("id") or ""),
+                "code": (result.get("code") or {}).get("text")
+                or (resource.get("code") or {}).get("text")
+                or "",
+            }
+        )
+
+    # New observations make any cached search for this patient stale at once.
+    # Without this the clinician saves a reading and then cannot see it.
+    try:
+        await invalidate_cache("Observation", payload.patient_id)
+    except Exception:
+        logger.warning("observation cache invalidation failed", exc_info=True)
+
+    body = {"ok": True, "created": created, "count": len(created)}
+    if idem_key:
+        idem_store(user.sub, route, idem_key, 201, body)
+    return body
 
 
 # --------------------------------------------------------------------------
