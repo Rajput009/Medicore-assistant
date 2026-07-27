@@ -428,3 +428,110 @@ async def complete(
     if idem_key:
         idem_store(principal.sub, route, idem_key, 200, body)
     return body
+
+
+# --------------------------------------------------------------------------
+# Handoff notes (SBAR)
+#
+# Shift-handoff notes lived in the browser's sessionStorage, which meant a
+# clinician who closed the tab lost the handoff they had just written, and the
+# incoming shift could not read it at all — the one thing a handoff note is
+# for. These persist them server-side.
+#
+# Storage choice: patient-flow's Mongo, not a FHIR ``Communication``.
+#   * These are *working notes*, not the record of truth. Writing unverified
+#     free text into the hospital EHR would put it in the legal record and in
+#     front of every other system that reads from it.
+#   * The gateway's only FHIR write is coded Observations, deliberately narrow
+#     so what was written is always auditable. Free text does not fit that.
+#   * They belong to the same shift-workflow state (beds, triage) this service
+#     already owns.
+# Promoting a note into the EHR is a separate, explicit action — and should
+# stay one.
+#
+# Append-only: "what was I told at 07:00?" must remain answerable after
+# someone edits the note at 09:00.
+# --------------------------------------------------------------------------
+
+
+MAX_HANDOFF_LENGTH = 4000
+
+
+class HandoffWrite(BaseModel):
+    text: str = Field(..., min_length=1, max_length=MAX_HANDOFF_LENGTH)
+    encounter_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("text")
+    @classmethod
+    def _not_only_whitespace(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Handoff note cannot be blank")
+        return cleaned
+
+
+@app.get("/handoff/{patient_id}", tags=["handoff"])
+async def get_handoff(
+    patient_id: str, repo: Repo, principal: ClinicalUser
+) -> dict[str, Any]:
+    """The current handoff note for a patient, or null when none exists."""
+    try:
+        note = await repo.latest_handoff(patient_id)
+    except PyMongoError as exc:
+        raise _unavailable(exc) from exc
+    return {"patient_id": patient_id, "note": note}
+
+
+@app.get("/handoff/{patient_id}/history", tags=["handoff"])
+async def get_handoff_history(
+    patient_id: str,
+    repo: Repo,
+    principal: ClinicalUser,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Every version, newest first.
+
+    Append-only storage is only useful if the earlier versions can actually be
+    read back; this is that view.
+    """
+    try:
+        versions = await repo.handoff_history(patient_id, limit=limit)
+    except PyMongoError as exc:
+        raise _unavailable(exc) from exc
+    return {"patient_id": patient_id, "versions": versions, "count": len(versions)}
+
+
+@app.post("/handoff/{patient_id}", status_code=status.HTTP_201_CREATED, tags=["handoff"])
+async def save_handoff(
+    patient_id: str,
+    payload: HandoffWrite,
+    repo: Repo,
+    principal: ClinicalUser,
+    request: Request,
+) -> dict[str, Any]:
+    """Append a new version of the handoff note.
+
+    The author is taken from the verified token, never from the body: a note
+    that could claim to be from another clinician is worse than no note.
+    """
+    route = f"POST /handoff/{patient_id}"
+    idem_key = extract_idempotency_key(request)
+    if idem_key:
+        hit = idem_lookup(principal.sub, route, idem_key)
+        if hit is not None:
+            return replay_response(hit[0], hit[1])
+
+    try:
+        note = await repo.add_handoff(
+            patient_id,
+            payload.text,
+            author=principal.sub,
+            encounter_id=payload.encounter_id,
+        )
+    except PyMongoError as exc:
+        raise _unavailable(exc) from exc
+
+    body = {"ok": True, "note": note}
+    if idem_key:
+        idem_store(principal.sub, route, idem_key, 201, body)
+    return body

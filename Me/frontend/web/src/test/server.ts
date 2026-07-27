@@ -288,6 +288,68 @@ export const handlers = [
     })
   }),
 
+  /** Handoff notes: append-only server-side. */
+  http.get('/flow/handoff/:id', ({ params, request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      patient_id: params.id,
+      note: {
+        patient_id: params.id,
+        text: 'S - Situation: stored handoff from the previous shift',
+        author: 'dr.night',
+        encounter_id: null,
+        created_at: new Date(Date.now() - 3600_000).toISOString(),
+      },
+    })
+  }),
+
+  http.get('/flow/handoff/:id/history', ({ params, request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      patient_id: params.id,
+      versions: [
+        {
+          patient_id: params.id,
+          text: 'newer version',
+          author: 'dr.day',
+          created_at: new Date().toISOString(),
+        },
+        {
+          patient_id: params.id,
+          text: 'older version',
+          author: 'dr.night',
+          created_at: new Date(Date.now() - 7200_000).toISOString(),
+        },
+      ],
+      count: 2,
+    })
+  }),
+
+  http.post('/flow/handoff/:id', async ({ params, request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const body = (await request.json()) as { text?: string }
+    if (!body.text?.trim()) {
+      return HttpResponse.json({ detail: 'Handoff note cannot be blank' }, { status: 422 })
+    }
+    return HttpResponse.json(
+      {
+        ok: true,
+        note: {
+          patient_id: params.id,
+          text: body.text,
+          // Author comes from the session server-side, never the body.
+          author: 'test.user',
+          encounter_id: null,
+          created_at: new Date().toISOString(),
+        },
+      },
+      { status: 201 },
+    )
+  }),
+
   http.get('/flow/beds', ({ request }) => {
     const denied = requireAuth(request)
     if (denied) return denied

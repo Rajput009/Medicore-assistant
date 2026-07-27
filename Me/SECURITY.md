@@ -50,6 +50,7 @@ honest: “designed” is not the same as “proven in your cluster”.
 | Ward/dept scope | JWT claims `wards` / `departments` | unit tests |
 | Accounting of disclosures | queryable audit index + admin search | real-Postgres + endpoint tests |
 | Emergency access | break-glass: scope-only override, reason required, indexed | unit + live stack |
+| Handoff notes | append-only, author from token, audited as PHI | unit + integration tests |
 | L3/L4 isolation | NetworkPolicy default-deny | YAML residual tests |
 | Mesh mTLS (optional) | Istio STRICT manifests | YAML present; needs mesh |
 | FQDN egress (optional) | Cilium `toFQDNs` | YAML present; needs Cilium |
@@ -102,6 +103,9 @@ and impact assessment.
 - Idempotency keys TTL 24h.
 - Revocation entries TTL = token remaining lifetime.
 - Audit logs: retain per organisational policy in a HIPAA-capable sink.
+- Handoff notes: working notes, not the medical record, so they are **not**
+  retained for the six years the audit trail is. `purge_handoffs(days)` sweeps
+  them; retaining PHI past its usefulness is its own risk.
 - Audit index (`audit_events`): `AUDIT_RETENTION_DAYS`, default 2555 (seven
   years, comfortably over the six required by 164.316(b)(2)(i)). `0` disables
   purging. Probe traffic (`/health`, `/ready`, `/metrics`) is never indexed.

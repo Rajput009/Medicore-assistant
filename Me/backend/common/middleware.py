@@ -44,6 +44,7 @@ _FHIR_PATH = re.compile(r"^/fhir/(?P<type>[^/]+)/(?P<id>[^/]+)")
 _CACHE_PATH = re.compile(r"^/cache/(?P<type>[^/]+)")
 _QUEUE_PATH = re.compile(r"^/queue/(?P<id>[^/]+)")
 _BED_PATH = re.compile(r"^/beds/(?P<id>[^/]+)")
+_HANDOFF_PATH = re.compile(r"^/handoff/(?P<id>[^/]+)")
 
 # Query parameters whose values identify a patient and must be audited.
 _IDENTIFYING_PARAMS = ("patient", "subject", "identifier")
@@ -204,6 +205,11 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         elif match := _BED_PATH.match(path):
             info["resource_type"] = "Bed"
             info["bed_id"] = match.group("id")
+        elif match := _HANDOFF_PATH.match(path):
+            # A handoff note is clinical free text about a named patient, so
+            # reading or writing one is an access to that patient's record.
+            info["resource_type"] = "HandoffNote"
+            info["patient_ref"] = self._reference(match.group("id"))
 
         # A search filtered by patient is still an access to that patient.
         for name in _IDENTIFYING_PARAMS:
@@ -224,6 +230,10 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
             return "/queue/{id}"
         if _BED_PATH.match(path):
             return "/beds/{id}"
+        if match := _HANDOFF_PATH.match(path):
+            # Keep the /history suffix distinguishable from a plain read.
+            suffix = "/history" if path.rstrip("/").endswith("/history") else ""
+            return f"/handoff/{{id}}{suffix}"
         return path
 
     async def dispatch(self, request: Request, call_next) -> Response:

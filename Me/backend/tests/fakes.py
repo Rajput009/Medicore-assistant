@@ -28,6 +28,8 @@ class FakePatientFlowRepository:
                 "patient_id": None,
             }
         self.queue_store: list[dict[str, Any]] = []
+        # Append-only, mirroring the real collection.
+        self.handoff_store: list[dict[str, Any]] = []
         self.fail_with: Exception | None = None
         self.ping_error: Exception | None = None
 
@@ -155,6 +157,63 @@ class FakePatientFlowRepository:
         item["status"] = "completed"
         item["completed_at"] = _utcnow()
         return dict(item)
+
+    # -- handoff notes -----------------------------------------------------
+
+    async def add_handoff(
+        self,
+        patient_id: str,
+        text: str,
+        author: str,
+        *,
+        encounter_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._guard()
+        doc = {
+            "patient_id": patient_id,
+            "text": text,
+            "author": author,
+            "encounter_id": encounter_id,
+            # Monotonic within a test even when writes land in the same tick,
+            # so "newest wins" is deterministic rather than clock-dependent.
+            "created_at": _utcnow(),
+            "_seq": len(self.handoff_store),
+        }
+        self.handoff_store.append(doc)
+        return {k: v for k, v in doc.items() if k != "_seq"}
+
+    def _handoffs_for(self, patient_id: str) -> list[dict[str, Any]]:
+        rows = [n for n in self.handoff_store if n["patient_id"] == patient_id]
+        return sorted(rows, key=lambda n: n["_seq"], reverse=True)
+
+    async def latest_handoff(self, patient_id: str) -> dict[str, Any] | None:
+        self._guard()
+        rows = self._handoffs_for(patient_id)
+        if not rows:
+            return None
+        return {k: v for k, v in rows[0].items() if k != "_seq"}
+
+    async def handoff_history(
+        self, patient_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        self._guard()
+        return [
+            {k: v for k, v in n.items() if k != "_seq"}
+            for n in self._handoffs_for(patient_id)[:limit]
+        ]
+
+    async def purge_handoffs(self, older_than_days: int) -> int:
+        self._guard()
+        if older_than_days <= 0:
+            return 0
+        from datetime import timedelta
+
+        cutoff = _utcnow() - timedelta(days=older_than_days)
+        before = len(self.handoff_store)
+        self.handoff_store = [
+            n for n in self.handoff_store if n["created_at"] >= cutoff
+        ]
+        return before - len(self.handoff_store)
 
     async def ping(self) -> None:
         if self.ping_error:

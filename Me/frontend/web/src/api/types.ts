@@ -248,3 +248,23 @@ export type AuthUser = {
   wards: string[]
   departments: string[]
 }
+
+/** A persisted shift-handoff (SBAR) note. Append-only server-side. */
+export type HandoffNote = {
+  patient_id: string
+  text: string
+  author: string
+  encounter_id?: string | null
+  created_at: string
+}
+
+export type HandoffResponse = {
+  patient_id: string
+  note: HandoffNote | null
+}
+
+export type HandoffHistoryResponse = {
+  patient_id: string
+  versions: HandoffNote[]
+  count: number
+}

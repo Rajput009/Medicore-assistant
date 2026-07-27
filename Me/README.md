@@ -377,6 +377,29 @@ Every use is logged at WARNING and flagged in the audit index. Review with
 filter in the console; the per-patient accessor summary counts overrides per
 clinician. See SECURITY.md for the full rationale.
 
+## Handoff notes (SBAR)
+
+Shift-handoff notes are persisted server-side by patient-flow:
+
+- `GET /handoff/{patient_id}` — the current note (or `null`)
+- `GET /handoff/{patient_id}/history` — every version, newest first
+- `POST /handoff/{patient_id}` — append a new version
+
+**Append-only.** A note is a contemporaneous clinical communication, so "what
+was I told at 07:00?" must stay answerable after someone edits it at 09:00.
+Saving supersedes; it never overwrites.
+
+**Not the record of truth.** These are working notes that survive the shift —
+the hospital EHR remains authoritative. That is why they live in MediCore's own
+storage rather than being written to a FHIR `Communication`: unverified free
+text should not land in the legal record, and the gateway's only FHIR write is
+deliberately narrow (coded Observations) so what was written is always
+auditable. Promoting a note into the EHR is a separate, explicit action.
+
+The author is taken from the verified session, never from the request body.
+Reads and writes are audited against the patient like any other PHI access,
+and the note text itself is never logged.
+
 ## Clinical workflow notes
 
 **Ward / department scope.** Access tokens may carry `wards` and

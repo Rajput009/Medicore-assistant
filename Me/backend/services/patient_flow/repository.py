@@ -11,7 +11,7 @@ query, serialising all concurrent requests behind the slowest one.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
@@ -50,6 +50,7 @@ class PatientFlowRepository:
         self.db = db
         self.beds = db.beds
         self.queue = db.triage_queue
+        self.handoffs = db.handoff_notes
 
     # -- schema ------------------------------------------------------------
 
@@ -67,6 +68,12 @@ class PatientFlowRepository:
             [("status", ASCENDING), ("acuity", ASCENDING), ("created_at", ASCENDING)]
         )
         await self.queue.create_index([("dept", ASCENDING), ("status", ASCENDING)])
+        # Handoff notes are append-only and read newest-first per patient.
+        await self.handoffs.create_index(
+            [("patient_id", ASCENDING), ("created_at", DESCENDING)]
+        )
+        # Retention sweeps delete by age across all patients.
+        await self.handoffs.create_index([("created_at", ASCENDING)])
 
     async def seed_beds(self, beds: list[dict[str, Any]]) -> int:
         """Insert any missing beds. Existing rows are left untouched.
@@ -240,3 +247,65 @@ def create_client() -> AsyncIOMotorClient:
         retryWrites=True,
         tz_aware=True,
     )
+
+    # -- handoff notes -----------------------------------------------------
+    #
+    # Shift-handoff SBAR notes. Deliberately **append-only**: a handoff note
+    # is a contemporaneous clinical communication, and the question "what was
+    # I told at 07:00?" must stay answerable after someone edits it at 09:00.
+    # An update-in-place model would silently destroy that.
+    #
+    # These are *not* the record of truth — that is the hospital EHR. They are
+    # working notes that survive the shift, which is exactly the gap
+    # sessionStorage left: a clinician who closed the tab lost the handoff
+    # they had just written.
+
+    async def add_handoff(
+        self,
+        patient_id: str,
+        text: str,
+        author: str,
+        *,
+        encounter_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a new version of the handoff note for ``patient_id``."""
+        doc = {
+            "patient_id": patient_id,
+            "text": text,
+            "author": author,
+            "encounter_id": encounter_id,
+            "created_at": utcnow(),
+        }
+        await self.handoffs.insert_one(doc)
+        return _strip_id(doc)
+
+    async def latest_handoff(self, patient_id: str) -> dict[str, Any] | None:
+        """The current note: newest version wins."""
+        doc = await self.handoffs.find_one(
+            {"patient_id": patient_id}, sort=[("created_at", DESCENDING)]
+        )
+        return _strip_id(doc) if doc else None
+
+    async def handoff_history(
+        self, patient_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Every version, newest first — the audit view of the note."""
+        cursor = (
+            self.handoffs.find({"patient_id": patient_id})
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        return [_strip_id(doc) async for doc in cursor]
+
+    async def purge_handoffs(self, older_than_days: int) -> int:
+        """Delete notes past the retention window; 0 disables purging.
+
+        Working notes are not the medical record, so they are not kept for the
+        six years the audit trail is. Retaining PHI longer than it is useful
+        is its own risk.
+        """
+        if older_than_days <= 0:
+            return 0
+        cutoff = utcnow() - timedelta(days=older_than_days)
+        result = await self.handoffs.delete_many({"created_at": {"$lt": cutoff}})
+        return int(result.deleted_count)

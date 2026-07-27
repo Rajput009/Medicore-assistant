@@ -17,6 +17,9 @@ import type {
   FhirBundle,
   FhirResource,
   FhirResourceType,
+  HandoffHistoryResponse,
+  HandoffNote,
+  HandoffResponse,
   Health,
   QueueItem,
   QueueListResponse,
@@ -328,6 +331,55 @@ export const api = {
     return request<AuditAccessorsResponse>(
       `${BASE.gateway}/audit/patient/${encodeURIComponent(patientId)}/accessors`,
       { params: limit ? { limit } : {}, signal },
+    )
+  },
+
+  /** The current shift-handoff note for a patient, or null when none exists. */
+  getHandoff(
+    patientId: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<HandoffResponse> {
+    return request<HandoffResponse>(
+      `${BASE.patientFlow}/handoff/${encodeURIComponent(patientId)}`,
+      { signal },
+    )
+  },
+
+  /** Every version, newest first. Notes are append-only, never overwritten. */
+  getHandoffHistory(
+    patientId: string,
+    limit?: number,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<HandoffHistoryResponse> {
+    return request<HandoffHistoryResponse>(
+      `${BASE.patientFlow}/handoff/${encodeURIComponent(patientId)}/history`,
+      { params: limit ? { limit } : {}, signal },
+    )
+  },
+
+  /**
+   * Append a new version of the handoff note.
+   *
+   * The author is taken from the session server-side, never sent from here.
+   */
+  saveHandoff(
+    patientId: string,
+    text: string,
+    encounterId?: string | null,
+    _token?: string | null,
+    signal?: AbortSignal,
+    idempotencyKey?: string,
+  ): Promise<{ ok: boolean; note: HandoffNote }> {
+    return request<{ ok: boolean; note: HandoffNote }>(
+      `${BASE.patientFlow}/handoff/${encodeURIComponent(patientId)}`,
+      {
+        method: 'POST',
+        body: { text, ...(encounterId ? { encounter_id: encounterId } : {}) },
+        signal,
+        idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
+      },
     )
   },
 

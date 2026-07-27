@@ -12,13 +12,14 @@ import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { Bed, FhirResource, QueueItem, QueueListResponse } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
+import { describeError } from '../hooks/useAsync'
 import { summariseResource } from '../pages/FhirPage'
 import { Alert, Badge, Spinner } from '../ui/components'
 import { usePatientChart } from './PatientChartContext'
 import {
   clearHandoff,
   loadHandoff,
-  saveHandoff,
+  saveHandoff as saveLocalDraft,
   sbarTemplate,
 } from './handoffNotes'
 import {
@@ -114,6 +115,10 @@ export const PatientChartDrawer: React.FC = () => {
   const [data, setData] = useState<ChartData | null>(null)
   const [handoffText, setHandoffText] = useState('')
   const [handoffSaved, setHandoffSaved] = useState<string | null>(null)
+  const [handoffError, setHandoffError] = useState<string | null>(null)
+  const [handoffSaving, setHandoffSaving] = useState(false)
+  const [handoffAuthor, setHandoffAuthor] = useState<string | null>(null)
+  const [handoffAt, setHandoffAt] = useState<string | null>(null)
 
   useEffect(() => {
     if (!patientId) {
@@ -121,11 +126,35 @@ export const PatientChartDrawer: React.FC = () => {
       setError(null)
       setHandoffText('')
       setHandoffSaved(null)
+      setHandoffError(null)
+      setHandoffAuthor(null)
+      setHandoffAt(null)
       return
     }
-    const existing = loadHandoff(patientId)
-    setHandoffText(existing?.text ?? sbarTemplate(patientId))
+    // Show any unsent local draft immediately, then reconcile with the
+    // server: the incoming shift must see what the outgoing one saved, and a
+    // draft this tab never managed to send must not be silently discarded.
+    const draft = loadHandoff(patientId)
+    setHandoffText(draft?.text ?? sbarTemplate(patientId))
     setHandoffSaved(null)
+    setHandoffError(null)
+    setHandoffAuthor(null)
+    setHandoffAt(null)
+
+    const handoffAc = new AbortController()
+    void (async () => {
+      try {
+        const { note } = await api.getHandoff(patientId, null, handoffAc.signal)
+        if (handoffAc.signal.aborted || !note) return
+        setHandoffAuthor(note.author)
+        setHandoffAt(note.created_at)
+        // An unsent local draft is newer work than the stored note, so it
+        // wins the textarea; the saved version stays visible in the byline.
+        if (!draft) setHandoffText(note.text)
+      } catch {
+        /* No stored note, or flow is unreachable — the draft still works. */
+      }
+    })()
 
     const ac = new AbortController()
     setLoading(true)
@@ -207,7 +236,10 @@ export const PatientChartDrawer: React.FC = () => {
       }
     })()
 
-    return () => ac.abort()
+    return () => {
+      ac.abort()
+      handoffAc.abort()
+    }
   }, [patientId])
 
   // Escape closes the drawer.
@@ -435,8 +467,15 @@ export const PatientChartDrawer: React.FC = () => {
               <section className="chart-section">
                 <h3>Handoff note (SBAR)</h3>
                 <p className="muted" style={{ marginTop: 0, fontSize: '0.8rem' }}>
-                  Draft only — not saved to the EHR. Stored in this browser tab.
+                  Shared with the next shift. Working note — not part of the EHR.
+                  Saving keeps every earlier version.
                 </p>
+                {handoffAuthor && (
+                  <p className="muted" style={{ marginTop: 0, fontSize: '0.8rem' }}>
+                    Last saved by <strong className="mono">{handoffAuthor}</strong>
+                    {handoffAt ? ` · ${new Date(handoffAt).toLocaleString()}` : ''}
+                  </p>
+                )}
                 <textarea
                   className="handoff-textarea"
                   aria-label="SBAR handoff note"
@@ -451,13 +490,38 @@ export const PatientChartDrawer: React.FC = () => {
                   <button
                     type="button"
                     className="primary"
+                    disabled={handoffSaving}
                     onClick={() => {
                       if (!patientId) return
-                      saveHandoff(patientId, handoffText, user?.sub)
-                      setHandoffSaved('Saved in this tab.')
+                      setHandoffSaved(null)
+                      setHandoffError(null)
+                      setHandoffSaving(true)
+                      // Keep a local copy first: if the request fails, the
+                      // clinician's typing must not be the thing that is lost.
+                      saveLocalDraft(patientId, handoffText, user?.sub)
+                      void (async () => {
+                        try {
+                          const { note } = await api.saveHandoff(
+                            patientId,
+                            handoffText,
+                          )
+                          setHandoffAuthor(note.author)
+                          setHandoffAt(note.created_at)
+                          // Sent successfully, so the local draft is no longer
+                          // unsent work that needs to win on reopen.
+                          clearHandoff(patientId)
+                          setHandoffSaved('Saved for the next shift.')
+                        } catch (err) {
+                          setHandoffError(
+                            `${describeError(err).message} Your draft is kept in this tab.`,
+                          )
+                        } finally {
+                          setHandoffSaving(false)
+                        }
+                      })()
                     }}
                   >
-                    Save draft
+                    {handoffSaving ? 'Saving…' : 'Save handoff'}
                   </button>
                   <button
                     type="button"
@@ -476,7 +540,8 @@ export const PatientChartDrawer: React.FC = () => {
                       if (!patientId) return
                       clearHandoff(patientId)
                       setHandoffText(sbarTemplate(patientId))
-                      setHandoffSaved('Cleared.')
+                      setHandoffError(null)
+                      setHandoffSaved('Local draft cleared. Saved versions are kept.')
                     }}
                   >
                     Clear
@@ -485,6 +550,11 @@ export const PatientChartDrawer: React.FC = () => {
                 {handoffSaved && (
                   <div style={{ marginTop: 8 }}>
                     <Alert kind="success">{handoffSaved}</Alert>
+                  </div>
+                )}
+                {handoffError && (
+                  <div style={{ marginTop: 8 }}>
+                    <Alert kind="error">{handoffError}</Alert>
                   </div>
                 )}
               </section>
