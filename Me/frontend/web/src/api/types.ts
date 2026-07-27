@@ -144,6 +144,9 @@ export type AuditEvent = {
   user_agent?: string | null
   duration_ms?: number | null
   query_keys?: string[] | null
+  /** True when scope was overridden under break-glass. */
+  break_glass?: boolean | null
+  break_glass_reason?: string | null
 }
 
 export type AuditSearchResponse = {
@@ -167,6 +170,8 @@ export type AuditSearchParams = {
   service?: string
   since?: string
   until?: string
+  /** True to review only emergency overrides. */
+  break_glass?: boolean
   limit?: number
   offset?: number
 }
@@ -176,6 +181,8 @@ export type AuditAccessor = {
   actor_sub: string
   accesses: number
   denied: number
+  /** How many of those accesses used an emergency override. */
+  break_glass: number
   first_access: string
   last_access: string
 }

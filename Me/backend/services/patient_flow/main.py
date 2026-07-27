@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import PyMongoError
 
+from backend.common import audit_store
 from backend.common.app import create_service_app
 from backend.common.config import settings
 from backend.common.deps import (
@@ -30,6 +31,7 @@ from backend.common.idempotency import (
     replay_response,
     store as idem_store,
 )
+from backend.common.middleware import set_audit_sink
 
 from .repository import (
     ConflictError,
@@ -86,9 +88,25 @@ async def lifespan(app: FastAPI):
         # database recovers, and setup is re-attempted on the next start.
         logger.exception("startup database initialisation failed")
 
+    # Bed and triage access is PHI access, and the browser reaches this
+    # service directly (ingress routes /flow/* here, not through the gateway),
+    # so without its own sink every bed assignment and triage claim — including
+    # break-glass overrides — would be missing from audit search.
+    if settings.audit_index_enabled:
+        try:
+            await audit_store.start()
+            set_audit_sink(audit_store.submit)
+        except Exception as exc:
+            logger.warning(
+                "audit index unavailable; audit trail remains in the log stream",
+                extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+            )
+
     try:
         yield
     finally:
+        set_audit_sink(None)
+        await audit_store.stop()
         if owns_client and _client is not None:
             _client.close()
             _client = None
@@ -203,6 +221,9 @@ async def list_beds(
     ward: str | None = Query(default=None, max_length=64),
     occupied: bool | None = Query(default=None),
 ) -> list[Bed]:
+    # No break-glass on list endpoints. Emergency access is for reaching a
+    # specific patient right now; allowing it here would turn an override into
+    # bulk browsing of every ward, which is the abuse the scope exists to stop.
     require_ward_access(ward, principal)
     try:
         docs = await repo.list_beds(ward=ward, occupied=occupied)
@@ -252,7 +273,9 @@ async def update_bed(
             ) from exc
         except PyMongoError as exc:
             raise _unavailable(exc) from exc
-        require_ward_access(existing.get("ward"), principal)
+        # Break-glass permitted: assigning a specific bed for a deteriorating
+        # patient is exactly the emergency this exists for.
+        require_ward_access(existing.get("ward"), principal, request)
 
     route = f"PATCH /beds/{bed_id}"
     idem_key = extract_idempotency_key(request)
@@ -296,7 +319,7 @@ async def enqueue(
     principal: ClinicalUser,
     request: Request,
 ):
-    require_department_access(item.dept, principal)
+    require_department_access(item.dept, principal, request)
 
     route = "POST /queue"
     idem_key = extract_idempotency_key(request)
@@ -330,6 +353,7 @@ async def list_queue(
     limit: int = Query(default=25, ge=1, le=200),
     dept: str | None = Query(default=None, max_length=64),
 ) -> dict[str, Any]:
+    # Strict by design — see the note on list_beds.
     require_department_access(dept, principal)
     try:
         items = await repo.list_queue(limit=limit, dept=dept)
@@ -350,7 +374,7 @@ async def claim_next(
     dept: str = Query(..., max_length=64),
 ):
     """Atomically claim the most urgent waiting patient in a department."""
-    require_department_access(dept, principal)
+    require_department_access(dept, principal, request)
 
     route = f"POST /queue/claim?dept={dept}"
     idem_key = extract_idempotency_key(request)

@@ -54,6 +54,16 @@ const EventRow: React.FC<{ event: AuditEvent }> = ({ event }) => (
     <td className="mono">{event.actor_sub ?? <span className="muted">anonymous</span>}</td>
     <td>
       <span className="mono">{event.method}</span> <span className="mono">{event.path}</span>
+      {/* An override is the reviewer's whole reason for being here, so the
+          reason is shown inline rather than hidden behind a tooltip. */}
+      {event.break_glass && (
+        <div style={{ marginTop: 4 }}>
+          <Badge tone="warn">break-glass</Badge>{' '}
+          {event.break_glass_reason && (
+            <span className="muted">{event.break_glass_reason}</span>
+          )}
+        </div>
+      )}
     </td>
     <td>
       <Badge tone={outcomeTone(event.outcome)}>{event.outcome ?? '—'}</Badge>
@@ -70,6 +80,7 @@ export const AuditSearchPanel: React.FC = () => {
   const [patient, setPatient] = useState('')
   const [actor, setActor] = useState('')
   const [outcome, setOutcome] = useState<AuditOutcome | ''>('')
+  const [overridesOnly, setOverridesOnly] = useState(false)
   const [offset, setOffset] = useState(0)
   // The identifier the current results belong to, so paging cannot drift onto
   // a different patient after the field is edited but not re-submitted.
@@ -81,6 +92,7 @@ export const AuditSearchPanel: React.FC = () => {
         patient: patient.trim() || undefined,
         actor: actor.trim() || undefined,
         outcome: outcome || undefined,
+        break_glass: overridesOnly ? true : undefined,
         limit: PAGE_SIZE,
         offset: nextOffset,
       },
@@ -167,6 +179,18 @@ export const AuditSearchPanel: React.FC = () => {
             </Field>
           </div>
 
+          <div className="field">
+            <label htmlFor="audit-break-glass" style={{ display: 'flex', gap: 8 }}>
+              <input
+                id="audit-break-glass"
+                type="checkbox"
+                checked={overridesOnly}
+                onChange={(e) => setOverridesOnly(e.target.checked)}
+              />
+              <span>Emergency overrides only</span>
+            </label>
+          </div>
+
           <div>
             <button type="submit" disabled={events.state.status === 'loading'}>
               {events.state.status === 'loading' ? (
@@ -205,6 +229,7 @@ export const AuditSearchPanel: React.FC = () => {
                       <th scope="col">Clinician</th>
                       <th scope="col">Accesses</th>
                       <th scope="col">Denied</th>
+                      <th scope="col">Overrides</th>
                       <th scope="col">First access</th>
                       <th scope="col">Last access</th>
                     </tr>
@@ -217,6 +242,13 @@ export const AuditSearchPanel: React.FC = () => {
                         <td>
                           {a.denied > 0 ? (
                             <Badge tone="err">{a.denied}</Badge>
+                          ) : (
+                            <span className="muted">0</span>
+                          )}
+                        </td>
+                        <td>
+                          {a.break_glass > 0 ? (
+                            <Badge tone="warn">{a.break_glass}</Badge>
                           ) : (
                             <span className="muted">0</span>
                           )}

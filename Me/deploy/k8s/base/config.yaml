@@ -31,6 +31,8 @@ data:
   # Queryable audit index (Postgres). Writes are queued off the request path;
   # alert on the dropped/failed counters exposed by GET /audit/stats.
   AUDIT_INDEX_ENABLED: "true"
+  # Emergency scope override; every use is logged at WARNING and indexed.
+  BREAK_GLASS_ENABLED: "true"
   # Six-year retention per HIPAA 164.316(b)(2)(i).
   AUDIT_RETENTION_DAYS: "2555"
   # Shared rate-limit + token denylist across replicas.

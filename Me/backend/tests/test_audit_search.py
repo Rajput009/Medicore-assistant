@@ -168,6 +168,52 @@ class TestSchema:
         run(audit.ensure_schema())
         run(audit.ensure_schema())
 
+    def test_upgrades_a_pre_existing_table_in_place(self, audit):
+        """A deployed database already has audit_events without the
+        break-glass columns. Upgrading must not require dropping audit
+        history, which would itself be a compliance failure.
+        """
+
+        async def simulate_old_deployment():
+            import backend.common.cache as cache
+
+            pool = await cache.init_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DROP TABLE IF EXISTS audit_events")
+                # The v1 shape, before break-glass existed.
+                await conn.execute(
+                    """
+                    CREATE TABLE audit_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        ts TIMESTAMP WITH TIME ZONE NOT NULL,
+                        request_id TEXT, service TEXT, actor_sub TEXT,
+                        actor_roles TEXT[], method TEXT NOT NULL,
+                        path TEXT NOT NULL, status INTEGER, outcome TEXT,
+                        resource_type TEXT, resource_ref TEXT,
+                        patient_ref TEXT, bed_id TEXT, client_ip TEXT,
+                        user_agent TEXT, duration_ms DOUBLE PRECISION,
+                        query_keys TEXT[]
+                    );
+                    """
+                )
+                # A historical row that must survive the upgrade.
+                await conn.execute(
+                    "INSERT INTO audit_events (ts, method, path, actor_sub) "
+                    "VALUES (now(), 'GET', '/fhir/patient/{id}', 'dr.legacy')"
+                )
+
+        run(simulate_old_deployment())
+        run(audit.ensure_schema())
+
+        # Old rows are intact and default to "not an override".
+        legacy = run(audit.search(actor="dr.legacy"))
+        assert legacy["total"] == 1
+        assert legacy["items"][0]["break_glass"] is False
+
+        # And new writes work against the upgraded table.
+        insert(audit, record(sub="dr.new", break_glass=True, break_glass_reason="x" * 12))
+        assert run(audit.search(break_glass=True))["total"] == 1
+
     def test_denied_index_is_partial(self, audit):
         """A full index on outcome would be mostly dead weight; denied rows
         are the small, high-signal slice worth indexing."""
@@ -193,10 +239,23 @@ class TestSchema:
 class TestRowProjection:
     def test_maps_every_column(self, audit):
         row = audit.row_from_record(record())
-        assert len(row) == 17
+        assert len(row) == 19
         assert row[3] == "dr.smith"
         assert row[4] == ["clinician"]
         assert row[7] == 200
+
+    def test_break_glass_defaults_to_false(self, audit):
+        """A missing flag must never read as an override."""
+        row = audit.row_from_record(record())
+        assert row[17] is False
+        assert row[18] is None
+
+    def test_break_glass_is_projected(self, audit):
+        row = audit.row_from_record(
+            record(break_glass=True, break_glass_reason="Arrest in bay 4")
+        )
+        assert row[17] is True
+        assert row[18] == "Arrest in bay 4"
 
     def test_roles_string_is_coerced_to_array(self, audit):
         """IdPs emit roles as a list or a delimited string."""
@@ -490,6 +549,26 @@ class TestSearch:
         insert(audit, *[record() for _ in range(4)])
         assert run(audit.search())["total"] == 4
 
+    def test_break_glass_filter_isolates_overrides(self, audit):
+        """'Show me every emergency override' is the review query."""
+        insert(
+            audit,
+            record(sub="dr.normal"),
+            record(
+                sub="dr.emergency",
+                break_glass=True,
+                break_glass_reason="Arrest in bay 4",
+            ),
+        )
+        only = run(audit.search(break_glass=True))
+        assert only["total"] == 1
+        assert only["items"][0]["actor_sub"] == "dr.emergency"
+        assert only["items"][0]["break_glass_reason"] == "Arrest in bay 4"
+
+        assert run(audit.search(break_glass=False))["total"] == 1
+        # Unset means "either", not "non-override".
+        assert run(audit.search())["total"] == 2
+
 
 # ---------------------------------------------------------------------------
 # "Who viewed MRN-X?" — the summarised answer
@@ -572,6 +651,20 @@ class TestAccessorSummary:
         )
         rows = run(audit.actors_for_subject("sha256:x"))
         assert [r["actor_sub"] for r in rows] == ["dr.a"]
+
+    def test_counts_break_glass_overrides_per_clinician(self, audit):
+        """Whether someone reached this chart by override is a first-order
+        question about their access, not a footnote."""
+        insert(
+            audit,
+            record(sub="dr.emergency", patient_ref="sha256:x", break_glass=True),
+            record(sub="dr.emergency", patient_ref="sha256:x"),
+            record(sub="dr.routine", patient_ref="sha256:x"),
+        )
+        rows = {r["actor_sub"]: r for r in run(audit.actors_for_subject("sha256:x"))}
+        assert rows["dr.emergency"]["break_glass"] == 1
+        assert rows["dr.emergency"]["accesses"] == 2
+        assert rows["dr.routine"]["break_glass"] == 0
 
     def test_unknown_subject_returns_empty(self, audit):
         assert run(audit.actors_for_subject("sha256:nobody")) == []

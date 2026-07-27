@@ -354,6 +354,29 @@ curl -H "Authorization: Bearer <admin_token>" \
 
 Both are also available in the console under **Administration**.
 
+## Break-glass (emergency access)
+
+A clinician scoped to ward A who finds a ward-B patient arresting needs the
+chart *now*. Send a reason and the scope check is overridden:
+
+```bash
+curl -X PATCH -H "Authorization: Bearer <clinician_token>" \
+  -H "X-Break-Glass-Reason: Cardiac arrest in ICU bay 4, covering clinician unavailable" \
+  -H "Content-Type: application/json" \
+  -d '{"occupied": true, "patient_id": "MRN-123"}' \
+  "http://localhost:8082/beds/ICU-001"
+```
+
+It widens **scope, never role** — a `viewer` stays a viewer, and nobody
+becomes `admin`. The reason is mandatory and must be substantive; a trivial
+one is rejected (400) rather than accepted and logged. List endpoints refuse
+it, so an override cannot become cross-ward browsing.
+
+Every use is logged at WARNING and flagged in the audit index. Review with
+`GET /audit/search?break_glass=true` or the **Emergency overrides only**
+filter in the console; the per-patient accessor summary counts overrides per
+clinician. See SECURITY.md for the full rationale.
+
 ## Clinical workflow notes
 
 **Ward / department scope.** Access tokens may carry `wards` and

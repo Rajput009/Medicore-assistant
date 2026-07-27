@@ -83,9 +83,20 @@ CREATE TABLE IF NOT EXISTS audit_events (
     client_ip    TEXT,
     user_agent   TEXT,
     duration_ms  DOUBLE PRECISION,
-    query_keys   TEXT[]
+    query_keys   TEXT[],
+    break_glass  BOOLEAN NOT NULL DEFAULT false,
+    break_glass_reason TEXT
 );
 """
+
+# Columns added after the table first shipped. Applied with IF NOT EXISTS so an
+# existing deployment upgrades in place rather than needing the audit history
+# dropped and recreated.
+_MIGRATIONS = (
+    "ALTER TABLE audit_events "
+    "ADD COLUMN IF NOT EXISTS break_glass BOOLEAN NOT NULL DEFAULT false;",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS break_glass_reason TEXT;",
+)
 
 # Every index below backs a question an investigator actually asks. Without
 # them "who viewed MRN-X" is a sequential scan over the whole history.
@@ -101,15 +112,20 @@ _INDEXES = (
     # the table, so they get a partial index.
     "CREATE INDEX IF NOT EXISTS audit_events_denied_idx "
     "ON audit_events (ts DESC) WHERE outcome = 'denied';",
+    # Break-glass overrides are rarer still and are reviewed as a set
+    # ("show me every emergency override this month"), so the same applies.
+    "CREATE INDEX IF NOT EXISTS audit_events_break_glass_idx "
+    "ON audit_events (ts DESC) WHERE break_glass;",
 )
 
 _INSERT = """
 INSERT INTO audit_events (
     ts, request_id, service, actor_sub, actor_roles, method, path, status,
     outcome, resource_type, resource_ref, patient_ref, bed_id, client_ip,
-    user_agent, duration_ms, query_keys
+    user_agent, duration_ms, query_keys, break_glass, break_glass_reason
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+    $17, $18, $19
 )
 """
 
@@ -131,6 +147,8 @@ _COLUMNS = (
     "user_agent",
     "duration_ms",
     "query_keys",
+    "break_glass",
+    "break_glass_reason",
 )
 
 
@@ -181,6 +199,8 @@ def row_from_record(record: dict[str, Any], *, now: datetime | None = None) -> t
         _text(record.get("user_agent"), _MAX_USER_AGENT),
         float(duration) if isinstance(duration, (int, float)) else None,
         _string_list(record.get("query_keys")),
+        bool(record.get("break_glass", False)),
+        _text(record.get("break_glass_reason"), 500),
     )
 
 
@@ -390,6 +410,10 @@ async def ensure_schema() -> None:
     pool = await init_pool()
     async with pool.acquire() as conn:
         await conn.execute(_DDL)
+        # Bring an already-deployed table up to the current shape before the
+        # indexes, which may reference the newer columns.
+        for statement in _MIGRATIONS:
+            await conn.execute(statement)
         for statement in _INDEXES:
             await conn.execute(statement)
 
@@ -515,6 +539,7 @@ async def search(
     service: str | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
+    break_glass: bool | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -553,6 +578,8 @@ async def search(
         add("ts >= ${n}", since)
     if until:
         add("ts <= ${n}", until)
+    if break_glass is not None:
+        add("break_glass = ${n}", break_glass)
 
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
@@ -606,7 +633,8 @@ async def actors_for_subject(subject_ref: str, *, limit: int = 50) -> list[dict[
                    count(*)                                   AS accesses,
                    max(ts)                                    AS last_access,
                    min(ts)                                    AS first_access,
-                   count(*) FILTER (WHERE outcome = 'denied') AS denied
+                   count(*) FILTER (WHERE outcome = 'denied') AS denied,
+                   count(*) FILTER (WHERE break_glass)        AS break_glass
             FROM audit_events
             WHERE (patient_ref = $1 OR resource_ref = $1)
               AND actor_sub IS NOT NULL
@@ -626,5 +654,6 @@ async def actors_for_subject(subject_ref: str, *, limit: int = 50) -> list[dict[
                 item[key] = value.isoformat()
         item["accesses"] = int(item.get("accesses") or 0)
         item["denied"] = int(item.get("denied") or 0)
+        item["break_glass"] = int(item.get("break_glass") or 0)
         result.append(item)
     return result

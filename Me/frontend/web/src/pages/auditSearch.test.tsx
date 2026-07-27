@@ -240,6 +240,86 @@ describe('AuditSearchPanel', () => {
   })
 })
 
+describe('break-glass review', () => {
+  it('shows the override and its reason on the event', async () => {
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+
+    const events = await screen.findByRole('table', { name: /audit events/i })
+    expect(within(events).getByText(/break-glass/i)).toBeInTheDocument()
+    // The reason is why a reviewer is here; it must not be hidden.
+    expect(
+      within(events).getByText(/cardiac arrest in bay 4/i),
+    ).toBeInTheDocument()
+  })
+
+  it('counts overrides per clinician in the summary', async () => {
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.type(screen.getByLabelText(/patient id/i), 'MRN-000123')
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+
+    const summary = await screen.findByRole('table', {
+      name: /clinicians who accessed this record/i,
+    })
+    const snoop = within(summary).getByText('dr.snoop').closest('tr')!
+    expect(within(snoop).getByText('2')).toBeInTheDocument()
+  })
+
+  it('filters to overrides only when asked', async () => {
+    let query = ''
+    server.use(
+      http.get('/api/audit/search', ({ request }) => {
+        query = new URL(request.url).search
+        return HttpResponse.json({
+          items: [],
+          count: 0,
+          total: 0,
+          limit: 25,
+          offset: 0,
+          since: new Date().toISOString(),
+          until: new Date().toISOString(),
+          subject_ref: null,
+        })
+      }),
+    )
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByLabelText(/emergency overrides only/i))
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    await waitFor(() => expect(query).toContain('break_glass=true'))
+  })
+
+  it('does not send the filter when unchecked', async () => {
+    let query = ''
+    server.use(
+      http.get('/api/audit/search', ({ request }) => {
+        query = new URL(request.url).search
+        return HttpResponse.json({
+          items: [],
+          count: 0,
+          total: 0,
+          limit: 25,
+          offset: 0,
+          since: new Date().toISOString(),
+          until: new Date().toISOString(),
+          subject_ref: null,
+        })
+      }),
+    )
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    // Unset must mean "either", not "non-override".
+    await waitFor(() => expect(query).not.toContain('break_glass'))
+  })
+
+  it('does not label ordinary access as an override', async () => {
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    const events = await screen.findByRole('table', { name: /audit events/i })
+    const smith = within(events).getByText('dr.smith').closest('tr')!
+    expect(within(smith).queryByText(/break-glass/i)).not.toBeInTheDocument()
+  })
+})
+
 describe('AdminPage integration', () => {
   it('offers audit search alongside cache invalidation', async () => {
     renderWithProviders(<AdminPage />, asAdmin)

@@ -49,6 +49,7 @@ honest: “designed” is not the same as “proven in your cluster”.
 | Idempotent writes | `Idempotency-Key` on bed/queue | unit tests |
 | Ward/dept scope | JWT claims `wards` / `departments` | unit tests |
 | Accounting of disclosures | queryable audit index + admin search | real-Postgres + endpoint tests |
+| Emergency access | break-glass: scope-only override, reason required, indexed | unit + live stack |
 | L3/L4 isolation | NetworkPolicy default-deny | YAML residual tests |
 | Mesh mTLS (optional) | Istio STRICT manifests | YAML present; needs mesh |
 | FQDN egress (optional) | Cilium `toFQDNs` | YAML present; needs Cilium |
@@ -141,3 +142,34 @@ Remaining gap: **searches** are attributed only when filtered by an
 identifying parameter. A search by name or date range that returns ten
 patients records the query shape, not the ten patients it disclosed.
 Closing that means attributing each entry in the result bundle.
+
+## Break-glass (emergency scope override)
+
+A clinician scoped to ward A who finds a ward-B patient arresting needs the
+chart now. Ward scoping is correct almost always and catastrophically wrong in
+that moment, so `X-Break-Glass-Reason: <why>` lets them through and makes the
+override loud, attributable and reviewable. Set `BREAK_GLASS_ENABLED=false` to
+disable, in which case the header is **rejected**, not ignored — a caller who
+believes they have emergency access and does not must be told.
+
+The limits are the control:
+
+| Rule | Why |
+|------|-----|
+| Widens **scope only**, never role | Otherwise it is a privilege-escalation primitive wearing a safety label. A `viewer` stays a viewer. |
+| Reason required, ≥10 chars | An override nobody can review is not a control. "x" in an audit column looks like compliance while providing nothing. |
+| Per-request, not a session mode | Access cannot silently stay elevated; there is no session to forget to close. |
+| **Not** honoured on list endpoints | Emergency access is for reaching one patient now. On a list it would become cross-ward browsing — the exact abuse scope exists to prevent. |
+| Bad reason → 400, not 403 | A clinician who typo'd the header needs to know that, not receive a denial they cannot account for. |
+
+Reviewing: `GET /audit/search?break_glass=true`, or the **Emergency overrides
+only** filter in the console. The accessor summary counts overrides per
+clinician, so "did anyone reach this chart by override?" is answerable per
+patient. Overrides are logged at WARNING with the reason and the scope that
+was crossed, *and* flagged on the request's own audit record, so the review
+query does not depend on correlating separate log lines.
+
+Note that patient-flow indexes audit records into the same Postgres the
+gateway searches. It has to: the browser reaches `/flow/*` directly, so
+without its own sink every bed assignment, triage claim and break-glass
+override would be missing from audit search.

@@ -131,6 +131,13 @@ class Settings(BaseSettings):
     audit_retention_days: int = 2555
     audit_purge_interval_seconds: int = 86_400
 
+    # --- Break-glass (emergency scope override) ---
+    # Lets an in-scope clinician reach a patient outside their ward/department
+    # in an emergency, with a mandatory reason recorded at WARNING and indexed
+    # for review. Widens scope only — never role. Set false to disable, in
+    # which case the header is rejected rather than ignored.
+    break_glass_enabled: bool = True
+
     # --- Abuse protection ---
     rate_limit_per_minute: int = 120
     # Login is the credential-stuffing target, so it gets a tighter budget.

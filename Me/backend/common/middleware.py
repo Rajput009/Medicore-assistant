@@ -288,6 +288,15 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         if resolved and not record.get("patient_ref"):
             record["patient_ref"] = self._reference(str(resolved))
 
+        # An emergency override is the single most review-worthy event in the
+        # trail, so it is carried on the record itself rather than left to be
+        # correlated from a separate log line.
+        if getattr(request.state, "break_glass", False):
+            record["break_glass"] = True
+            reason = getattr(request.state, "break_glass_reason", None)
+            if reason:
+                record["break_glass_reason"] = str(reason)[:500]
+
         user = getattr(request.state, "user", None)
         if isinstance(user, dict):
             if user.get("sub"):

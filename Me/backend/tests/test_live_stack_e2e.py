@@ -701,6 +701,100 @@ class TestLiveAuditSearch:
         assert body["total"] >= 1
         assert all(item["outcome"] == "denied" for item in body["items"])
 
+    def _scoped_token(self, sub: str, wards: list[str]) -> str:
+        """A ward-scoped clinician token, signed like the live workers expect.
+
+        Demo login issues an unscoped token (which is unrestricted), so break-
+        glass can only be exercised with a genuinely scoped one.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from jose import jwt
+
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "sub": sub,
+                "roles": ["clinician"],
+                "wards": wards,
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=15)).timestamp()),
+                "jti": f"{sub}-bg-jti",
+                "token_use": "access",
+            },
+            "test-secret-at-least-32-chars-long!!",
+            algorithm="HS256",
+        )
+
+    def test_break_glass_override_is_recorded_and_reviewable(self, live_stack):
+        """End to end: a ward-A clinician is refused an ICU bed, declares an
+        emergency, gets through, and the override is findable afterwards by
+        someone reviewing overrides through the real index."""
+        from backend.common.breakglass import BREAK_GLASS_HEADER
+
+        reason = "Cardiac arrest in ICU bay 1, covering clinician unavailable"
+        scoped = self._scoped_token("dr.bg", ["A"])
+
+        # Refused without a declaration.
+        code, _, _ = _http(
+            "PATCH",
+            f"{live_stack['flow']}/beds/ICU-001",
+            token=scoped,
+            body={"occupied": True, "patient_id": "MRN-BG"},
+        )
+        assert code == 403, "ward scope was not enforced"
+
+        # Granted with one.
+        code, _, _ = _http(
+            "PATCH",
+            f"{live_stack['flow']}/beds/ICU-001",
+            token=scoped,
+            body={"occupied": True, "patient_id": "MRN-BG"},
+            headers={BREAK_GLASS_HEADER: reason},
+        )
+        assert code == 200, "break-glass did not grant access"
+
+        # And reviewable: patient-flow indexes into the same Postgres the
+        # gateway searches, so the override surfaces in the review query.
+        admin = self._admin_token()
+        deadline = time.time() + 6.0
+        found = None
+        while time.time() < deadline:
+            code, _, body = _http(
+                "GET",
+                f"{live_stack['gateway']}/audit/search?break_glass=true&actor=dr.bg",
+                token=admin,
+            )
+            assert code == 200, body
+            if body["total"] >= 1:
+                found = body
+                break
+            time.sleep(0.25)
+
+        assert found is not None, "break-glass override never reached the audit index"
+        event = found["items"][0]
+        assert event["break_glass"] is True
+        assert event["break_glass_reason"] == reason
+        assert event["service"] == "patient-flow"
+
+    def test_normal_access_is_absent_from_the_override_review(self, live_stack):
+        """The review query must not be diluted by routine access."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.routine", "password": "medicore-dev"},
+        )
+        _http("GET", f"{live_stack['flow']}/beds", token=login["access_token"])
+
+        admin = self._admin_token()
+        code, _, body = _http(
+            "GET",
+            f"{live_stack['gateway']}/audit/search?break_glass=true&limit=200",
+            token=admin,
+        )
+        assert code == 200
+        assert all(item["actor_sub"] != "dr.routine" for item in body["items"])
+
     def test_a_clinician_cannot_search_the_audit_trail(self, live_stack):
         _, _, login = _http(
             "POST",

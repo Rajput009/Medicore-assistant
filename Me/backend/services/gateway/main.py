@@ -676,6 +676,10 @@ async def audit_search(
     service: str | None = Query(default=None, max_length=64),
     since: datetime | None = Query(default=None),
     until: datetime | None = Query(default=None),
+    break_glass: bool | None = Query(
+        default=None,
+        description="True to review only emergency overrides.",
+    ),
     limit: int = Query(default=50, ge=1, le=audit_store.MAX_SEARCH_LIMIT),
     offset: int = Query(default=0, ge=0),
     user: User = Depends(admin_only),
@@ -705,6 +709,7 @@ async def audit_search(
             service=service.strip() if service else None,
             since=resolved_since,
             until=resolved_until,
+            break_glass=break_glass,
             limit=limit,
             offset=offset,
         )
