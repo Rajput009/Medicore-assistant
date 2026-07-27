@@ -41,6 +41,9 @@ class Settings(BaseSettings):
 
     jwt_secret: str = "change-this-in-prod"
     jwt_alg: str = "HS256"
+    # Short-lived access tokens limit the blast radius of a stolen JWT.
+    # 15 minutes is the default; raise only with a documented risk acceptance.
+    access_token_ttl_minutes: int = 15
 
     postgres_user: str = "medicore"
     postgres_password: str = "medicore_pw"
@@ -108,6 +111,17 @@ class Settings(BaseSettings):
     max_request_body_bytes: int = 1_048_576
     enable_hsts: bool = True
     allowed_origins: str = "http://localhost:5173"
+    # Comma-separated Host header allow-list. Empty disables the check (local
+    # only). In production this MUST be set so Host-header attacks cannot
+    # poison absolute URL generation or cache keys.
+    trusted_hosts: str = ""
+    # Interactive OpenAPI docs (/docs, /redoc, /openapi.json). Forced off in
+    # production regardless of this flag — the schema is a free attack map.
+    expose_api_docs: bool = False
+    # Username/password demo login. Forced off in production. Outside
+    # production it still requires an explicit opt-in via ENABLE_DEMO_LOGIN
+    # or ENV=local/test so a mis-set ENV cannot re-enable a shared password.
+    enable_demo_login: bool = False
 
     # --- Observability ---
     otel_exporter_otlp_endpoint: str = "http://jaeger:4318"
@@ -149,6 +163,37 @@ class Settings(BaseSettings):
         # using a signed-in clinician's session.
         if "*" in self.cors_origins:
             problems.append("ALLOWED_ORIGINS must not be '*' in production")
+
+        if not self.trusted_hosts_list:
+            problems.append(
+                "TRUSTED_HOSTS must be set in production "
+                "(comma-separated hostnames, e.g. 'api.hospital.example,localhost')"
+            )
+
+        if self.enable_demo_login:
+            problems.append(
+                "ENABLE_DEMO_LOGIN cannot be true in production; use OIDC SSO"
+            )
+
+        if self.access_token_ttl_minutes <= 0 or self.access_token_ttl_minutes > 60:
+            problems.append(
+                "ACCESS_TOKEN_TTL_MINUTES must be between 1 and 60 in production "
+                f"(got {self.access_token_ttl_minutes})"
+            )
+
+        # Production without OIDC leaves no legitimate way to obtain a token
+        # once demo login is forced off. Fail closed rather than shipping a
+        # locked-out auth service.
+        oidc_ready = bool(
+            (self.oidc_issuer or self.oidc_jwks_uri)
+            and self.oidc_client_id
+            and self.oidc_client_secret
+        )
+        if not oidc_ready:
+            problems.append(
+                "OIDC_ISSUER (or OIDC_JWKS_URI), OIDC_CLIENT_ID and "
+                "OIDC_CLIENT_SECRET must be configured in production"
+            )
 
         if problems:
             raise ValueError(
@@ -197,6 +242,24 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+
+    @property
+    def trusted_hosts_list(self) -> list[str]:
+        return [h.strip() for h in self.trusted_hosts.split(",") if h.strip()]
+
+    @property
+    def demo_login_allowed(self) -> bool:
+        """True only when the username/password stub is safe to expose.
+
+        Production is always False. Outside production the operator must still
+        opt in (ENV=local/test, or ENABLE_DEMO_LOGIN=true) so a forgotten flag
+        on a staging box does not silently re-enable a shared password.
+        """
+        if self.is_production:
+            return False
+        if self.env.lower() in ("local", "test"):
+            return True
+        return bool(self.enable_demo_login)
 
 
 settings = Settings()

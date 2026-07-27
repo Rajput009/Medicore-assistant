@@ -10,19 +10,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends
 from pydantic import BaseModel, Field
 
+from backend.common.app import create_service_app
 from backend.common.config import settings
 from backend.common.deps import Principal, clinical_staff
-from backend.common.hardening import (
-    BodySizeLimitMiddleware,
-    RateLimitMiddleware,
-    SecurityHeadersMiddleware,
-)
-from backend.common.logging import configure_logging
-from backend.common.middleware import AuditLogMiddleware
-from backend.common.telemetry import instrument_fastapi
 
 from .scoring import (
     ConsciousnessLevel,
@@ -31,18 +24,11 @@ from .scoring import (
     normalised_score,
 )
 
-configure_logging(settings.log_level, service="cds")
-
-app = instrument_fastapi(
-    FastAPI(title="MediCore CDS", version="1.0.0"), service_name="cds"
+app = create_service_app(
+    title="MediCore CDS",
+    service_name="cds",
+    version="1.0.0",
 )
-# Middleware runs in reverse registration order, so the last registered is
-# outermost. Order matters: security headers must wrap everything (including
-# rejections), and the audit log must see the authenticated principal.
-app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
-app.add_middleware(AuditLogMiddleware, service="cds")
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 ClinicalUser = Annotated[Principal, Depends(clinical_staff)]
 

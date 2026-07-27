@@ -10,3 +10,7 @@ opentelemetry-exporter-otlp-proto-http
 opentelemetry-instrumentation-fastapi
 opentelemetry-instrumentation-httpx
 opentelemetry-instrumentation-logging
+
+# JWT verification (shared deps.get_principal)
+python-jose[cryptography]
+httpx

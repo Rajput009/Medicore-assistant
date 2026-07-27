@@ -24,16 +24,9 @@ from backend.common.cache import (
 from backend.common.cache import (
     ping as cache_ping,
 )
+from backend.common.app import create_service_app
 from backend.common.config import settings
 from backend.common.fhir_client import FHIRError, default_fhir_client
-from backend.common.hardening import (
-    BodySizeLimitMiddleware,
-    RateLimitMiddleware,
-    SecurityHeadersMiddleware,
-)
-from backend.common.logging import configure_logging
-from backend.common.middleware import AuditLogMiddleware
-from backend.common.telemetry import instrument_fastapi
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
 
@@ -57,7 +50,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    configure_logging(settings.log_level, service="gateway")
     try:
         # Create the pool (and cache table) up front so the first request does
         # not pay the setup cost, and readiness reflects reality immediately.
@@ -79,20 +71,18 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = instrument_fastapi(
-    FastAPI(title="MediCore Gateway", version="0.1.0", lifespan=lifespan),
+# Auth is registered first so it runs innermost: the audit logger wraps it and
+# still records rejected (401/403) requests — denied access is what an audit
+# trail most needs.
+app = create_service_app(
+    title="MediCore Gateway",
     service_name="gateway",
+    version="0.1.0",
+    lifespan=lifespan,
+    enable_cors=True,
+    cors_methods=("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"),
+    extra_middleware=((JWTAuthMiddleware, {}),),
 )
-
-# Middleware runs in reverse registration order: the last registered is the
-# outermost layer. Auth is registered first so it runs innermost, which means
-# the audit logger wraps it and still records rejected (401/403) requests -
-# denied access attempts are the ones an audit trail most needs.
-app.add_middleware(JWTAuthMiddleware)
-app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
-app.add_middleware(AuditLogMiddleware, service="gateway")
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 
 class Health(BaseModel):
@@ -219,8 +209,19 @@ async def _read(resource: str, resource_id: str) -> dict[str, Any]:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"{resource}/{resource_id} not found",
             ) from exc
+        # Never echo driver/upstream internals — they can contain URLs with
+        # credentials or stack fragments.
+        logger.warning(
+            "upstream FHIR read failed",
+            extra={
+                "resource": resource,
+                "status_code": exc.status_code,
+                "error_type": type(exc).__name__,
+            },
+        )
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Upstream clinical data service unavailable",
         ) from exc
 
 
@@ -237,8 +238,17 @@ async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
     try:
         resp = await fhir.search(resource, params)
     except FHIRError as exc:
+        logger.warning(
+            "upstream FHIR search failed",
+            extra={
+                "resource": resource,
+                "status_code": exc.status_code,
+                "error_type": type(exc).__name__,
+            },
+        )
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Upstream clinical data service unavailable",
         ) from exc
 
     try:
@@ -346,8 +356,10 @@ async def admin_invalidate_cache(
     try:
         deleted = await invalidate_cache(canonical, patient)
     except Exception as exc:
+        logger.error("cache invalidation failed", exc_info=exc)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cache invalidation temporarily unavailable",
         ) from exc
     return {
         "status": "ok",

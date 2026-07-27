@@ -16,16 +16,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import PyMongoError
 
+from backend.common.app import create_service_app
 from backend.common.config import settings
 from backend.common.deps import Principal, clinical_staff
-from backend.common.hardening import (
-    BodySizeLimitMiddleware,
-    RateLimitMiddleware,
-    SecurityHeadersMiddleware,
-)
-from backend.common.logging import configure_logging
-from backend.common.middleware import AuditLogMiddleware
-from backend.common.telemetry import instrument_fastapi
 
 from .repository import (
     ConflictError,
@@ -63,7 +56,6 @@ def build_bed_documents() -> list[dict[str, Any]]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client, _repository
-    configure_logging(settings.log_level, service="patient-flow")
 
     # A repository may be injected before startup (tests, or an embedding
     # process). Only open our own connection when one was not supplied, but
@@ -92,17 +84,12 @@ async def lifespan(app: FastAPI):
             _repository = None
 
 
-app = instrument_fastapi(
-    FastAPI(title="MediCore Patient Flow", version="1.0.0", lifespan=lifespan),
+app = create_service_app(
+    title="MediCore Patient Flow",
     service_name="patient-flow",
+    version="1.0.0",
+    lifespan=lifespan,
 )
-# Middleware runs in reverse registration order, so the last registered is
-# outermost. Order matters: security headers must wrap everything (including
-# rejections), and the audit log must see the authenticated principal.
-app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
-app.add_middleware(AuditLogMiddleware, service="patient-flow")
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 ClinicalUser = Annotated[Principal, Depends(clinical_staff)]
 Repo = Annotated[PatientFlowRepository, Depends(get_repository)]

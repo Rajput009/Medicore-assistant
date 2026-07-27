@@ -13,7 +13,19 @@ data:
   KAFKA_BROKERS: "kafka:9092"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
   OTEL_SERVICE_NAMESPACE: "medicore"
+  # Browser origins allowed to call the API with credentials. Never "*".
   ALLOWED_ORIGINS: "https://console.medicore.local"
+  # Host header allow-list (comma-separated). Required in production.
+  TRUSTED_HOSTS: "api.medicore.local,localhost"
+  # Short-lived access tokens limit blast radius of a stolen JWT.
+  ACCESS_TOKEN_TTL_MINUTES: "15"
+  # Interactive OpenAPI docs stay off in production.
+  EXPOSE_API_DOCS: "false"
+  ENABLE_DEMO_LOGIN: "false"
+  ENABLE_HSTS: "true"
+  RATE_LIMIT_PER_MINUTE: "120"
+  LOGIN_RATE_LIMIT_PER_MINUTE: "10"
+  AUDIT_LOG_RAW_IDENTIFIERS: "false"
 ---
 # NOTE: the medicore-secrets Secret is deliberately NOT defined here.
 #
@@ -26,5 +38,8 @@ data:
 #   postgres-password   >= 12 chars
 #   fhir-client-secret  from your EHR vendor
 #   oidc-client-secret  from your IdP
+#   oidc-client-id      from your IdP
+#   oidc-issuer         https://idp.example/realms/medicore
 #
-# Services refuse to start in production if any of these is a placeholder.
+# Services refuse to start in production if any of these is a placeholder,
+# if TRUSTED_HOSTS is empty, if demo login is enabled, or if OIDC is missing.

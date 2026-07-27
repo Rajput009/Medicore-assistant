@@ -5,63 +5,45 @@ import secrets
 from typing import Any
 
 from authlib.integrations.starlette_client import OAuth, OAuthError
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from starlette.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
+from backend.common.app import create_service_app
 from backend.common.config import settings
-from backend.common.hardening import (
-    BodySizeLimitMiddleware,
-    RateLimitMiddleware,
-    SecurityHeadersMiddleware,
-)
-from backend.common.logging import configure_logging
-from backend.common.middleware import AuditLogMiddleware
 from backend.common.security import create_access_token
-from backend.common.telemetry import instrument_fastapi
-
-configure_logging(settings.log_level, service="auth")
-
-app = instrument_fastapi(
-    FastAPI(title="MediCore Auth", version="1.0.0"), service_name="auth"
-)
 
 # Session cookie is required for the OIDC state/nonce round-trip.
 _session_secret = os.getenv("SESSION_SECRET", settings.session_secret)
-if settings.env not in ("local", "test") and _session_secret in (
-    "dev-change-me",
-    "",
+if settings.is_production and (
+    not _session_secret or _session_secret in ("dev-change-me", "")
 ):
     raise RuntimeError(
-        "SESSION_SECRET must be set to a strong random value outside local/test"
+        "SESSION_SECRET must be set to a strong random value in production"
     )
 
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=_session_secret,
-    same_site="lax",
-    https_only=settings.env not in ("local", "test"),
+# Session middleware must sit inside CORS/TrustedHost so the cookie is set on
+# responses that already passed host/origin checks. Registered as innermost
+# extra middleware via the shared factory.
+app = create_service_app(
+    title="MediCore Auth",
+    service_name="auth",
+    version="1.0.0",
+    rate_limit=settings.login_rate_limit_per_minute,
+    enable_cors=True,
+    extra_middleware=(
+        (
+            SessionMiddleware,
+            {
+                "secret_key": _session_secret,
+                "same_site": "lax",
+                "https_only": settings.is_production,
+                "max_age": 600,  # OIDC round-trip only; short-lived.
+            },
+        ),
+    ),
 )
-
-# Credentialed CORS cannot use a "*" origin — browsers reject the combination,
-# so fall back to an explicit allow-list.
-_origins = settings.cors_origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-# Middleware runs in reverse registration order, so the last registered is
-# outermost. Order matters: security headers must wrap everything (including
-# rejections), and the audit log must see the authenticated principal.
-app.add_middleware(RateLimitMiddleware, limit=settings.login_rate_limit_per_minute)
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
-app.add_middleware(AuditLogMiddleware, service="auth")
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 
 class Health(BaseModel):
@@ -88,31 +70,35 @@ def ready() -> dict[str, Any]:
 
 
 class LoginReq(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=256)
 
 
 class TokenResp(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    expires_in: int = 3600
+    expires_in: int
 
 
 def _demo_login_enabled() -> bool:
-    """The username/password stub authenticates nobody — keep it out of prod."""
-    return settings.env in ("local", "test") or os.getenv(
-        "ENABLE_DEMO_LOGIN", ""
-    ).lower() in ("1", "true", "yes")
+    """The username/password stub authenticates nobody real — keep it out of prod.
+
+    Production is always False (enforced in Settings too). Outside production
+    the shared ``settings.demo_login_allowed`` gate still requires ENV=local/test
+    or an explicit ENABLE_DEMO_LOGIN opt-in.
+    """
+    return settings.demo_login_allowed
 
 
 @app.post("/login", response_model=TokenResp)
 def login(req: LoginReq) -> TokenResp:
     if not _demo_login_enabled():
+        # 404 rather than 403: do not advertise that a password endpoint exists.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Local login is disabled; use /oidc/login",
         )
-    if not req.username or not req.password:
+    if not req.username.strip() or not req.password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
@@ -124,8 +110,9 @@ def login(req: LoginReq) -> TokenResp:
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
 
-    token = create_access_token(sub=req.username, roles=["clinician"])
-    return TokenResp(access_token=token)
+    ttl = settings.access_token_ttl_minutes
+    token = create_access_token(sub=req.username.strip(), roles=["clinician"])
+    return TokenResp(access_token=token, expires_in=ttl * 60)
 
 
 # --------------------------------------------------------------------------
@@ -221,6 +208,7 @@ async def oidc_callback(request: Request):
         {
             "access_token": internal,
             "token_type": "bearer",
+            "expires_in": settings.access_token_ttl_minutes * 60,
             "user": {
                 "sub": sub,
                 "email": userinfo.get("email"),

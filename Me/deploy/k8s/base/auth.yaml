@@ -46,6 +46,18 @@ spec:
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef: { name: medicore-secrets, key: jwt-secret }
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef: { name: medicore-secrets, key: session-secret }
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef: { name: medicore-secrets, key: oidc-client-id }
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: medicore-secrets, key: oidc-client-secret }
+            - name: OIDC_ISSUER
+              valueFrom:
+                secretKeyRef: { name: medicore-secrets, key: oidc-issuer }
           envFrom:
             - configMapRef: { name: medicore-config }
           # Without probes, Kubernetes routes traffic to pods that are still
@@ -71,6 +83,11 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            # readOnlyRootFilesystem needs a writable tmp for uvicorn/openssl.
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
 ---
 apiVersion: v1
 kind: Service

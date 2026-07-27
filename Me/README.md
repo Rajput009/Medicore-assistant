@@ -48,7 +48,7 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression + e2e | `backend/tests/test_*.py` | 333 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 342 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
 
@@ -96,9 +96,30 @@ retain PHI indefinitely.
 
 **Fail-fast configuration.** Outside local/test/dev the services refuse to
 start if `JWT_SECRET`, `SESSION_SECRET` or `POSTGRES_PASSWORD` is still a
-placeholder or too short, or if `ALLOWED_ORIGINS` is `*`. Booting with the
-default signing key - which is published in this repository - would let anyone
-mint a valid admin token, and nothing downstream would notice.
+placeholder or too short; if `ALLOWED_ORIGINS` is `*`; if `TRUSTED_HOSTS` is
+empty; if demo login is enabled; if OIDC is not fully configured; or if the
+access-token TTL is outside 1–60 minutes. Booting with the default signing key
+— which is published in this repository — would let anyone mint a valid admin
+token, and nothing downstream would notice.
+
+**Tokens.** Access tokens default to a **15-minute** lifetime
+(`ACCESS_TOKEN_TTL_MINUTES`) and carry a `token_use=access` claim so a future
+refresh token cannot be replayed as an access token. Demo username/password
+login is forced off in production and returns 404 so the endpoint is not
+advertised.
+
+**API surface.** Interactive OpenAPI docs (`/docs`, `/redoc`, `/openapi.json`)
+are disabled outside local/test. `/ready` stays public (probes send no auth)
+but returns only dependency status, never PHI. Every service is built through
+a shared factory (`backend.common.app.create_service_app`) so security headers,
+body-size limits, rate limits, audit logging, CORS allow-lists and
+TrustedHost checks cannot drift between services.
+
+**Containers.** Images run as uid 10001, drop all capabilities, use a
+read-only root filesystem with an in-memory `/tmp`, and start a single uvicorn
+worker (scale with replicas, not `--workers`). Kubernetes manifests set
+`runAsNonRoot`, PodDisruptionBudgets, topology spread, and NetworkPolicies
+that default-deny east-west traffic.
 
 **Audit trail.** Every request is logged with the actor (`sub`, `roles`) and a
 reference to the record touched (`resource_type`, `resource_ref`), so
@@ -168,8 +189,8 @@ Makefile                 # DX helpers
 
 ## Services (initial)
 
-- **gateway**: Edge API, request fan-out to internal services, OpenAPI docs at `/docs`.
-- **auth**: Login, token mint/refresh, RBAC, OIDC plumbing.
+- **gateway**: Edge API, JWT + RBAC, FHIR proxy with Postgres cache. Docs off in prod.
+- **auth**: OIDC SSO (required in prod), short-lived internal JWT minting, demo login local-only.
 - **patient-flow**: Bed management and ED triage queue, persisted in MongoDB
   with optimistic-concurrency updates and atomic patient claiming.
 - **cds**: NEWS2 deterioration scoring with a per-parameter breakdown and
