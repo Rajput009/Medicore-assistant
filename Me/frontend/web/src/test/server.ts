@@ -193,6 +193,86 @@ export const handlers = [
     })
   }),
 
+  /**
+   * Audit search. Mirrors the gateway: the raw MRN is never echoed back —
+   * only the hash the server matched on.
+   */
+  http.get('/api/audit/search', ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const url = new URL(request.url)
+    const patient = url.searchParams.get('patient')
+    const limit = Number(url.searchParams.get('limit') ?? 25)
+    const offset = Number(url.searchParams.get('offset') ?? 0)
+    const now = new Date().toISOString()
+    return HttpResponse.json({
+      items: [
+        {
+          ts: now,
+          request_id: 'req-1',
+          service: 'gateway',
+          actor_sub: 'dr.smith',
+          actor_roles: ['clinician'],
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 200,
+          outcome: 'success',
+          resource_type: 'patient',
+          resource_ref: 'sha256:0123456789abcdef',
+          patient_ref: null,
+          client_ip: '203.0.113.7',
+        },
+        {
+          ts: now,
+          request_id: 'req-2',
+          service: 'gateway',
+          actor_sub: 'dr.snoop',
+          actor_roles: ['clinician'],
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 403,
+          outcome: 'denied',
+          resource_type: 'patient',
+          resource_ref: 'sha256:0123456789abcdef',
+          patient_ref: null,
+          client_ip: '198.51.100.4',
+        },
+      ],
+      count: 2,
+      total: 2,
+      limit,
+      offset,
+      since: new Date(Date.now() - 30 * 86400_000).toISOString(),
+      until: now,
+      subject_ref: patient ? 'sha256:0123456789abcdef' : null,
+    })
+  }),
+
+  http.get('/api/audit/patient/:id/accessors', ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      patient_ref: 'sha256:0123456789abcdef',
+      accessors: [
+        {
+          actor_sub: 'dr.smith',
+          accesses: 4,
+          denied: 0,
+          first_access: new Date(Date.now() - 3 * 86400_000).toISOString(),
+          last_access: new Date().toISOString(),
+        },
+        {
+          actor_sub: 'dr.snoop',
+          accesses: 1,
+          denied: 1,
+          first_access: new Date(Date.now() - 86400_000).toISOString(),
+          last_access: new Date(Date.now() - 86400_000).toISOString(),
+        },
+      ],
+      count: 2,
+    })
+  }),
+
   http.delete('/api/cache/:resource', ({ params, request }) => {
     const denied = requireAuth(request)
     if (denied) return denied

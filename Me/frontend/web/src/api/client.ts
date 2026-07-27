@@ -8,6 +8,9 @@
  */
 
 import type {
+  AuditAccessorsResponse,
+  AuditSearchParams,
+  AuditSearchResponse,
   Bed,
   BedUpdate,
   CacheInvalidationResponse,
@@ -294,6 +297,38 @@ export const api = {
       params: patient ? { patient } : {},
       signal,
     })
+  },
+
+  /**
+   * Search the audit trail. Admin-only server-side.
+   *
+   * `patient` takes the raw identifier a human knows (an MRN); the gateway
+   * hashes it with the deployment's audit salt before matching, so the SPA
+   * never needs to know the pseudonymisation scheme.
+   */
+  auditSearch(
+    params: AuditSearchParams,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AuditSearchResponse> {
+    return request<AuditSearchResponse>(`${BASE.gateway}/audit/search`, {
+      // buildQuery drops blank values, so unset filters are simply absent.
+      params: { ...params },
+      signal,
+    })
+  },
+
+  /** Distinct clinicians who accessed a patient's record, newest first. */
+  auditAccessors(
+    patientId: string,
+    limit?: number,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AuditAccessorsResponse> {
+    return request<AuditAccessorsResponse>(
+      `${BASE.gateway}/audit/patient/${encodeURIComponent(patientId)}/accessors`,
+      { params: limit ? { limit } : {}, signal },
+    )
   },
 
   listBeds(ward: string | null, _token?: string | null, signal?: AbortSignal): Promise<Bed[]> {

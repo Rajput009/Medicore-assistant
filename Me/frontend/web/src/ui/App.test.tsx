@@ -59,14 +59,14 @@ describe('role-based access', () => {
     expect(await screen.findByRole('heading', { name: /fhir explorer/i })).toBeInTheDocument()
   })
 
-  it('denies cache admin to a clinician', async () => {
+  it('denies administration to a clinician', async () => {
     renderApp('/admin', makeToken({ roles: ['clinician'] }))
     expect(await screen.findByRole('heading', { name: /access denied/i })).toBeInTheDocument()
   })
 
-  it('allows cache admin for an admin', async () => {
+  it('allows administration for an admin', async () => {
     renderApp('/admin', makeToken({ roles: ['admin'] }))
-    expect(await screen.findByRole('heading', { name: /cache administration/i })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: /^administration$/i })).toBeInTheDocument()
   })
 
   it('denies decision support to a viewer', async () => {

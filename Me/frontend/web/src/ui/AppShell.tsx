@@ -17,7 +17,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: '/fhir', label: 'FHIR explorer', roles: ['clinician', 'admin'] },
   { to: '/flow', label: 'Patient flow', roles: ['clinician', 'admin'] },
   { to: '/cds', label: 'Decision support', roles: ['clinician', 'admin'] },
-  { to: '/admin', label: 'Cache admin', roles: ['admin'] },
+  { to: '/admin', label: 'Administration', roles: ['admin'] },
 ]
 
 /** Nav items the given roles may see. */

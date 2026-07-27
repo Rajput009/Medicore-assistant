@@ -156,6 +156,15 @@ identifiers are pseudonymised with a salted HMAC: stable enough to correlate
 accesses, but the log stream carries no raw PHI. Denied attempts are recorded
 with `outcome: denied`.
 
+**Audit search.** Records are additionally indexed in Postgres so that
+question can actually be *asked*, not just answered in principle by grepping a
+log archive. Admins get `GET /audit/search` and
+`GET /audit/patient/{id}/accessors`. Indexing is deliberately best-effort: a
+bounded queue drained by a background batch writer, because a clinical request
+must never wait on — or fail because of — an audit write. Records lost to a
+full queue or a database outage are counted and surfaced on `/audit/stats`
+rather than silently discarded.
+
 **Edge hardening.** Security headers on every response (including
 `Cache-Control: no-store`, so PHI is never written to a shared cache),
 per-caller rate limiting, and a request body cap. These duplicate what a
@@ -315,6 +324,35 @@ Example:
 ```bash
 curl -X DELETE -H "Authorization: Bearer <admin_token>" "http://localhost:8080/cache/Observation?patient=123"
 ```
+
+## Audit Search (Admin-only)
+
+Answers "who viewed MRN-X?" from the queryable audit index. Pass the raw
+identifier — the gateway hashes it with the deployment's audit salt before
+matching, so you never need to know the pseudonymisation scheme and no raw id
+is written as a result of searching.
+
+- `GET /audit/patient/{id}/accessors` → one row per clinician: access count,
+  denied count, first/last access. Where an investigation starts.
+- `GET /audit/search` → the individual events. Filters: `patient`, `actor`,
+  `outcome` (`success|failure|denied|error`), `resource_type`, `service`,
+  `since`, `until`, `limit`, `offset`. Defaults to the last 30 days; the
+  window is capped at 366 days.
+- `GET /audit/stats` → index health. **Alert on `dropped` and `failed`**: they
+  are non-zero only when audit records did not reach the index, meaning the
+  searchable trail is incomplete (the log stream still has them).
+
+```bash
+# Who opened this chart?
+curl -H "Authorization: Bearer <admin_token>" \
+  "http://localhost:8080/audit/patient/MRN-000123/accessors"
+
+# Every refused attempt against that chart in the last week
+curl -H "Authorization: Bearer <admin_token>" \
+  "http://localhost:8080/audit/search?patient=MRN-000123&outcome=denied&since=2026-07-20T00:00:00Z"
+```
+
+Both are also available in the console under **Administration**.
 
 ## Clinical workflow notes
 

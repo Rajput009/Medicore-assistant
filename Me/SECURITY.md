@@ -28,6 +28,9 @@ honest: “designed” is not the same as “proven in your cluster”.
   depth, not the only control.
 - **PHI** lives in Mongo, upstream FHIR, and (briefly) the Postgres cache.
   Audit logs carry **pseudonymised** patient refs by default.
+- **Audit trail** is written twice: the log stream is the system of record,
+  and a Postgres `audit_events` index makes it queryable. The index stores the
+  same pseudonymised refs, so it holds no raw MRNs under default settings.
 
 ## Controls (what we claim)
 
@@ -45,6 +48,7 @@ honest: “designed” is not the same as “proven in your cluster”.
 | Error scrubbing | `errors.install_error_handlers` | unit tests |
 | Idempotent writes | `Idempotency-Key` on bed/queue | unit tests |
 | Ward/dept scope | JWT claims `wards` / `departments` | unit tests |
+| Accounting of disclosures | queryable audit index + admin search | real-Postgres + endpoint tests |
 | L3/L4 isolation | NetworkPolicy default-deny | YAML residual tests |
 | Mesh mTLS (optional) | Istio STRICT manifests | YAML present; needs mesh |
 | FQDN egress (optional) | Cilium `toFQDNs` | YAML present; needs Cilium |
@@ -62,6 +66,8 @@ honest: “designed” is not the same as “proven in your cluster”.
 | R7 | In-process rate limit/revoke when Redis down | Med | Monitor fallback; require Redis in prod |
 | R8 | Supply-chain / CVE drift | Med | CI `pip-audit` + `npm audit` |
 | R9 | No formal pen-test | High (org) | External assessment before PHI |
+| R10 | Audit index is lossy under overload (bounded queue) | Med | Alert on `/audit/stats` dropped/failed; backfill from log stream |
+| R11 | Non-Patient reads are not attributed to a patient | Med | Resolve `subject` on the FHIR read path before indexing |
 
 ## AuthZ model (current)
 
@@ -94,3 +100,29 @@ and impact assessment.
 - Idempotency keys TTL 24h.
 - Revocation entries TTL = token remaining lifetime.
 - Audit logs: retain per organisational policy in a HIPAA-capable sink.
+- Audit index (`audit_events`): `AUDIT_RETENTION_DAYS`, default 2555 (seven
+  years, comfortably over the six required by 164.316(b)(2)(i)). `0` disables
+  purging. Probe traffic (`/health`, `/ready`, `/metrics`) is never indexed.
+
+## Audit search (accounting of disclosures)
+
+`GET /audit/search` and `GET /audit/patient/{id}/accessors` answer "who viewed
+this record?" for **admins only** — knowing who looked at whom is itself
+sensitive, and both endpoints are captured by the same audit middleware, so
+investigating the investigators works. Callers pass a raw MRN; the gateway
+hashes it with the deployment's audit salt before matching, so searching never
+writes an identifier anywhere.
+
+Design constraint worth preserving: **indexing must never delay or fail a
+clinical request.** Records go through a bounded in-memory queue drained by a
+background batch writer. When the queue overflows or a write fails, records
+are dropped and counted rather than blocking the caller — losing audit rows is
+bad, blocking a clinician mid-resuscitation is worse. `GET /audit/stats`
+exposes `dropped` / `failed`; both should be alerted on, since the searchable
+trail is incomplete until they are backfilled from the log stream.
+
+Known gap: a direct read of a non-Patient resource (e.g.
+`GET /fhir/observation/obs-1`) records that resource's reference, not the
+patient it belongs to, because the gateway does not resolve `subject` on the
+read path. Searches match a patient's own reference plus anything explicitly
+filtered by that patient.

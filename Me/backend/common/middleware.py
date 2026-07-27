@@ -14,6 +14,11 @@ this middleware separates the two concerns:
 
 Set ``AUDIT_LOG_RAW_IDENTIFIERS=true`` when the log sink is itself a
 HIPAA-compliant, access-controlled store and investigators need raw ids.
+
+Records are additionally handed to an optional *sink* (see
+``audit_store.submit``) which indexes them in Postgres so questions like "who
+viewed MRN-123?" can be answered directly. The sink is best-effort by
+construction: it must never delay or fail a clinical request.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -64,21 +70,44 @@ def pseudonymise(value: str, salt: str) -> str:
     return f"sha256:{digest[:32]}"
 
 
+def audit_reference(raw: str | None) -> str | None:
+    """The reference this deployment writes into audit records for ``raw``.
+
+    Shared with the audit search endpoint: a query for "MRN-123" must hash the
+    identifier exactly as the middleware did, or it silently matches nothing.
+    Two implementations of the same rule is how that bug happens, so there is
+    only one.
+    """
+    if not raw:
+        return None
+    settings = _load_settings()
+    if settings is not None and getattr(settings, "audit_log_raw_identifiers", False):
+        return raw
+    salt = getattr(settings, "audit_log_salt", "") or getattr(
+        settings, "jwt_secret", "medicore"
+    )
+    return pseudonymise(raw, salt)
+
+
+# Optional queryable sink, installed at startup by a service that owns a
+# database (currently the gateway). Left unset everywhere else so the audit
+# middleware keeps working standalone.
+_sink: Callable[[dict[str, Any]], Any] | None = None
+
+
+def set_audit_sink(sink: Callable[[dict[str, Any]], Any] | None) -> None:
+    """Register (or clear) the queryable audit sink."""
+    global _sink
+    _sink = sink
+
+
 class AuditLogMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, service: str | None = None):
         super().__init__(app)
         self.service = service
 
     def _reference(self, raw: str | None) -> str | None:
-        if not raw:
-            return None
-        settings = _load_settings()
-        if settings is not None and getattr(settings, "audit_log_raw_identifiers", False):
-            return raw
-        salt = getattr(settings, "audit_log_salt", "") or getattr(
-            settings, "jwt_secret", "medicore"
-        )
-        return pseudonymise(raw, salt)
+        return audit_reference(raw)
 
     def _describe_target(self, request: Request) -> dict[str, Any]:
         """Identify the clinical record a request touches, for the audit trail."""
@@ -193,6 +222,16 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
             level = max(level, logging.WARNING)
 
         logger.log(level, json.dumps(record, default=str))
+
+        # The log stream above is the system of record; the index is derived.
+        # It is fed last and defensively, so a broken sink degrades searchability
+        # without touching the guarantee that the access was written down.
+        sink = _sink
+        if sink is not None:
+            try:
+                sink(record)
+            except Exception:  # pragma: no cover - sink must never escape
+                logger.debug("audit sink rejected a record", exc_info=True)
 
 
 def redact_phi_loggers() -> None:

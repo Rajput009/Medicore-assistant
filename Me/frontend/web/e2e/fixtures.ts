@@ -77,6 +77,72 @@ export async function stubBackend(page: Page): Promise<void> {
     json(r, { status: 'ok', resource: 'Patient', patient: null, deleted: 3 }),
   )
 
+  // Audit index. Mirrors the gateway: the response carries only the hashed
+  // reference, never the raw identifier the caller searched for.
+  await page.route(/\/api\/audit\/search/, (r) => {
+    const now = new Date().toISOString()
+    return json(r, {
+      items: [
+        {
+          ts: now,
+          request_id: 'e2e-1',
+          service: 'gateway',
+          actor_sub: 'dr.smith',
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 200,
+          outcome: 'success',
+          resource_type: 'patient',
+          resource_ref: 'sha256:0123456789abcdef',
+          client_ip: '203.0.113.7',
+        },
+        {
+          ts: now,
+          request_id: 'e2e-2',
+          service: 'gateway',
+          actor_sub: 'dr.snoop',
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 403,
+          outcome: 'denied',
+          resource_type: 'patient',
+          resource_ref: 'sha256:0123456789abcdef',
+          client_ip: '198.51.100.4',
+        },
+      ],
+      count: 2,
+      total: 2,
+      limit: 25,
+      offset: 0,
+      since: new Date(Date.now() - 30 * 86400_000).toISOString(),
+      until: now,
+      subject_ref: 'sha256:0123456789abcdef',
+    })
+  })
+
+  await page.route(/\/api\/audit\/patient\/[^/]+\/accessors/, (r) =>
+    json(r, {
+      patient_ref: 'sha256:0123456789abcdef',
+      accessors: [
+        {
+          actor_sub: 'dr.smith',
+          accesses: 4,
+          denied: 0,
+          first_access: new Date(Date.now() - 3 * 86400_000).toISOString(),
+          last_access: new Date().toISOString(),
+        },
+        {
+          actor_sub: 'dr.snoop',
+          accesses: 1,
+          denied: 1,
+          first_access: new Date(Date.now() - 86400_000).toISOString(),
+          last_access: new Date(Date.now() - 86400_000).toISOString(),
+        },
+      ],
+      count: 2,
+    }),
+  )
+
   await page.route('**/flow/beds', (r) => {
     if (unauthorized(r)) return
     return json(r, [

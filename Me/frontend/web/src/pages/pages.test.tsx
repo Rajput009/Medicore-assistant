@@ -571,7 +571,7 @@ describe('AdminPage', () => {
     )
     const { user } = renderWithProviders(<AdminPage />, { token: makeToken({ roles: ['admin'] }) })
     await user.selectOptions(screen.getByLabelText(/resource type/i), 'Observation')
-    await user.type(screen.getByLabelText(/patient id/i), '7')
+    await user.type(screen.getByLabelText(/cache patient id/i), '7')
     await user.click(screen.getByRole('button', { name: /clear cache/i }))
     await user.click(screen.getByRole('button', { name: /yes, clear cache/i }))
     await waitFor(() => expect(search).toBe('?patient=7'))

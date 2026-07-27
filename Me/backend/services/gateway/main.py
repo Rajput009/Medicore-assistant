@@ -7,11 +7,13 @@ Postgres-backed response cache.
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 
+from backend.common import audit_store
 from backend.common.app import create_service_app
 from backend.common.cache import (
     close_pool,
@@ -37,6 +39,7 @@ from backend.common.idempotency import (
 from backend.common.idempotency import (
     store as idem_store,
 )
+from backend.common.middleware import audit_reference, set_audit_sink
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
 from backend.services.gateway.observations import (
@@ -81,9 +84,27 @@ async def lifespan(app: FastAPI):
             "cache initialisation failed; serving without cache",
             extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
         )
+
+    if settings.audit_index_enabled:
+        try:
+            await audit_store.start()
+            # Only register the sink once the writer is actually running,
+            # so records are never handed to a dead queue.
+            set_audit_sink(audit_store.submit)
+        except Exception as exc:
+            # The log stream still carries every audit record; only the
+            # searchable index is unavailable. That is a degradation to
+            # report, not a reason to refuse clinical traffic.
+            logger.warning(
+                "audit index unavailable; audit trail remains in the log stream",
+                extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+            )
+
     try:
         yield
     finally:
+        set_audit_sink(None)
+        await audit_store.stop()
         await stop_janitor()
         await fhir.aclose()
         await close_pool()
@@ -118,14 +139,29 @@ def health() -> Health:
 
 @app.get("/ready", tags=["ops"])
 async def ready(response: Response) -> dict[str, Any]:
-    """Readiness: verifies the cache database before accepting traffic."""
+    """Readiness: verifies the cache database before accepting traffic.
+
+    The audit index is reported but deliberately does **not** affect
+    readiness: the log stream remains the system of record, so a stalled index
+    is a searchability degradation, not a reason to pull a healthy pod out of
+    the load balancer. This endpoint is unauthenticated, so it reports a bare
+    status word — the counters live behind admin auth on /audit/stats.
+    """
+    audit_state = "disabled"
+    if settings.audit_index_enabled:
+        audit_state = "ok" if audit_store.stats()["running"] else "degraded"
+
     try:
         await cache_ping()
     except Exception:
         logger.warning("readiness check failed", exc_info=True)
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "degraded", "cache": "unavailable"}
-    return {"status": "ok", "cache": "ok"}
+        return {
+            "status": "degraded",
+            "cache": "unavailable",
+            "audit_index": audit_state,
+        }
+    return {"status": "ok", "cache": "ok", "audit_index": audit_state}
 
 
 @app.get("/secure")
@@ -546,4 +582,164 @@ async def admin_invalidate_cache(
         "resource": canonical,
         "patient": patient,
         "deleted": deleted,
+    }
+
+
+# --------------------------------------------------------------------------
+# Admin audit search — "who viewed MRN-X?"
+#
+# HIPAA 164.308(a)(1)(ii)(D) requires regular review of information system
+# activity, and 164.528 gives patients a right to an accounting of
+# disclosures. Both need the audit trail to be *queryable*, not merely
+# written. These endpoints are admin-only: the ability to see who looked at
+# whom is itself sensitive, and every query here is captured by the same audit
+# middleware, so investigating the investigators works too.
+# --------------------------------------------------------------------------
+
+# Only these outcomes exist in the index; anything else is a client mistake
+# worth reporting rather than an empty result set that looks like "no access".
+_AUDIT_OUTCOMES = frozenset({"success", "failure", "denied", "error"})
+
+# Bounds the most expensive query shape (a wide time range with no filters).
+MAX_AUDIT_WINDOW_DAYS = 366
+DEFAULT_AUDIT_WINDOW_DAYS = 30
+
+
+def _audit_window(
+    since: datetime | None, until: datetime | None
+) -> tuple[datetime, datetime]:
+    """Resolve and validate the reporting window.
+
+    Defaults to the last 30 days. An unbounded default would make the common
+    case a full-table scan as the index grows.
+    """
+    now = datetime.now(UTC)
+    resolved_until = until or now
+    resolved_since = since or (resolved_until - timedelta(days=DEFAULT_AUDIT_WINDOW_DAYS))
+
+    # Naive datetimes are ambiguous; assume UTC rather than guessing local.
+    if resolved_since.tzinfo is None:
+        resolved_since = resolved_since.replace(tzinfo=UTC)
+    if resolved_until.tzinfo is None:
+        resolved_until = resolved_until.replace(tzinfo=UTC)
+
+    if resolved_since > resolved_until:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'since' must be earlier than 'until'",
+        )
+    if resolved_until - resolved_since > timedelta(days=MAX_AUDIT_WINDOW_DAYS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Time range must not exceed {MAX_AUDIT_WINDOW_DAYS} days",
+        )
+    return resolved_since, resolved_until
+
+
+def _audit_unavailable(exc: Exception) -> HTTPException:
+    logger.warning(
+        "audit search failed",
+        extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+    )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Audit index temporarily unavailable",
+    )
+
+
+@app.get("/audit/search", tags=["audit"])
+async def audit_search(
+    patient: str | None = Query(
+        default=None,
+        max_length=64,
+        description="Patient/resource identifier, e.g. MRN-123. Hashed before "
+        "matching, exactly as the audit writer hashed it.",
+    ),
+    actor: str | None = Query(default=None, max_length=256),
+    outcome: str | None = Query(default=None, max_length=32),
+    resource_type: str | None = Query(default=None, max_length=64),
+    service: str | None = Query(default=None, max_length=64),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=audit_store.MAX_SEARCH_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(admin_only),
+) -> dict[str, Any]:
+    """Search the audit trail.
+
+    ``patient`` accepts the *raw* identifier a human knows (an MRN) and hashes
+    it with the deployment's audit salt before matching. Callers therefore
+    never need to know the pseudonymisation scheme, and no raw identifier is
+    written anywhere as a result of searching.
+    """
+    if outcome and outcome not in _AUDIT_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"outcome must be one of: {', '.join(sorted(_AUDIT_OUTCOMES))}",
+        )
+
+    resolved_since, resolved_until = _audit_window(since, until)
+    subject_ref = audit_reference(patient.strip()) if patient and patient.strip() else None
+
+    try:
+        result = await audit_store.search(
+            subject_ref=subject_ref,
+            actor=actor.strip() if actor else None,
+            outcome=outcome,
+            resource_type=resource_type.strip() if resource_type else None,
+            service=service.strip() if service else None,
+            since=resolved_since,
+            until=resolved_until,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        raise _audit_unavailable(exc) from exc
+
+    # Echo the resolved window so a caller relying on defaults knows exactly
+    # what was searched, and the pseudonym so results can be cross-referenced
+    # against the raw log stream.
+    result["since"] = resolved_since.isoformat()
+    result["until"] = resolved_until.isoformat()
+    result["subject_ref"] = subject_ref
+    return result
+
+
+@app.get("/audit/patient/{patient_id}/accessors", tags=["audit"])
+async def audit_patient_accessors(
+    patient_id: str,
+    limit: int = Query(default=50, ge=1, le=audit_store.MAX_SEARCH_LIMIT),
+    user: User = Depends(admin_only),
+) -> dict[str, Any]:
+    """Who accessed this patient's record, most recent first.
+
+    The summarised form of the same question: one row per clinician with an
+    access count and first/last timestamps, which is what a privacy
+    investigation starts from.
+    """
+    _validate_id(patient_id)
+    subject_ref = audit_reference(patient_id)
+    try:
+        accessors = await audit_store.actors_for_subject(subject_ref, limit=limit)
+    except Exception as exc:
+        raise _audit_unavailable(exc) from exc
+    return {
+        "patient_ref": subject_ref,
+        "accessors": accessors,
+        "count": len(accessors),
+    }
+
+
+@app.get("/audit/stats", tags=["audit"])
+async def audit_stats(user: User = Depends(admin_only)) -> dict[str, Any]:
+    """Audit index health.
+
+    ``dropped`` and ``failed`` are non-zero only when audit records did not
+    reach the index. Both should be alerted on: the log stream still has the
+    records, but the searchable trail is incomplete until they are backfilled.
+    """
+    return {
+        "enabled": settings.audit_index_enabled,
+        "retention_days": settings.audit_retention_days,
+        **audit_store.stats(),
     }

@@ -168,6 +168,26 @@ test.describe('cache administration', () => {
   })
 })
 
+test.describe('audit search', () => {
+  test('answers who viewed a record', async ({ stubbedPage: page }) => {
+    await page.goto('/admin')
+    await page.getByLabel(/patient id \/ mrn/i).fill('MRN-000123')
+    await page.getByRole('button', { name: /search audit trail/i }).click()
+
+    const summary = page.getByRole('table', { name: /clinicians who accessed this record/i })
+    await expect(summary).toBeVisible()
+    await expect(summary.getByText('dr.smith')).toBeVisible()
+    await expect(summary.getByText('dr.snoop')).toBeVisible()
+  })
+
+  test('shows denied attempts among the events', async ({ stubbedPage: page }) => {
+    await page.goto('/admin')
+    await page.getByRole('button', { name: /search audit trail/i }).click()
+    const events = page.getByRole('table', { name: /audit events/i })
+    await expect(events.getByText('denied')).toBeVisible()
+  })
+})
+
 test.describe('accessibility and responsiveness', () => {
   test('is keyboard navigable from the skip link', async ({ stubbedPage: page }) => {
     await page.goto('/')

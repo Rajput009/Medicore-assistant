@@ -118,6 +118,74 @@ export type CacheInvalidationResponse = {
   deleted: number
 }
 
+/** Outcomes recorded in the audit trail. */
+export const AUDIT_OUTCOMES = ['success', 'failure', 'denied', 'error'] as const
+export type AuditOutcome = (typeof AUDIT_OUTCOMES)[number]
+
+/**
+ * One recorded access. Patient identifiers are pseudonymised server-side, so
+ * `resource_ref` / `patient_ref` are salted hashes, never raw MRNs.
+ */
+export type AuditEvent = {
+  ts: string
+  request_id?: string | null
+  service?: string | null
+  actor_sub?: string | null
+  actor_roles?: string[] | null
+  method: string
+  path: string
+  status?: number | null
+  outcome?: AuditOutcome | string | null
+  resource_type?: string | null
+  resource_ref?: string | null
+  patient_ref?: string | null
+  bed_id?: string | null
+  client_ip?: string | null
+  user_agent?: string | null
+  duration_ms?: number | null
+  query_keys?: string[] | null
+}
+
+export type AuditSearchResponse = {
+  items: AuditEvent[]
+  count: number
+  total: number
+  limit: number
+  offset: number
+  since: string
+  until: string
+  /** The hash the server matched on; useful for cross-referencing raw logs. */
+  subject_ref: string | null
+}
+
+/** Filters accepted by the audit search endpoint. All optional. */
+export type AuditSearchParams = {
+  patient?: string
+  actor?: string
+  outcome?: AuditOutcome | ''
+  resource_type?: string
+  service?: string
+  since?: string
+  until?: string
+  limit?: number
+  offset?: number
+}
+
+/** One clinician's access history for a patient. */
+export type AuditAccessor = {
+  actor_sub: string
+  accesses: number
+  denied: number
+  first_access: string
+  last_access: string
+}
+
+export type AuditAccessorsResponse = {
+  patient_ref: string
+  accessors: AuditAccessor[]
+  count: number
+}
+
 /** Minimal FHIR shapes — the server returns full resources/bundles. */
 export type FhirResource = {
   resourceType: string

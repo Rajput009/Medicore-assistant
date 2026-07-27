@@ -28,6 +28,11 @@ data:
   RATE_LIMIT_PER_MINUTE: "120"
   LOGIN_RATE_LIMIT_PER_MINUTE: "10"
   AUDIT_LOG_RAW_IDENTIFIERS: "false"
+  # Queryable audit index (Postgres). Writes are queued off the request path;
+  # alert on the dropped/failed counters exposed by GET /audit/stats.
+  AUDIT_INDEX_ENABLED: "true"
+  # Six-year retention per HIPAA 164.316(b)(2)(i).
+  AUDIT_RETENTION_DAYS: "2555"
   # Shared rate-limit + token denylist across replicas.
   REDIS_ENABLED: "true"
   REDIS_HOST: "redis"
