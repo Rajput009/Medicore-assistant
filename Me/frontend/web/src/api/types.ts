@@ -38,6 +38,58 @@ export type QueueListResponse = {
   total: number
 }
 
+/** ACVPU level of consciousness — anything but Alert scores 3 on NEWS2. */
+export const ACVPU = ['A', 'C', 'V', 'P', 'U'] as const
+export type Acvpu = (typeof ACVPU)[number]
+
+/** Full NEWS2 input set (the /news2 endpoint), as opposed to the 3-vital /risk. */
+export type News2Request = {
+  respiratory_rate: number
+  spo2: number
+  temperature: number
+  systolic_bp: number
+  pulse: number
+  consciousness?: Acvpu
+  on_supplemental_oxygen?: boolean
+  use_spo2_scale2?: boolean
+}
+
+export type News2Parameter = {
+  name: string
+  value: number | string
+  score: number
+  rationale: string
+}
+
+export type News2Response = {
+  score: number
+  band: 'low' | 'low-medium' | 'medium' | 'high'
+  red_flag: boolean
+  recommended_response: string
+  monitoring_frequency: string
+  parameters: News2Parameter[]
+  disclaimer: string
+}
+
+/** Vitals persisted as FHIR Observations. */
+export type VitalsWrite = {
+  patient_id: string
+  respiratory_rate?: number
+  spo2?: number
+  temperature?: number
+  systolic_bp?: number
+  pulse?: number
+  consciousness?: Acvpu
+  news2_score?: number
+  encounter_id?: string
+}
+
+export type VitalsWriteResponse = {
+  ok: boolean
+  count: number
+  created: { id: string; code: string }[]
+}
+
 export type RiskRequest = {
   hr: number
   sbp: number

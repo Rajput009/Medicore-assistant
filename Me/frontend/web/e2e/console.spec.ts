@@ -109,31 +109,44 @@ test.describe('patient flow', () => {
 })
 
 test.describe('decision support', () => {
-  test('scores healthy vitals as low risk', async ({ stubbedPage: page }) => {
+  test('scores a healthy full vital set as low risk', async ({ stubbedPage: page }) => {
     await page.goto('/cds')
-    await page.getByRole('button', { name: /calculate risk/i }).click()
-    await expect(page.getByText('low')).toBeVisible()
+    await page.getByRole('button', { name: /calculate news2/i }).click()
+    await expect(page.getByText('low', { exact: true })).toBeVisible()
   })
 
   test('scores critical vitals as high risk', async ({ stubbedPage: page }) => {
     await page.goto('/cds')
-    await page.getByLabel(/heart rate/i).fill('190')
-    await page.getByLabel(/systolic/i).fill('60')
-    await page.getByLabel(/oxygen/i).fill('80')
-    await page.getByRole('button', { name: /calculate risk/i }).click()
-    await expect(page.getByText('high')).toBeVisible()
+    await page.getByLabel(/respiratory rate/i).fill('30')
+    await page.getByLabel(/systolic/i).fill('80')
+    await page.getByLabel(/oxygen saturation/i).fill('85')
+    await page.getByRole('button', { name: /calculate news2/i }).click()
+    await expect(page.getByText('high', { exact: true })).toBeVisible()
+  })
+
+  test('shows the per-parameter breakdown behind the score', async ({ stubbedPage: page }) => {
+    await page.goto('/cds')
+    await page.getByRole('button', { name: /calculate news2/i }).click()
+    await expect(page.getByRole('table')).toBeVisible()
+  })
+
+  test('saves vitals to the chart', async ({ stubbedPage: page }) => {
+    await page.goto('/cds?patient=MRN-42')
+    await page.getByRole('button', { name: /calculate news2/i }).click()
+    await page.getByRole('button', { name: /save vitals to chart/i }).click()
+    await expect(page.getByText(/saved 6 observations/i)).toBeVisible()
   })
 
   test('blocks impossible vitals before calling the server', async ({ stubbedPage: page }) => {
     await page.goto('/cds')
-    await page.getByLabel(/oxygen/i).fill('400')
-    await page.getByRole('button', { name: /calculate risk/i }).click()
+    await page.getByLabel(/oxygen saturation/i).fill('400')
+    await page.getByRole('button', { name: /calculate news2/i }).click()
     await expect(page.getByText(/must be between 1 and 100/i)).toBeVisible()
   })
 
   test('displays the clinical safety disclaimer', async ({ stubbedPage: page }) => {
     await page.goto('/cds')
-    await expect(page.getByText(/not a validated clinical model/i)).toBeVisible()
+    await expect(page.getByText(/not a diagnosis/i)).toBeVisible()
   })
 })
 

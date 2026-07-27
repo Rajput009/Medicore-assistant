@@ -103,6 +103,63 @@ export async function stubBackend(page: Page): Promise<void> {
     })
   })
 
+  // Full NEWS2 endpoint, scoring the parameters the specs exercise.
+  await page.route('**/cds/news2', async (route) => {
+    if (unauthorized(route)) return
+    const b = route.request().postDataJSON() as {
+      respiratory_rate: number
+      spo2: number
+      temperature: number
+      systolic_bp: number
+      pulse: number
+      consciousness?: string
+      on_supplemental_oxygen?: boolean
+    }
+    const scoreRr =
+      b.respiratory_rate <= 8 ? 3 : b.respiratory_rate <= 11 ? 1
+        : b.respiratory_rate <= 20 ? 0 : b.respiratory_rate <= 24 ? 2 : 3
+    const scoreSpo2 = b.spo2 <= 91 ? 3 : b.spo2 <= 93 ? 2 : b.spo2 <= 95 ? 1 : 0
+    const scoreTemp =
+      b.temperature <= 35 ? 3 : b.temperature <= 36 ? 1
+        : b.temperature <= 38 ? 0 : b.temperature <= 39 ? 1 : 2
+    const scoreSbp =
+      b.systolic_bp <= 90 ? 3 : b.systolic_bp <= 100 ? 2 : b.systolic_bp <= 110 ? 1 : 0
+    const scorePulse =
+      b.pulse <= 40 ? 3 : b.pulse <= 50 ? 1 : b.pulse <= 90 ? 0
+        : b.pulse <= 110 ? 1 : b.pulse <= 130 ? 2 : 3
+    const scoreAcvpu = (b.consciousness ?? 'A') === 'A' ? 0 : 3
+    const scoreO2 = b.on_supplemental_oxygen ? 2 : 0
+
+    const parameters = [
+      { name: 'respiratory_rate', value: b.respiratory_rate, score: scoreRr, rationale: 'RR' },
+      { name: 'spo2', value: b.spo2, score: scoreSpo2, rationale: 'SpO2' },
+      { name: 'temperature', value: b.temperature, score: scoreTemp, rationale: 'Temp' },
+      { name: 'systolic_bp', value: b.systolic_bp, score: scoreSbp, rationale: 'SBP' },
+      { name: 'pulse', value: b.pulse, score: scorePulse, rationale: 'Pulse' },
+      { name: 'consciousness', value: b.consciousness ?? 'A', score: scoreAcvpu, rationale: 'ACVPU' },
+    ]
+    const total = parameters.reduce((sum, p) => sum + p.score, 0) + scoreO2
+    const redFlag = parameters.some((p) => p.score >= 3)
+    const band =
+      total >= 7 ? 'high' : total >= 5 || redFlag ? 'medium' : total >= 1 ? 'low-medium' : 'low'
+
+    return json(route, {
+      score: total,
+      band,
+      red_flag: redFlag,
+      recommended_response:
+        band === 'high' ? 'Emergency critical care assessment.' : 'Routine monitoring.',
+      monitoring_frequency: band === 'high' ? 'Continuous' : '12 hourly',
+      parameters,
+      disclaimer: 'NEWS2 is a track-and-trigger aid, not a diagnosis.',
+    })
+  })
+
+  await page.route('**/api/fhir/observation', async (route) => {
+    if (unauthorized(route)) return
+    return json(route, { ok: true, count: 6, created: [] }, 201)
+  })
+
   await page.route('**/cds/risk', async (route) => {
     if (unauthorized(route)) return
     const b = route.request().postDataJSON() as { hr: number; sbp: number; spo2: number }

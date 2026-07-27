@@ -283,6 +283,81 @@ export const handlers = [
     })
   }),
 
+  /**
+   * Full NEWS2 stub. Implements the real RCP thresholds for the parameters
+   * the tests exercise, so a page test cannot pass against a score the actual
+   * standard would never produce.
+   */
+  http.post('/cds/news2', async ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const body = (await request.json()) as Record<string, unknown>
+    const rr = Number(body.respiratory_rate ?? 16)
+    const spo2 = Number(body.spo2 ?? 98)
+    const temp = Number(body.temperature ?? 37)
+    const sbp = Number(body.systolic_bp ?? 120)
+    const pulse = Number(body.pulse ?? 72)
+    const acvpu = String(body.consciousness ?? 'A')
+    const onOxygen = Boolean(body.on_supplemental_oxygen)
+
+    const scoreRr = rr <= 8 ? 3 : rr <= 11 ? 1 : rr <= 20 ? 0 : rr <= 24 ? 2 : 3
+    const scoreSpo2 = spo2 <= 91 ? 3 : spo2 <= 93 ? 2 : spo2 <= 95 ? 1 : 0
+    const scoreTemp =
+      temp <= 35 ? 3 : temp <= 36 ? 1 : temp <= 38 ? 0 : temp <= 39 ? 1 : 2
+    const scoreSbp = sbp <= 90 ? 3 : sbp <= 100 ? 2 : sbp <= 110 ? 1 : sbp >= 220 ? 3 : 0
+    const scorePulse =
+      pulse <= 40 ? 3 : pulse <= 50 ? 1 : pulse <= 90 ? 0 : pulse <= 110 ? 1 : pulse <= 130 ? 2 : 3
+    const scoreAcvpu = acvpu === 'A' ? 0 : 3
+    const scoreO2 = onOxygen ? 2 : 0
+
+    const parameters = [
+      { name: 'respiratory_rate', value: rr, score: scoreRr, rationale: 'RR band' },
+      { name: 'spo2', value: spo2, score: scoreSpo2, rationale: 'SpO2 band' },
+      { name: 'temperature', value: temp, score: scoreTemp, rationale: 'Temp band' },
+      { name: 'systolic_bp', value: sbp, score: scoreSbp, rationale: 'SBP band' },
+      { name: 'pulse', value: pulse, score: scorePulse, rationale: 'Pulse band' },
+      { name: 'consciousness', value: acvpu, score: scoreAcvpu, rationale: 'ACVPU' },
+      { name: 'supplemental_oxygen', value: onOxygen ? 'yes' : 'no', score: scoreO2, rationale: 'O2' },
+    ]
+    const total = parameters.reduce((sum, p) => sum + p.score, 0)
+    const redFlag = parameters.some((p) => p.score >= 3)
+    const band = total >= 7 ? 'high' : total >= 5 || redFlag ? 'medium' : total >= 1 ? 'low-medium' : 'low'
+
+    return HttpResponse.json({
+      score: total,
+      band,
+      red_flag: redFlag,
+      recommended_response:
+        band === 'high' ? 'Emergency critical care assessment.' : 'Continue routine monitoring.',
+      monitoring_frequency: band === 'high' ? 'Continuous' : '12 hourly',
+      parameters,
+      disclaimer: 'NEWS2 is a track-and-trigger aid, not a diagnosis.',
+    })
+  }),
+
+  /** Observation write (vitals capture). */
+  http.post('/api/fhir/observation', async ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    const body = (await request.json()) as Record<string, unknown>
+    if (!body.patient_id) {
+      return HttpResponse.json({ detail: 'patient_id is required' }, { status: 422 })
+    }
+    const keys = [
+      'respiratory_rate',
+      'spo2',
+      'temperature',
+      'systolic_bp',
+      'pulse',
+      'consciousness',
+      'news2_score',
+    ]
+    const created = keys
+      .filter((k) => body[k] !== undefined && body[k] !== null)
+      .map((k, i) => ({ id: `obs-${i + 1}`, code: k }))
+    return HttpResponse.json({ ok: true, created, count: created.length }, { status: 201 })
+  }),
+
   http.post('/cds/risk', async ({ request }) => {
     const denied = requireAuth(request)
     if (denied) return denied

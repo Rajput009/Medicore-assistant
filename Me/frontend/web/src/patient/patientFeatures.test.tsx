@@ -8,7 +8,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 
 import { AuthProvider } from '../auth/AuthContext'
-import { CdsPage, acuityFromRisk } from '../pages/CdsPage'
+import { CdsPage, acuityFromNews2 } from '../pages/CdsPage'
 import { DashboardPage } from '../pages/DashboardPage'
 import { groupBedsByWard, wardSummary, WardBoardPage } from '../pages/WardBoardPage'
 import { partitionWorklist, waitingDepartments, WorklistPage } from '../pages/WorklistPage'
@@ -16,7 +16,7 @@ import { makeToken, renderWithProviders, seedToken } from '../test/helpers'
 import { server } from '../test/server'
 import { PatientChartDrawer } from './PatientChartDrawer'
 import { PatientChartProvider } from './PatientChartContext'
-import type { Bed, QueueItem, RiskResponse } from '../api/types'
+import type { Bed, News2Response, QueueItem } from '../api/types'
 
 function shell(ui: React.ReactElement, route = '/') {
   seedToken(makeToken({ sub: 'dr.smith', roles: ['clinician'] }))
@@ -71,20 +71,25 @@ describe('groupBedsByWard', () => {
   })
 })
 
-describe('acuityFromRisk', () => {
-  const base: RiskResponse = {
-    score: 0.2,
-    class_label: 'low',
-    news2_score: 1,
+describe('acuityFromNews2', () => {
+  const base: News2Response = {
+    score: 1,
+    band: 'low',
     red_flag: false,
     recommended_response: 'ok',
+    monitoring_frequency: '12 hourly',
+    parameters: [],
     disclaimer: 'd',
   }
   it('maps bands to ESI-like acuity', () => {
-    expect(acuityFromRisk(base)).toBe(4)
-    expect(acuityFromRisk({ ...base, class_label: 'medium', news2_score: 5 })).toBe(2)
-    expect(acuityFromRisk({ ...base, class_label: 'high', news2_score: 9 })).toBe(1)
-    expect(acuityFromRisk({ ...base, red_flag: true, news2_score: 0 })).toBe(1)
+    expect(acuityFromNews2(base)).toBe(4)
+    expect(acuityFromNews2({ ...base, band: 'medium', score: 5 })).toBe(2)
+    expect(acuityFromNews2({ ...base, band: 'high', score: 9 })).toBe(1)
+  })
+
+  it('treats a red flag as top acuity even when the total is low', () => {
+    // The single-parameter rule is the whole point of the red flag.
+    expect(acuityFromNews2({ ...base, red_flag: true, score: 3 })).toBe(1)
   })
 })
 
@@ -452,13 +457,14 @@ describe('CdsPage escalate', () => {
     const user = userEvent.setup()
     let enqueued: unknown = null
     server.use(
-      http.post('/cds/risk', () =>
+      http.post('/cds/news2', () =>
         HttpResponse.json({
-          score: 0.9,
-          class_label: 'high',
-          news2_score: 9,
+          score: 9,
+          band: 'high',
           red_flag: true,
           recommended_response: 'Emergency assessment',
+          monitoring_frequency: 'Continuous',
+          parameters: [],
           disclaimer: 'NEWS2',
         }),
       ),
@@ -469,7 +475,7 @@ describe('CdsPage escalate', () => {
     )
 
     renderWithProviders(<CdsPage />, { route: '/cds?patient=MRN-99' })
-    await user.click(screen.getByRole('button', { name: /calculate risk/i }))
+    await user.click(screen.getByRole('button', { name: /calculate news2/i }))
     expect(await screen.findByText('high')).toBeInTheDocument()
 
     const escalateBtn = await screen.findByRole('button', { name: /escalate to triage/i })

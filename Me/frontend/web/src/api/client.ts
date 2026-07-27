@@ -17,9 +17,13 @@ import type {
   Health,
   QueueItem,
   QueueListResponse,
+  News2Request,
+  News2Response,
   RiskRequest,
   RiskResponse,
   TokenResponse,
+  VitalsWrite,
+  VitalsWriteResponse,
 } from './types'
 import { FHIR_ROUTE } from './types'
 
@@ -375,6 +379,39 @@ export const api = {
         idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
       },
     )
+  },
+
+  /** Full NEWS2 assessment with a per-parameter breakdown. */
+  news2(
+    payload: News2Request,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<News2Response> {
+    return request<News2Response>(`${BASE.cds}/news2`, {
+      method: 'POST',
+      body: payload,
+      signal,
+    })
+  },
+
+  /**
+   * Persist vitals as FHIR Observations.
+   *
+   * Takes an explicit idempotency key so a retry re-files nothing: pass the
+   * key from `retryWithIdempotency`, never a fresh one per attempt.
+   */
+  saveVitals(
+    payload: VitalsWrite,
+    _token?: string | null,
+    signal?: AbortSignal,
+    idempotencyKey?: string,
+  ): Promise<VitalsWriteResponse> {
+    return request<VitalsWriteResponse>(`${BASE.gateway}/fhir/observation`, {
+      method: 'POST',
+      body: payload,
+      signal,
+      idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
+    })
   },
 
   risk(
