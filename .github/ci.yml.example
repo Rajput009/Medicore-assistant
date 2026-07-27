@@ -28,7 +28,7 @@ jobs:
             fastapi "uvicorn[standard]" "pydantic>=2" pydantic-settings \
             "python-jose[cryptography]" httpx asyncpg pymongo motor authlib \
             itsdangerous python-multipart \
-            pgserver mongomock-motor
+            pgserver mongomock-motor fakeredis pyyaml
 
       - name: Lint
         run: ruff check backend

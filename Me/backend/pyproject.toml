@@ -45,6 +45,10 @@ types-requests = "^2.32.0.20240602"
 pgserver = "^0.1.4"
 # In-process MongoDB wire-semantics engine used by repository tests.
 mongomock-motor = "^0.0.34"
+# Redis protocol emulator for rate-limit + revocation path tests.
+fakeredis = "^2.21.0"
+# YAML assertions over k8s manifests (NetworkPolicy / Ingress structure).
+pyyaml = "^6.0"
 
 [build-system]
 requires = ["poetry-core"]

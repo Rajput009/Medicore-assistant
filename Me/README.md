@@ -48,20 +48,29 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression + e2e | `backend/tests/test_*.py` | 362 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 379 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
 
-Backend DB coverage notes:
+Backend DB / residual coverage notes:
 
 - **PostgreSQL (real):** `tests/test_cache_postgres.py` boots a genuine PostgreSQL
   server via the `pgserver` wheel (no Docker) and exercises the FHIR cache DDL,
   jsonb codec, `ON CONFLICT` upserts, SQL-side TTL, invalidation and janitor.
-- **MongoDB (mock):** `tests/test_repository.py` uses `mongomock-motor`. The mock
-  enforces the unique partial index the triage queue depends on; replica-set
-  behaviour, retryable writes and multi-document transactions are not covered.
+- **MongoDB (mock):** `tests/test_repository.py` + residual suite use
+  `mongomock-motor`. **Proven on the mock:** unique partial index on
+  `(patient_id) where status=waiting`, including re-queue after complete.
+  **Not proven:** replica-set behaviour, retryable writes, multi-document
+  transactions (real `mongod` download is TLS-blocked in this environment).
+- **Redis paths:** `tests/test_residual_verification.py` drives revocation and
+  rate-limit through `fakeredis` (same INCR/SETEX/EXISTS commands production
+  uses) and proves the in-process fallback when Redis errors.
+- **NetworkPolicy / Ingress:** residual suite parses the k8s YAML and asserts
+  default-deny ingress+egress, per-workload egress allow-lists, TLS ingress,
+  path routing for `/api` `/auth` `/flow` `/cds`, and that **no mesh mTLS
+  resources are claimed**.
 
-Both suites `importorskip` cleanly when their engine is missing.
+Suites `importorskip` cleanly when optional engines are missing.
 
 Browser e2e requires `npx playwright install` once to download browsers.
 
