@@ -178,12 +178,24 @@ def note_audit_patient(request: Request, patient_id: str | None) -> None:
         pass
 
 
-# A search can legitimately disclose a page of patients. The audit record
-# names them so each disclosure is attributable, but the list is bounded: an
-# unbounded one would let a wide search write an enormous row, and past a
-# certain size the useful signal is "this query returned a lot of people",
-# which `subject_count` already carries.
-MAX_AUDITED_SUBJECTS = 25
+# A search can legitimately disclose a page of patients, and the audit record
+# names each one so the disclosure appears in that person's accounting.
+#
+# This bound exists only to stop a pathological caller writing an unbounded
+# row; it must never truncate a *legitimate* search. That means it has to sit
+# at or above the largest page any service will return — the gateway caps
+# pages at MAX_COUNT (100), so 100 is the floor here. An earlier value of 25
+# was below the gateway's *default* page of 50, which meant an ordinary search
+# silently dropped half its subjects from the trail: querying one of those
+# patients returned an empty result, indistinguishable from "never accessed".
+#
+# The invariant is enforced by test_audit_attribution.py, because the two
+# constants live in different modules (common must not import a service) and
+# would otherwise drift apart unnoticed.
+#
+# If truncation ever does occur, `subjects_truncated` marks the record, so an
+# incomplete list is visibly incomplete rather than quietly wrong.
+MAX_AUDITED_SUBJECTS = 100
 
 
 def note_audit_patients(request: Request, patient_ids: list[str]) -> None:
@@ -330,9 +342,11 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         if resolved and not record.get("patient_ref"):
             record["patient_ref"] = self._reference(str(resolved))
 
-        # A search discloses a page of patients, not just one. Name them all
-        # so each person's accounting is complete; the count is recorded
-        # separately because the list is truncated for very wide results.
+        # A search discloses a page of patients, not just one. Name every one
+        # so each person's accounting is complete. MAX_AUDITED_SUBJECTS is set
+        # at or above the largest page any service returns, so this should not
+        # truncate in practice; when it does, say so explicitly rather than
+        # emitting a short list that looks complete.
         disclosed = getattr(request.state, "audit_patient_ids", None)
         if disclosed:
             record["subject_count"] = len(disclosed)
@@ -340,6 +354,19 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
                 self._reference(str(pid))
                 for pid in disclosed[:MAX_AUDITED_SUBJECTS]
             ]
+            if len(disclosed) > MAX_AUDITED_SUBJECTS:
+                # An incomplete accounting must be visibly incomplete: a query
+                # for a dropped patient otherwise returns nothing, which reads
+                # exactly like "this record was never accessed".
+                record["subjects_truncated"] = True
+                logger.warning(
+                    "audit subject list truncated; accounting is incomplete",
+                    extra={
+                        "event": "audit_subjects_truncated",
+                        "disclosed": len(disclosed),
+                        "recorded": MAX_AUDITED_SUBJECTS,
+                    },
+                )
 
         # An emergency override is the single most review-worthy event in the
         # trail, so it is carried on the record itself rather than left to be

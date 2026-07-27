@@ -151,6 +151,8 @@ export type AuditEvent = {
   subject_refs?: string[] | null
   /** True number disclosed, even when subject_refs was truncated. */
   subject_count?: number | null
+  /** True when subject_refs omits some of the patients disclosed. */
+  subjects_truncated?: boolean | null
 }
 
 export type AuditSearchResponse = {

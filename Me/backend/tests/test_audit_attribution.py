@@ -335,27 +335,86 @@ class TestGatewayAttribution:
         record = records(caplog)[-1]
         assert record["subject_refs"] == [audit_reference("MRN-OBS")]
 
-    def test_the_subject_list_is_bounded(self, gateway, monkeypatch, caplog):
-        """A very wide search must not write an unbounded audit row; the count
-        still reports the true scale of the disclosure."""
-        import backend.services.gateway.main as gw
-        from backend.common.middleware import MAX_AUDITED_SUBJECTS
+    def test_the_audit_cap_cannot_truncate_a_legitimate_search(self):
+        """The invariant that makes attribution trustworthy.
 
-        async def many(resource, params=None):
+        These constants live in different modules — ``common`` must not import
+        a service — so nothing but this test stops them drifting apart. They
+        did drift: the cap was 25 while the gateway's *default* page is 50, so
+        an ordinary search silently dropped half its subjects, and querying one
+        of the dropped patients returned an empty result indistinguishable from
+        "this record was never accessed".
+        """
+        from backend.common.middleware import MAX_AUDITED_SUBJECTS
+        from backend.services.gateway.main import DEFAULT_COUNT, MAX_COUNT
+
+        assert MAX_AUDITED_SUBJECTS >= MAX_COUNT, (
+            f"The audit subject cap ({MAX_AUDITED_SUBJECTS}) is below the "
+            f"largest page the gateway will return ({MAX_COUNT}), so a "
+            "legitimate search will silently drop patients from the audit "
+            "trail. Raise MAX_AUDITED_SUBJECTS, or normalise subjects into "
+            "their own table."
+        )
+        assert MAX_AUDITED_SUBJECTS >= DEFAULT_COUNT
+
+    def test_a_full_page_of_results_is_named_in_full(self, gateway, monkeypatch, caplog):
+        """The largest page the gateway permits must be recorded completely."""
+        import backend.services.gateway.main as gw
+
+        async def full_page(resource, params=None):
+            return {
+                "resourceType": "Bundle",
+                "entry": [
+                    {"resource": {"resourceType": "Patient", "id": f"MRN-{i:03d}"}}
+                    for i in range(gw.MAX_COUNT)
+                ],
+            }
+
+        monkeypatch.setattr(gw.fhir, "search", full_page)
+        with caplog.at_level(logging.INFO, logger="medicore.audit"):
+            gateway.get("/fhir/patient/search?family=Common", headers=auth())
+        record = records(caplog)[-1]
+
+        assert record["subject_count"] == gw.MAX_COUNT
+        assert len(record["subject_refs"]) == gw.MAX_COUNT
+        assert not record.get("subjects_truncated")
+        # The last patient on the page is as findable as the first: being
+        # result #100 rather than #1 is an arbitrary ordering detail.
+        assert audit_reference(f"MRN-{gw.MAX_COUNT - 1:03d}") in record["subject_refs"]
+
+    def test_truncation_is_flagged_rather_than_silent(self, gateway, monkeypatch, caplog):
+        """Belt and braces for a future MAX_COUNT rise.
+
+        If the cap is ever exceeded, the record says so — an incomplete
+        accounting must be visibly incomplete rather than quietly wrong.
+        """
+        import backend.common.middleware as mw
+        import backend.services.gateway.main as gw
+
+        monkeypatch.setattr(mw, "MAX_AUDITED_SUBJECTS", 3)
+
+        async def five(resource, params=None):
             return {
                 "resourceType": "Bundle",
                 "entry": [
                     {"resource": {"resourceType": "Patient", "id": f"MRN-{i}"}}
-                    for i in range(60)
+                    for i in range(5)
                 ],
             }
 
-        monkeypatch.setattr(gw.fhir, "search", many)
+        monkeypatch.setattr(gw.fhir, "search", five)
         with caplog.at_level(logging.INFO, logger="medicore.audit"):
             gateway.get("/fhir/patient/search?family=Common", headers=auth())
         record = records(caplog)[-1]
-        assert record["subject_count"] == 60
-        assert len(record["subject_refs"]) == MAX_AUDITED_SUBJECTS
+
+        assert record["subject_count"] == 5
+        assert len(record["subject_refs"]) == 3
+        assert record["subjects_truncated"] is True
+        assert any(
+            getattr(r, "event", None) == "audit_subjects_truncated"
+            and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
 
     def test_an_empty_search_records_no_subjects(self, gateway, caplog):
         """Finding nobody is not a disclosure."""

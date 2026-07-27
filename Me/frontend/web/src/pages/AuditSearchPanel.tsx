@@ -78,6 +78,16 @@ const EventRow: React.FC<{ event: AuditEvent }> = ({ event }) => (
           {event.subject_count} {event.subject_count === 1 ? 'patient' : 'patients'} returned
         </div>
       )}
+      {/* An incomplete accounting must look incomplete: without this, a
+          reviewer would read the stored list as the whole disclosure. */}
+      {event.subjects_truncated && (
+        <div style={{ marginTop: 4 }}>
+          <Badge tone="warn">partial list</Badge>{' '}
+          <span className="muted" style={{ fontSize: '0.78rem' }}>
+            not every patient recorded
+          </span>
+        </div>
+      )}
     </td>
     <td className="mono">{event.client_ip ?? '—'}</td>
   </tr>

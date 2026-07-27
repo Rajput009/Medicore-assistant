@@ -239,7 +239,7 @@ class TestSchema:
 class TestRowProjection:
     def test_maps_every_column(self, audit):
         row = audit.row_from_record(record())
-        assert len(row) == 21
+        assert len(row) == 22
         assert row[3] == "dr.smith"
         assert row[4] == ["clinician"]
         assert row[7] == 200
@@ -250,11 +250,21 @@ class TestRowProjection:
         )
         assert row[19] == ["sha256:a", "sha256:b"]
         assert row[20] == 2
+        assert row[21] is False
+
+    def test_truncation_flag_is_projected(self, audit):
+        row = audit.row_from_record(
+            record(subject_refs=["sha256:a"], subject_count=9, subjects_truncated=True)
+        )
+        assert row[21] is True
 
     def test_a_single_target_read_has_no_subject_list(self, audit):
         row = audit.row_from_record(record())
         assert row[19] is None
         assert row[20] is None
+        # Absent must never read as "truncated"; that would imply a missing
+        # disclosure where there was none.
+        assert row[21] is False
 
     def test_break_glass_defaults_to_false(self, audit):
         """A missing flag must never read as an override."""
@@ -585,6 +595,27 @@ class TestSearch:
         assert run(audit.search(subject_ref="sha256:also-here"))["total"] == 1
         # But not someone who was never returned.
         assert run(audit.search(subject_ref="sha256:elsewhere"))["total"] == 0
+
+    def test_a_truncated_record_is_marked_in_the_index(self, audit):
+        """An incomplete accounting must be visibly incomplete when queried,
+        not only in the log stream."""
+        insert(
+            audit,
+            record(
+                sub="dr.wide",
+                patient_ref=None,
+                resource_ref=None,
+                subject_refs=["sha256:kept"],
+                subject_count=200,
+                subjects_truncated=True,
+            ),
+        )
+        found = run(audit.search(subject_ref="sha256:kept"))
+        assert found["total"] == 1
+        item = found["items"][0]
+        assert item["subjects_truncated"] is True
+        # The count stays honest even though the list does not.
+        assert item["subject_count"] == 200
 
     def test_search_disclosure_appears_in_the_accessor_summary(self, audit):
         """'Who has seen this patient?' must include whoever ran a search

@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
     break_glass  BOOLEAN NOT NULL DEFAULT false,
     break_glass_reason TEXT,
     subject_refs TEXT[],
-    subject_count INTEGER
+    subject_count INTEGER,
+    subjects_truncated BOOLEAN NOT NULL DEFAULT false
 );
 """
 
@@ -100,6 +101,8 @@ _MIGRATIONS = (
     "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS break_glass_reason TEXT;",
     "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS subject_refs TEXT[];",
     "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS subject_count INTEGER;",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS "
+    "subjects_truncated BOOLEAN NOT NULL DEFAULT false;",
 )
 
 # Every index below backs a question an investigator actually asks. Without
@@ -131,10 +134,10 @@ INSERT INTO audit_events (
     ts, request_id, service, actor_sub, actor_roles, method, path, status,
     outcome, resource_type, resource_ref, patient_ref, bed_id, client_ip,
     user_agent, duration_ms, query_keys, break_glass, break_glass_reason,
-    subject_refs, subject_count
+    subject_refs, subject_count, subjects_truncated
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21
+    $17, $18, $19, $20, $21, $22
 )
 """
 
@@ -160,6 +163,7 @@ _COLUMNS = (
     "break_glass_reason",
     "subject_refs",
     "subject_count",
+    "subjects_truncated",
 )
 
 
@@ -216,6 +220,7 @@ def row_from_record(record: dict[str, Any], *, now: datetime | None = None) -> t
         int(record["subject_count"])
         if isinstance(record.get("subject_count"), (int, float))
         else None,
+        bool(record.get("subjects_truncated", False)),
     )
 
 

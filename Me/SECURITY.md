@@ -148,11 +148,29 @@ name or date range that returns ten patients records all ten in
 nothing identifying is still a disclosure to everyone it returned. Cache hits
 are attributed too: serving from cache is still a disclosure.
 
-`subject_refs` is capped at 25 entries to bound the row size, but
-`subject_count` always carries the true number, so a very wide search reports
-its real scale rather than appearing to have returned 25 people. A GIN index
-makes "was this patient in anyone's search results?" a lookup rather than a
-scan.
+`subject_refs` is bounded by `MAX_AUDITED_SUBJECTS`, which is pinned at or
+above the largest page any service returns (`MAX_COUNT`, currently 100). The
+bound exists to stop a pathological caller writing an unbounded row — it must
+never truncate a *legitimate* search, because a patient dropped from the list
+is unfindable, and an empty accessor result reads exactly like "this record
+was never accessed".
+
+That invariant was violated once: the cap was 25 while the gateway's *default*
+page is 50, so an ordinary name search silently dropped half its subjects. The
+two constants live in different modules (`common` must not import a service),
+so `test_audit_attribution.py` asserts `MAX_AUDITED_SUBJECTS >= MAX_COUNT` to
+stop them drifting apart again.
+
+Cost, stated plainly: a full 100-patient page adds ~3.9 KB to that one audit
+row, and only search rows carry the array at all. At 10k searches/day, all
+returning full pages, that is ~15 GB/year — the pessimistic bound, not the
+expected one. If that becomes material, normalise subjects into an
+`audit_event_subjects` table rather than reinstating a lossy cap.
+
+Should the cap ever be exceeded anyway, the record sets `subjects_truncated`
+and a WARNING is logged, so an incomplete accounting is visibly incomplete
+rather than quietly wrong. A GIN index makes "was this patient in anyone's
+search results?" a lookup rather than a scan.
 
 ## Break-glass (emergency scope override)
 

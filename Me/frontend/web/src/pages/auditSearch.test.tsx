@@ -260,6 +260,53 @@ describe('search disclosure (R12)', () => {
   })
 })
 
+describe('truncated disclosure lists', () => {
+  it('flags a record whose subject list is incomplete', async () => {
+    /** Without the flag a reviewer reads the stored list as the whole
+        disclosure, which is the failure this marker exists to prevent. */
+    server.use(
+      http.get('/api/audit/search', () =>
+        HttpResponse.json({
+          items: [
+            {
+              ts: new Date().toISOString(),
+              actor_sub: 'dr.wide',
+              method: 'GET',
+              path: '/fhir/patient/search',
+              status: 200,
+              outcome: 'success',
+              resource_ref: null,
+              patient_ref: null,
+              subject_count: 200,
+              subjects_truncated: true,
+            },
+          ],
+          count: 1,
+          total: 1,
+          limit: 25,
+          offset: 0,
+          since: new Date().toISOString(),
+          until: new Date().toISOString(),
+          subject_ref: null,
+        }),
+      ),
+    )
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    const events = await screen.findByRole('table', { name: /audit events/i })
+    expect(within(events).getByText(/partial list/i)).toBeInTheDocument()
+    // The honest total is still shown alongside it.
+    expect(within(events).getByText(/200 patients returned/i)).toBeInTheDocument()
+  })
+
+  it('does not flag a complete disclosure list', async () => {
+    const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
+    await user.click(screen.getByRole('button', { name: /search audit trail/i }))
+    const events = await screen.findByRole('table', { name: /audit events/i })
+    expect(within(events).queryByText(/partial list/i)).not.toBeInTheDocument()
+  })
+})
+
 describe('break-glass review', () => {
   it('shows the override and its reason on the event', async () => {
     const { user } = renderWithProviders(<AuditSearchPanel />, asAdmin)
