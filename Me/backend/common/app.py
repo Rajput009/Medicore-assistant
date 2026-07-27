@@ -23,6 +23,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from backend.common.config import Settings, settings as default_settings
 from backend.common.csrf import CookieCSRFMiddleware
+from backend.common.errors import install_error_handlers
 from backend.common.hardening import (
     BodySizeLimitMiddleware,
     RateLimitMiddleware,
@@ -114,6 +115,7 @@ def create_service_app(
     if hosts:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
 
+    install_error_handlers(app)
     return app
 
 

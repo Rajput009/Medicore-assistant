@@ -28,9 +28,52 @@ class Principal(BaseModel):
     sub: str
     roles: list[str] = []
     claims: dict[str, Any] = {}
+    # Optional ward / department scope from IdP claims (e.g. wards=["A","ICU"]).
+    wards: list[str] = []
+    departments: list[str] = []
 
     def has_any_role(self, required: tuple[str, ...] | list[str]) -> bool:
         return bool(set(required) & set(self.roles))
+
+    def can_access_ward(self, ward: str | None) -> bool:
+        """True when the principal may touch data for ``ward``.
+
+        Empty scope = unrestricted (legacy tokens / admins without claims).
+        Admins always pass. Otherwise the ward must appear in ``wards``.
+        """
+        if not ward:
+            return True
+        if "admin" in self.roles:
+            return True
+        if not self.wards:
+            return True
+        return ward in self.wards
+
+    def can_access_department(self, dept: str | None) -> bool:
+        if not dept:
+            return True
+        if "admin" in self.roles:
+            return True
+        if not self.departments:
+            return True
+        return dept in self.departments
+
+    def can_access_patient(self, patient_id: str | None, *, assigned: set[str] | None = None) -> bool:
+        """Patient-level gate.
+
+        - Admins: always.
+        - If ``assigned`` is provided (e.g. from an encounter service), the
+          patient must be in that set unless the caller is admin.
+        - Otherwise fall through (role-only) — full chart ACL needs an
+          encounter index; this hook is the extension point.
+        """
+        if not patient_id:
+            return True
+        if "admin" in self.roles:
+            return True
+        if assigned is not None:
+            return patient_id in assigned
+        return True
 
 
 def normalise_roles(raw: Any) -> list[str]:
@@ -50,6 +93,16 @@ def normalise_roles(raw: Any) -> list[str]:
         if lowered in VALID_ROLES and lowered not in seen:
             seen.append(lowered)
     return seen
+
+
+def _string_list_claim(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(v).strip() for v in raw if str(v).strip()]
+    return []
 
 
 def _unauthorized(detail: str = "Not authenticated") -> HTTPException:
@@ -105,8 +158,30 @@ def get_principal(
         raise _unauthorized("Invalid token")
 
     return Principal(
-        sub=str(sub), roles=normalise_roles(claims.get("roles")), claims=claims
+        sub=str(sub),
+        roles=normalise_roles(claims.get("roles")),
+        claims=claims,
+        wards=_string_list_claim(claims.get("wards") or claims.get("ward")),
+        departments=_string_list_claim(
+            claims.get("departments") or claims.get("depts") or claims.get("dept")
+        ),
     )
+
+
+def require_ward_access(ward: str | None, principal: Principal) -> None:
+    if not principal.can_access_ward(ward):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised for this ward",
+        )
+
+
+def require_department_access(dept: str | None, principal: Principal) -> None:
+    if not principal.can_access_department(dept):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised for this department",
+        )
 
 
 def requires_roles(*required: str):
