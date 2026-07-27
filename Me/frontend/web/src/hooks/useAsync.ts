@@ -16,6 +16,27 @@ export function describeError(err: unknown): { message: string; statusCode?: num
       return { message: 'You do not have permission to view this.', statusCode: 403 }
     }
     if (err.status === 404) return { message: 'Not found.', statusCode: 404 }
+    if (err.status === 409) {
+      return {
+        message: err.detail || 'Someone else changed this first. Reload and retry.',
+        statusCode: 409,
+      }
+    }
+    if (err.status === 413) {
+      return { message: 'That request was too large.', statusCode: 413 }
+    }
+    if (err.status === 429) {
+      return {
+        message: 'Too many requests. Please wait a moment and try again.',
+        statusCode: 429,
+      }
+    }
+    if (err.status === 503) {
+      return {
+        message: 'This service is temporarily unavailable. Try again shortly.',
+        statusCode: 503,
+      }
+    }
     if (err.status === 502) {
       return { message: 'The upstream FHIR server is unavailable.', statusCode: 502 }
     }

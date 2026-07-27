@@ -1,0 +1,50 @@
+# Default-deny east-west traffic. Without this any compromised pod in the
+# cluster can reach the PHI-serving services directly, bypassing the gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: medicore
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Only the ingress controller may reach the gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: medicore
+spec:
+  podSelector:
+    matchLabels: { app: gateway }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { name: ingress-nginx }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# Internal services accept traffic only from the gateway, never from arbitrary
+# pods. Probes come from the kubelet, which NetworkPolicy does not restrict.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: internal-services-ingress
+  namespace: medicore
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [patient-flow, cds, auth]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: gateway }
+      ports:
+        - { protocol: TCP, port: 8081 }
+        - { protocol: TCP, port: 8082 }
+        - { protocol: TCP, port: 8083 }

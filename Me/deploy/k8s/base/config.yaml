@@ -15,17 +15,16 @@ data:
   OTEL_SERVICE_NAMESPACE: "medicore"
   ALLOWED_ORIGINS: "https://console.medicore.local"
 ---
-# Placeholder only. Create the real Secret out-of-band (sealed-secrets,
-# External Secrets Operator, cloud secret manager) — never commit values.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: medicore-secrets
-  namespace: medicore
-type: Opaque
-stringData:
-  jwt-secret: "REPLACE_ME"
-  session-secret: "REPLACE_ME"
-  postgres-password: "REPLACE_ME"
-  fhir-client-secret: "REPLACE_ME"
-  oidc-client-secret: "REPLACE_ME"
+# NOTE: the medicore-secrets Secret is deliberately NOT defined here.
+#
+# Committing a placeholder invites it being filled in and pushed. Create it
+# out-of-band with sealed-secrets, External Secrets Operator, or your cloud
+# secret manager. Required keys:
+#
+#   jwt-secret          >= 32 random chars  (openssl rand -hex 32)
+#   session-secret      >= 32 random chars
+#   postgres-password   >= 12 chars
+#   fhir-client-secret  from your EHR vendor
+#   oidc-client-secret  from your IdP
+#
+# Services refuse to start in production if any of these is a placeholder.

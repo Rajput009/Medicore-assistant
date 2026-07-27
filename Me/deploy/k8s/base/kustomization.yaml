@@ -12,3 +12,4 @@ resources:
   - cds.yaml
   - ingress.yaml
   - pdb.yaml
+  - networkpolicy.yaml

@@ -16,6 +16,17 @@ describe('describeError', () => {
     expect(describeError(new ApiError(status, 'raw')).message).toBe(expected)
   })
 
+  it.each([
+    [409, /changed this first|conflict/i],
+    [413, /too large/i],
+    [429, /too many requests/i],
+    [503, /temporarily unavailable/i],
+  ])('maps HTTP %i to actionable guidance', (status, pattern) => {
+    // These arrive from the hardening middleware; a raw server string would
+    // be meaningless to a clinician mid-shift.
+    expect(describeError(new ApiError(status, '')).message).toMatch(pattern)
+  })
+
   it('uses the server detail for other statuses', () => {
     expect(describeError(new ApiError(409, 'conflict')).message).toBe('conflict')
   })

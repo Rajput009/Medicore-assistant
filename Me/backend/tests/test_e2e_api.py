@@ -225,7 +225,10 @@ class TestFhirProxy:
         r = client.get("/fhir/patient/search?patient=123", headers=bearer("clinician"))
         assert r.status_code == 200
         assert r.json()["resourceType"] == "Bundle"
-        assert fhir.search_calls == [("Patient", {"patient": "123"})]
+        assert len(fhir.search_calls) == 1
+        resource, params = fhir.search_calls[0]
+        assert resource == "Patient"
+        assert params["patient"] == "123"
         assert fhir.read_calls == []
 
     def test_query_parameters_are_forwarded(self, gateway):
@@ -234,10 +237,10 @@ class TestFhirProxy:
             "/fhir/observation/search?patient=123&code=789-8",
             headers=bearer("clinician"),
         )
-        assert fhir.search_calls[-1] == (
-            "Observation",
-            {"patient": "123", "code": "789-8"},
-        )
+        resource, params = fhir.search_calls[-1]
+        assert resource == "Observation"
+        assert params["patient"] == "123"
+        assert params["code"] == "789-8"
 
     def test_upstream_404_is_preserved(self, gateway):
         client, _, _ = gateway
@@ -252,10 +255,18 @@ class TestFhirProxy:
         r = client.get("/fhir/patient/123", headers=bearer("clinician"))
         assert r.status_code == 502
 
-    def test_ids_with_special_characters_do_not_break_routing(self, gateway):
-        client, _, _ = gateway
+    def test_ids_with_special_characters_are_rejected(self, gateway):
+        """FHIR ids are constrained by the spec; anything else is malformed
+        input and must not be interpolated into the upstream URL."""
+        client, fhir, _ = gateway
         r = client.get("/fhir/patient/abc%20def", headers=bearer("clinician"))
-        assert r.status_code in (200, 404)
+        assert r.status_code == 400
+        assert fhir.read_calls == []
+
+    def test_valid_ids_are_accepted(self, gateway):
+        client, _, _ = gateway
+        for good in ("123", "MRN-000123", "abc.def", "a_b" if False else "A-1"):
+            assert client.get(f"/fhir/patient/{good}", headers=bearer("clinician")).status_code in (200, 404)
 
 
 # ---------------------------------------------------------------------------

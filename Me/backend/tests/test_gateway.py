@@ -127,7 +127,12 @@ def test_search_routes_not_shadowed_by_id_routes(gateway, path, resource):
     r = client.get(f"{path}?patient=123", headers=auth(["clinician"]))
     assert r.status_code == 200
     assert r.json()["resourceType"] == "Bundle"
-    assert calls["search"][-1] == (resource, {"patient": "123"})
+    # The gateway injects a bounded _count so a caller cannot pull an
+    # unbounded page of PHI.
+    resource_called, params = calls["search"][-1]
+    assert resource_called == resource
+    assert params["patient"] == "123"
+    assert int(params["_count"]) <= 100
     assert calls["read"] == []  # must not have been treated as an id
 
 

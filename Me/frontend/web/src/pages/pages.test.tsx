@@ -322,7 +322,8 @@ describe('PatientFlowPage', () => {
       ),
     )
     renderWithProviders(<PatientFlowPage />, { token: makeToken() })
-    expect(await screen.findByText(/queue unavailable/i)).toBeInTheDocument()
+    // Clinician-facing wording, not the raw driver/server string.
+    expect(await screen.findByText(/temporarily unavailable/i)).toBeInTheDocument()
   })
 
   it('validates the enqueue form client-side', async () => {

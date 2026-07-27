@@ -12,6 +12,11 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend.common.config import settings
+from backend.common.hardening import (
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 from backend.common.logging import configure_logging
 from backend.common.middleware import AuditLogMiddleware
 from backend.common.security import create_access_token
@@ -50,7 +55,13 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
-app.add_middleware(AuditLogMiddleware)
+# Middleware runs in reverse registration order, so the last registered is
+# outermost. Order matters: security headers must wrap everything (including
+# rejections), and the audit log must see the authenticated principal.
+app.add_middleware(RateLimitMiddleware, limit=settings.login_rate_limit_per_minute)
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
+app.add_middleware(AuditLogMiddleware, service="auth")
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 
 class Health(BaseModel):

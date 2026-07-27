@@ -5,6 +5,7 @@ Postgres-backed response cache.
 """
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -25,6 +26,11 @@ from backend.common.cache import (
 )
 from backend.common.config import settings
 from backend.common.fhir_client import FHIRError, default_fhir_client
+from backend.common.hardening import (
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 from backend.common.logging import configure_logging
 from backend.common.middleware import AuditLogMiddleware
 from backend.common.telemetry import instrument_fastapi
@@ -57,8 +63,14 @@ async def lifespan(app: FastAPI):
         # not pay the setup cost, and readiness reflects reality immediately.
         await init_pool()
         await start_janitor()
-    except Exception:
-        logger.exception("cache initialisation failed; continuing degraded")
+    except Exception as exc:
+        # Log a one-line summary, not a full traceback: this fires on every
+        # start while the database is unreachable and would otherwise flood
+        # the log pipeline. Readiness reports the degradation.
+        logger.warning(
+            "cache initialisation failed; serving without cache",
+            extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+        )
     try:
         yield
     finally:
@@ -72,11 +84,15 @@ app = instrument_fastapi(
     service_name="gateway",
 )
 
-# Middleware runs in reverse registration order, so registering the auth
-# middleware first makes the audit logger the outermost layer — meaning
-# rejected (401) requests still get logged.
+# Middleware runs in reverse registration order: the last registered is the
+# outermost layer. Auth is registered first so it runs innermost, which means
+# the audit logger wraps it and still records rejected (401/403) requests -
+# denied access attempts are the ones an audit trail most needs.
 app.add_middleware(JWTAuthMiddleware)
-app.add_middleware(AuditLogMiddleware)
+app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
+app.add_middleware(AuditLogMiddleware, service="gateway")
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.enable_hsts)
 
 
 class Health(BaseModel):
@@ -116,14 +132,84 @@ def secure_route(user: User = Depends(clinician_or_admin)) -> dict[str, Any]:
 # Query params that are gateway-internal / meaningless upstream.
 _RESERVED_PARAMS = frozenset({"access_token", "token"})
 
+# Only FHIR search parameters we intend to support are forwarded. An
+# allow-list (rather than a deny-list) means an attacker cannot reach
+# undocumented upstream behaviour, and cannot flood the response cache with
+# unbounded distinct keys by varying junk parameter names.
+ALLOWED_SEARCH_PARAMS: frozenset[str] = frozenset(
+    {
+        "patient", "subject", "identifier", "_id",
+        "name", "family", "given", "birthdate", "gender",
+        "status", "category", "code", "date", "encounter",
+        "class", "type", "intent", "authoredon", "requester",
+        "_count", "_sort", "_include", "_lastUpdated", "page",
+    }
+)
+
+MAX_PARAM_VALUE_LENGTH = 128
+MAX_SEARCH_PARAMS = 12
+# Upper bound on the page size we will ask the FHIR server for. Without this a
+# caller can request _count=999999 and force a huge upstream response.
+MAX_COUNT = 100
+DEFAULT_COUNT = 50
+
 
 def _clean_params(request: Request) -> dict[str, str]:
-    return {
-        k: v for k, v in request.query_params.items() if k not in _RESERVED_PARAMS
-    }
+    """Validate and normalise search parameters before they leave the gateway."""
+    params: dict[str, str] = {}
+    for key, value in request.query_params.items():
+        if key in _RESERVED_PARAMS:
+            continue
+        if key not in ALLOWED_SEARCH_PARAMS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported search parameter '{key}'",
+            )
+        if len(value) > MAX_PARAM_VALUE_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Value for '{key}' exceeds {MAX_PARAM_VALUE_LENGTH} characters",
+            )
+        params[key] = value
+
+    if len(params) > MAX_SEARCH_PARAMS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {MAX_SEARCH_PARAMS} search parameters are supported",
+        )
+
+    # Clamp paging so one request cannot pull an unbounded amount of PHI.
+    raw_count = params.get("_count")
+    if raw_count is not None:
+        try:
+            count = int(raw_count)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="_count must be an integer",
+            ) from None
+        params["_count"] = str(max(1, min(count, MAX_COUNT)))
+    else:
+        params["_count"] = str(DEFAULT_COUNT)
+
+    return params
+
+
+# FHIR ids are constrained by the spec to this character set.
+_FHIR_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _validate_id(resource_id: str) -> str:
+    if not _FHIR_ID.match(resource_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed resource id",
+        )
+    return resource_id
 
 
 async def _read(resource: str, resource_id: str) -> dict[str, Any]:
+    _validate_id(resource_id)
     try:
         return await fhir.read(resource, resource_id)
     except FHIRError as exc:

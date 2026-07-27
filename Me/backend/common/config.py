@@ -1,5 +1,25 @@
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Values shipped in the repository. If any of these survive into a production
+# deployment the system is trivially compromised: the JWT secret in particular
+# lets anyone mint a valid admin token.
+INSECURE_DEFAULTS: frozenset[str] = frozenset(
+    {
+        "change-this-in-prod",
+        "dev-change-me",
+        "medicore_pw",
+        "replace-me",
+        "medicore-dev",
+        "REPLACE_ME",
+        "changeme",
+        "secret",
+        "password",
+    }
+)
+
+MIN_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -72,12 +92,70 @@ class Settings(BaseSettings):
     oidc_issuer_claim: str = ""
 
     session_secret: str = "dev-change-me"
+
+    # --- Audit trail (HIPAA 164.312(b)) ---
+    # Patient identifiers in audit records are pseudonymised by default so the
+    # log stream carries no raw PHI. Enable raw ids only when the sink is an
+    # access-controlled, HIPAA-compliant store.
+    audit_log_raw_identifiers: bool = False
+    # Dedicated salt; falls back to jwt_secret when unset.
+    audit_log_salt: str = ""
+
+    # --- Abuse protection ---
+    rate_limit_per_minute: int = 120
+    # Login is the credential-stuffing target, so it gets a tighter budget.
+    login_rate_limit_per_minute: int = 10
+    max_request_body_bytes: int = 1_048_576
+    enable_hsts: bool = True
     allowed_origins: str = "http://localhost:5173"
 
     # --- Observability ---
     otel_exporter_otlp_endpoint: str = "http://jaeger:4318"
     otel_service_namespace: str = "medicore"
     otel_enabled: bool = True
+
+    @model_validator(mode="after")
+    def _reject_insecure_production_config(self) -> "Settings":
+        """Refuse to start a production deployment with placeholder secrets.
+
+        Failing at startup is the only safe option: a service that boots with
+        the published default signing key silently accepts forged admin tokens,
+        and nothing downstream would ever notice.
+        """
+        if not self.is_production:
+            return self
+
+        problems: list[str] = []
+
+        def check(name: str, value: str, *, min_length: int = MIN_SECRET_LENGTH) -> None:
+            if not value or value in INSECURE_DEFAULTS:
+                problems.append(f"{name} is unset or still a placeholder value")
+            elif len(value) < min_length:
+                problems.append(
+                    f"{name} must be at least {min_length} characters "
+                    f"(got {len(value)})"
+                )
+
+        check("JWT_SECRET", self.jwt_secret)
+        check("SESSION_SECRET", self.session_secret)
+        # Only enforced when not supplied via DATABASE_URL.
+        if not self.database_url:
+            check("POSTGRES_PASSWORD", self.postgres_password, min_length=12)
+
+        if self.fhir_client_secret in INSECURE_DEFAULTS:
+            problems.append("FHIR_CLIENT_SECRET is still a placeholder value")
+
+        # A wildcard origin with credentials allows any site to drive the API
+        # using a signed-in clinician's session.
+        if "*" in self.cors_origins:
+            problems.append("ALLOWED_ORIGINS must not be '*' in production")
+
+        if problems:
+            raise ValueError(
+                "Refusing to start with an insecure production configuration:\n  - "
+                + "\n  - ".join(problems)
+            )
+        return self
 
     @property
     def parsed_bed_layout(self) -> list[tuple[str, int]]:

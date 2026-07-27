@@ -84,6 +84,35 @@ system contain patient identifiers.
 `CACHE_MAX_AGE_SECONDS`; the table would otherwise grow without bound and
 retain PHI indefinitely.
 
+**Fail-fast configuration.** Outside local/test/dev the services refuse to
+start if `JWT_SECRET`, `SESSION_SECRET` or `POSTGRES_PASSWORD` is still a
+placeholder or too short, or if `ALLOWED_ORIGINS` is `*`. Booting with the
+default signing key - which is published in this repository - would let anyone
+mint a valid admin token, and nothing downstream would notice.
+
+**Audit trail.** Every request is logged with the actor (`sub`, `roles`) and a
+reference to the record touched (`resource_type`, `resource_ref`), so
+"who viewed this chart?" is answerable as HIPAA 164.312(b) requires. Patient
+identifiers are pseudonymised with a salted HMAC: stable enough to correlate
+accesses, but the log stream carries no raw PHI. Denied attempts are recorded
+with `outcome: denied`.
+
+**Edge hardening.** Security headers on every response (including
+`Cache-Control: no-store`, so PHI is never written to a shared cache),
+per-caller rate limiting, and a request body cap. These duplicate what a
+reverse proxy should do, deliberately: if the proxy is bypassed - a
+port-forward, a mesh sidecar in permissive mode - the application still
+defends itself.
+
+**Input validation.** FHIR search parameters are allow-listed, values length
+capped, and `_count` clamped, so a caller cannot reach undocumented upstream
+behaviour, pull an unbounded page of PHI, or flood the response cache with
+junk keys. Resource ids are validated against the FHIR id grammar.
+
+**Network.** NetworkPolicies default-deny east-west traffic; only the ingress
+controller reaches the gateway and only the gateway reaches the internal
+services. No Secret is committed - create `medicore-secrets` out-of-band.
+
 ## Web console
 
 The clinician/admin console is a React + TypeScript SPA. It exposes the FHIR
