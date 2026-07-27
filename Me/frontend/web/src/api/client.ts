@@ -128,12 +128,33 @@ async function extractDetail(res: Response): Promise<string> {
   }
 }
 
+/** Read a non-httpOnly cookie by name (used for the double-submit CSRF token). */
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null
+  const prefix = `${name}=`
+  for (const part of document.cookie.split(';')) {
+    const trimmed = part.trim()
+    if (trimmed.startsWith(prefix)) {
+      return decodeURIComponent(trimmed.slice(prefix.length))
+    }
+  }
+  return null
+}
+
+const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
 export async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', token, body, params, signal } = options
 
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (token) headers.Authorization = `Bearer ${token}`
   if (body !== undefined) headers['Content-Type'] = 'application/json'
+  // Double-submit CSRF: echo the non-httpOnly medicore_csrf cookie so
+  // cookie-only authenticated mutations pass CookieCSRFMiddleware.
+  if (UNSAFE.has(method.toUpperCase())) {
+    const csrf = readCookie('medicore_csrf')
+    if (csrf) headers['X-CSRF-Token'] = csrf
+  }
 
   let res: Response
   try {

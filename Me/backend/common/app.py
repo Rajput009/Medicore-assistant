@@ -22,6 +22,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from backend.common.config import Settings, settings as default_settings
+from backend.common.csrf import CookieCSRFMiddleware
 from backend.common.hardening import (
     BodySizeLimitMiddleware,
     RateLimitMiddleware,
@@ -42,7 +43,12 @@ def create_service_app(
     rate_limit: int | None = None,
     enable_cors: bool = False,
     cors_methods: Sequence[str] = ("GET", "POST", "OPTIONS"),
-    cors_headers: Sequence[str] = ("Authorization", "Content-Type", "X-Request-ID"),
+    cors_headers: Sequence[str] = (
+        "Authorization",
+        "Content-Type",
+        "X-Request-ID",
+        "X-CSRF-Token",
+    ),
     extra_middleware: Iterable[tuple[type, dict[str, Any]]] = (),
 ) -> FastAPI:
     """Build a FastAPI app with the standard MediCore hardening stack.
@@ -79,6 +85,10 @@ def create_service_app(
     # Service-specific middleware first (innermost).
     for cls, kwargs in extra_middleware:
         app.add_middleware(cls, **kwargs)
+
+    # CSRF sits just outside auth so cookie-only unsafe requests are rejected
+    # before they hit handlers, while Bearer-authenticated calls pass through.
+    app.add_middleware(CookieCSRFMiddleware)
 
     limit = rate_limit if rate_limit is not None else cfg.rate_limit_per_minute
     app.add_middleware(RateLimitMiddleware, limit=limit)

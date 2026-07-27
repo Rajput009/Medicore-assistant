@@ -15,9 +15,13 @@ x-backend-env: &backend-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medicore_pw}
   POSTGRES_DB: ${POSTGRES_DB:-medicore}
   MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+  REDIS_ENABLED: ${REDIS_ENABLED:-true}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
   KAFKA_BROKERS: kafka:9092
   OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
   ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+  AUTH_SET_COOKIE: "true"
 
 services:
   postgres:
@@ -36,12 +40,24 @@ services:
 
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    # Bind to the compose network only — never publish to the host in a shared
+    # environment. Local debugging can re-add the port mapping explicitly.
+    # ports: ["6379:6379"]
+    command:
+      - redis-server
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      # No password in local compose; production injects requirepass via Secret.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    volumes: ["redisdata:/data"]
 
   mongo:
     image: mongo:7
@@ -153,4 +169,5 @@ services:
 volumes:
   pgdata:
   mongodata:
+  redisdata:
   web_node_modules:

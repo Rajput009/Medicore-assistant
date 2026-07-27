@@ -48,7 +48,7 @@ make lint      # ruff + tsc --noEmit
 
 | Suite | Location | Count | Runner |
 | ----- | -------- | ----- | ------ |
-| Backend unit/regression + e2e | `backend/tests/test_*.py` | 353 | pytest |
+| Backend unit/regression + e2e | `backend/tests/test_*.py` | 362 | pytest |
 | Frontend unit + integration | `frontend/web/src/**/*.test.tsx` | 156 | vitest |
 | Browser end-to-end | `frontend/web/e2e/*.spec.ts` | 35 x 3 browsers | playwright |
 
@@ -148,9 +148,16 @@ capped, and `_count` clamped, so a caller cannot reach undocumented upstream
 behaviour, pull an unbounded page of PHI, or flood the response cache with
 junk keys. Resource ids are validated against the FHIR id grammar.
 
-**Network.** NetworkPolicies default-deny east-west traffic; only the ingress
-controller reaches the gateway and only the gateway reaches the internal
-services. No Secret is committed - create `medicore-secrets` out-of-band.
+**Network.** NetworkPolicies default-deny **ingress and egress**. The ingress
+controller is the only external entry; path prefixes (`/api`, `/auth`,
+`/flow`, `/cds`) match the Vite dev proxy so the SPA never needs internal
+service DNS. Egress is opened only for DNS, data stores, Redis, and HTTPS to
+upstream FHIR/IdP/OTLP. No Secret is committed — create `medicore-secrets`
+out-of-band.
+
+**CSRF.** Cookie-authenticated unsafe methods require a matching
+`Origin`/`Referer` from `ALLOWED_ORIGINS`, or a double-submit
+`X-CSRF-Token` header. Bearer-authenticated calls are unaffected.
 
 ## Web console
 

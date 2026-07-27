@@ -20,6 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from backend.common.app import create_service_app
 from backend.common.config import settings
+from backend.common.csrf import clear_csrf_cookie, issue_csrf_cookie
 from backend.common.revocation import revoke_payload
 from backend.common.security import create_access_token, verify_access_token
 
@@ -169,6 +170,7 @@ def login(req: LoginReq, response: Response) -> TokenResp:
     token = create_access_token(sub=req.username.strip(), roles=["clinician"])
     body = TokenResp(access_token=token, expires_in=ttl * 60)
     _set_session_cookie(response, token, max_age=ttl * 60)
+    issue_csrf_cookie(response, secure=_cookie_secure())
     return body
 
 
@@ -188,6 +190,7 @@ def logout(request: Request, response: Response) -> dict[str, str]:
             # Token already invalid/expired — still clear the cookie.
             pass
     _clear_session_cookie(response)
+    clear_csrf_cookie(response, secure=_cookie_secure())
     return {"status": "ok"}
 
 
@@ -323,4 +326,5 @@ async def oidc_callback(request: Request):
     }
     response = JSONResponse(body)
     _set_session_cookie(response, internal, max_age=ttl * 60)
+    issue_csrf_cookie(response, secure=_cookie_secure())
     return response
