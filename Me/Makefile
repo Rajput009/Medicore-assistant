@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/docker/docker-compose.yml
 
-.PHONY: help up down logs fmt lint audit test test-web test-e2e test-all build docker clean
+.PHONY: help up down logs fmt lint audit verify test test-web test-e2e test-all build docker clean
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -40,6 +40,23 @@ test-e2e: ## Run browser end-to-end tests (needs: npx playwright install)
 	cd frontend/web && npm run test:e2e
 
 test-all: test test-web ## Run every suite that needs no browser download
+
+# Everything CI enforces, in one command. Use this before claiming green:
+# "it passed on my machine" and "the gates pass" are different statements,
+# and this is the one that can be reproduced by someone else.
+verify: ## Run every CI gate locally (lint, audits, tests, typecheck, build)
+	@set -e; \
+	echo "== 1/8 ruff ==";              python -m ruff check backend; \
+	echo "== 2/8 pip-audit ==";         bash scripts/audit_python.sh; \
+	echo "== 3/8 pytest ==";            python -m pytest backend/tests -q; \
+	echo "== 4/8 npm audit ==";         bash scripts/audit_node.sh; \
+	echo "== 5/8 tsc (app) ==";         cd frontend/web && npx tsc --noEmit && cd ../..; \
+	echo "== 6/8 tsc (e2e specs) ==";   cd frontend/web && npx tsc --noEmit -p tsconfig.e2e.json && cd ../..; \
+	echo "== 7/8 vitest ==";            cd frontend/web && npx vitest run && cd ../..; \
+	echo "== 8/8 web build ==";         cd frontend/web && npm run build && cd ../..; \
+	echo; echo "All 8 gates passed."
+	@echo "NOTE: browser E2E is not included — it needs 'npx playwright install chromium'."
+	@echo "      Run 'make test-e2e' separately where a browser can be downloaded."
 
 build: ## Build all container images
 	$(COMPOSE) build

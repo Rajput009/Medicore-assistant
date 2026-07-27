@@ -400,6 +400,26 @@ The author is taken from the verified session, never from the request body.
 Reads and writes are audited against the patient like any other PHI access,
 and the note text itself is never logged.
 
+## Verifying a change
+
+```bash
+cd Me && make verify     # all eight gates: lint, both audits, tests, typecheck, build
+```
+
+**CI is not currently enforced.** `.github/ci.yml.example` has never been
+installed as `.github/workflows/ci.yml`, so `gh pr checks` reports "no checks
+reported" and nothing runs automatically on push. Enabling it is one commit
+from an account with the `workflows` token scope — see the header of that
+file. Until then `make verify` is the only reproducible check, and "the tests
+pass" means someone ran it, not that the branch is green.
+
+Browser end-to-end tests are **not** part of `make verify`: they need
+`npx playwright install chromium`, which some sandboxes cannot reach. Run
+`make test-e2e` where a browser is available. Because those specs cannot run
+everywhere, `src/e2eSelectors.test.tsx` asserts the same accessible names in
+jsdom on every push — so a renamed label breaks a test that actually runs,
+rather than rotting silently in a spec nobody executes.
+
 ## Chart assistant (grounded Q&A)
 
 `POST /assist/ask` answers questions about one patient's chart with citations:

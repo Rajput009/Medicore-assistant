@@ -279,6 +279,68 @@ export const handlers = [
     })
   }),
 
+  /**
+   * Chart-context resources. Stubbed explicitly rather than left to fall
+   * through: an unhandled request resolves as a failure, and the drawer
+   * (correctly) renders "allergy list unavailable" for that — which would
+   * make every drawer test assert the error path by accident.
+   */
+  http.get('/api/fhir/allergyintolerance/search', ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'AllergyIntolerance',
+            id: 'a1',
+            code: { text: 'Penicillin' },
+            criticality: 'high',
+            clinicalStatus: { coding: [{ code: 'active' }] },
+            reaction: [{ manifestation: [{ text: 'anaphylaxis' }] }],
+          },
+        },
+      ],
+    })
+  }),
+
+  http.get('/api/fhir/condition/search', ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Condition',
+            id: 'c1',
+            code: { text: 'Type 2 diabetes' },
+            clinicalStatus: { coding: [{ code: 'active' }] },
+          },
+        },
+      ],
+    })
+  }),
+
+  http.get('/api/fhir/medicationrequest/search', ({ request }) => {
+    const denied = requireAuth(request)
+    if (denied) return denied
+    return HttpResponse.json({
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'MedicationRequest',
+            id: 'm1',
+            status: 'active',
+            medicationCodeableConcept: { text: 'Metformin 500mg' },
+          },
+        },
+      ],
+    })
+  }),
+
   http.delete('/api/cache/:resource', ({ params, request }) => {
     const denied = requireAuth(request)
     if (denied) return denied

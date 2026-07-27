@@ -72,6 +72,8 @@ honest: “designed” is not the same as “proven in your cluster”.
 | R10 | Audit index is lossy under overload (bounded queue) | Med | Alert on `/audit/stats` dropped/failed; backfill from log stream |
 | ~~R12~~ | ~~Unfiltered searches are not attributed per result~~ | — | **Closed**: searches record every patient disclosed (`subject_refs`/`subject_count`) |
 | ~~R11~~ | ~~Non-Patient reads are not attributed to a patient~~ | — | **Closed**: the read path resolves `subject`/`patient` and records the patient ref |
+| R13 | **CI is not enforced** — no workflow installed, so no gate runs on push | High | One commit from an account with the `workflows` scope; `make verify` meanwhile |
+| R14 | Browser E2E cannot run where the Playwright CDN is blocked | Med | Selector canary (`e2eSelectors.test.tsx`) runs in jsdom on every push |
 
 ## AuthZ model (current)
 
