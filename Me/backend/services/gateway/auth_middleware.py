@@ -1,29 +1,73 @@
-from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi import Request, HTTPException, status
-from backend.common.security import verify_access_token
-from typing import List
+"""Global JWT enforcement for the gateway.
 
-EXEMPT_PATHS = ["/health", "/docs", "/openapi.json", "/favicon.ico", "/metrics"]
+Note: raising ``HTTPException`` inside ``BaseHTTPMiddleware.dispatch`` does not
+produce a 401 — it escapes FastAPI's exception handlers and surfaces as a 500.
+The middleware therefore returns ``JSONResponse`` directly.
+"""
+
+from collections.abc import Iterable
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.status import HTTP_401_UNAUTHORIZED
+
+from backend.common.security import verify_access_token
+
+# Exact-match public paths (prefix matching would let "/healthz-admin" or
+# "/docsecret" through).
+EXEMPT_PATHS = frozenset(
+    {
+        "/health",
+        "/healthz",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+        "/openapi.json",
+        "/favicon.ico",
+        "/metrics",
+    }
+)
+
+
+def _unauthorized(detail: str) -> JSONResponse:
+    return JSONResponse(
+        {"detail": detail},
+        status_code=HTTP_401_UNAUTHORIZED,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        # allow exempt paths (health, static, openapi)
-        for p in EXEMPT_PATHS:
-            if path.startswith(p):
-                return await call_next(request)
-        auth = request.headers.get("authorization") or request.headers.get("Authorization")
-        if not auth or not auth.lower().startswith("bearer "):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing auth header")
-        token = auth.split(" ", 1)[1]
+    def __init__(self, app, exempt_paths: Iterable[str] = EXEMPT_PATHS):
+        super().__init__(app)
+        self.exempt_paths = frozenset(exempt_paths)
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        # CORS preflight carries no Authorization header by design.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        if request.url.path.rstrip("/") in {p.rstrip("/") for p in self.exempt_paths}:
+            return await call_next(request)
+
+        auth = request.headers.get("authorization")
+        if not auth:
+            return _unauthorized("missing auth header")
+
+        scheme, _, token = auth.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return _unauthorized("invalid authorization scheme")
+
         try:
-            payload = verify_access_token(token)
-        except Exception as e:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token invalid or expired")
-        # attach user info to request.state for downstream handlers
+            payload = verify_access_token(token.strip())
+        except Exception:
+            # Never echo the exception: it can leak token/key details.
+            return _unauthorized("token invalid or expired")
+
         request.state.user = {
             "sub": payload.get("sub"),
             "roles": payload.get("roles", []),
-            "claims": payload
+            "claims": payload,
         }
         return await call_next(request)

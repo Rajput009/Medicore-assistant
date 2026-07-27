@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: medicore-config
+  namespace: medicore
+data:
+  LOG_LEVEL: "INFO"
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "medicore"
+  MONGO_URI: "mongodb://mongo:27017"
+  MONGO_DB: "medicore"
+  KAFKA_BROKERS: "kafka:9092"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  OTEL_SERVICE_NAMESPACE: "medicore"
+  ALLOWED_ORIGINS: "https://console.medicore.local"
+---
+# Placeholder only. Create the real Secret out-of-band (sealed-secrets,
+# External Secrets Operator, cloud secret manager) — never commit values.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: medicore-secrets
+  namespace: medicore
+type: Opaque
+stringData:
+  jwt-secret: "REPLACE_ME"
+  session-secret: "REPLACE_ME"
+  postgres-password: "REPLACE_ME"
+  fhir-client-secret: "REPLACE_ME"
+  oidc-client-secret: "REPLACE_ME"

@@ -9,23 +9,39 @@ Docker/Kubernetes deploys, CI, and local dev tooling.
 ## Quick Start (Local)
 
 ```bash
-# 1) clone & cd
-# 2) copy envs
-cp .env.example .env
+# 1) copy the env template
 cp backend/.env.example backend/.env
-cp deploy/docker/.env.example deploy/docker/.env
 
-# 3) start everything (APIs, DB, Redis, Kafka, Web)
+# 2) start everything (APIs, Postgres, Mongo, Redis, Kafka, Jaeger, Web)
 docker compose -f deploy/docker/docker-compose.yml up --build
 
-# 4) visit web
-http://localhost:5173
+# 3) visit the console
+open http://localhost:5173
 
-# 5) health checks
+# 4) health checks
 curl http://localhost:8080/health            # gateway
 curl http://localhost:8081/health            # auth
 curl http://localhost:8082/health            # patient-flow
 curl http://localhost:8083/health            # cds
+```
+
+### Get a token and call a protected endpoint
+
+```bash
+# The demo login only works when ENV=local/test (DEMO_PASSWORD, default "medicore-dev").
+TOKEN=$(curl -s -X POST http://localhost:8081/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"dr.smith","password":"medicore-dev"}' | jq -r .access_token)
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/fhir/patient/123
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/fhir/observation/search?patient=123"
+```
+
+### Run tests locally
+
+```bash
+make test     # pytest backend/tests
+make lint     # ruff + tsc --noEmit
 ```
 
 ## Structure
@@ -110,28 +126,18 @@ Makefile                 # DX helpers
 > For production: configure HTTPS, use PKCE if doing SPA auth, store tokens server-side, and add RBAC role mapping from IdP claims/groups.
 
 
-## Gateway JWT Enforcement
-- Gateway now validates JWTs on secured routes.
-- Example: `GET /secure` requires `Authorization: Bearer <internal-jwt>` header.
-- Internal JWTs are minted by the **auth** service (via SSO or /login).
+## Gateway Auth & RBAC
 
-
-## Gateway JWT Enforcement
-- The gateway now verifies internal JWTs issued by the `auth` service.
-- Use the `/fhir/patient/{id}/protected` endpoint (or `/fhir/patient/{id}` if your gateway was modified) to test RBAC enforcement.
-- Tokens are validated using `backend/common/security.verify_access_token` which uses the `JWT_SECRET` in `.env`.
-- To test: call the `auth` service OIDC login or `/login` stub to get a token, then: `curl -H "Authorization: Bearer <token>" http://localhost:8080/fhir/patient/123/protected`
-
-## Gateway: Global JWT Enforcement (Middleware) & JWKS/RS256
-- The gateway now includes `JWTAuthMiddleware` which enforces presence and validity of bearer tokens globally,
-  exempting a few public endpoints like `/health` and `/docs`.
-- RS256/RS family support: If your IdP issues RS256 tokens, set `OIDC_JWKS_URI` (preferred) or `OIDC_ISSUER` in `.env`.
-  The gateway will fetch JWKS and validate tokens using the matching `kid` header.
-- For HS256 (dev) the gateway uses `JWT_SECRET` as before.
-- To test middleware-protected endpoint:
-  `curl -H "Authorization: Bearer <token>" http://localhost:8080/fhir/patient/123/middleware-protected`
-- Production notes: configure `OIDC_JWKS_URI`, enable caching and rotate keys per IdP guidance. Consider validating `aud` and `iss` claims.
-
+- `JWTAuthMiddleware` enforces a valid bearer token on **every** gateway route
+  except an exact-match allow-list (`/health`, `/docs`, `/openapi.json`, `/metrics`, ...).
+- Route handlers additionally enforce roles: FHIR reads/searches require
+  `clinician` or `admin`; cache invalidation requires `admin`.
+- **HS256 (dev):** tokens are verified with `JWT_SECRET`.
+- **RS256/ES256 (prod):** set `OIDC_JWKS_URI` (preferred) or `OIDC_ISSUER`; the
+  gateway fetches the JWKS and matches on the `kid` header, re-fetching once on
+  an unknown `kid` to tolerate key rotation.
+- `alg: none` and algorithm-downgrade attempts are rejected outright.
+- Optionally set `OIDC_AUDIENCE` / `OIDC_ISSUER_CLAIM` to validate `aud`/`iss`.
 
 ## Expanded FHIR Endpoints
 The gateway now supports these protected endpoints (require clinician/admin role):

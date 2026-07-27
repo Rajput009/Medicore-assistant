@@ -3,6 +3,7 @@ kind: Deployment
 metadata:
   name: gateway
   namespace: medicore
+  labels: { app: gateway }
 spec:
   replicas: 2
   selector:
@@ -11,15 +12,48 @@ spec:
     metadata:
       labels: { app: gateway }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
           image: medicore/gateway:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
+              name: http
           env:
             - name: ENV
               value: "prod"
+            # Secrets come from a Secret, never from plain env values.
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef: { name: medicore-secrets, key: jwt-secret }
+          envFrom:
+            - configMapRef: { name: medicore-config }
+          # Without probes, Kubernetes routes traffic to pods that are still
+          # starting up or already wedged.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
 ---
 apiVersion: v1
 kind: Service
@@ -30,5 +64,6 @@ spec:
   selector:
     app: gateway
   ports:
-    - port: 8080
-      targetPort: 8080
+    - name: http
+      port: 8080
+      targetPort: http
