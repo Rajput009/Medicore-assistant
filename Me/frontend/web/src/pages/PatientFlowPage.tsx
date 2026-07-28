@@ -1,8 +1,10 @@
 import React, { useState } from 'react'
 
 import { api } from '../api/client'
-import type { Bed, QueueItem, QueueListResponse } from '../api/types'
+import type { Bed, Disposition, QueueItem, QueueListResponse } from '../api/types'
+import { DISPOSITION_LABELS } from '../api/types'
 import { useAsyncAction, useAsyncData } from '../hooks/useAsync'
+import { DispositionDialog } from '../patient/DispositionDialog'
 import { PatientLink } from '../patient/PatientChartDrawer'
 import { Alert, Badge, Card, EmptyState, Field, SkeletonRows, Spinner } from '../ui/components'
 
@@ -121,8 +123,14 @@ const QueueCard: React.FC = () => {
   const claim = useAsyncAction<[string], { ok: boolean; item: QueueItem }>((signal, d) =>
     api.claimNext(d, null, signal),
   )
-  const complete = useAsyncAction<[string], { ok: boolean; item: QueueItem }>((signal, pid) =>
-    api.completeQueue(pid, null, signal),
+  // The disposition is collected before the request, so completing is now a
+  // two-step action: pick what happened, then confirm.
+  const [completing, setCompleting] = useState<string | null>(null)
+  const complete = useAsyncAction<
+    [string, Disposition, string | null],
+    { ok: boolean; item: QueueItem }
+  >((signal, pid, disposition, note) =>
+    api.completeQueue(pid, disposition, note, null, signal),
   )
 
   React.useEffect(() => {
@@ -142,11 +150,18 @@ const QueueCard: React.FC = () => {
     }
   }
 
-  const onComplete = async (patientId: string) => {
+  const onComplete = async (
+    patientId: string,
+    disposition: Disposition,
+    note: string | null,
+  ) => {
     setActionMsg(null)
-    const res = await complete.run(patientId)
+    const res = await complete.run(patientId, disposition, note)
     if (res) {
-      setActionMsg(`Completed ${patientId}.`)
+      setCompleting(null)
+      setActionMsg(
+        `Completed ${patientId} — ${DISPOSITION_LABELS[disposition].toLowerCase()}.`,
+      )
       refresh()
     }
   }
@@ -274,7 +289,7 @@ const QueueCard: React.FC = () => {
                           <button
                             type="button"
                             disabled={busy}
-                            onClick={() => void onComplete(item.patient_id)}
+                            onClick={() => setCompleting(item.patient_id)}
                           >
                             Complete
                           </button>
@@ -288,6 +303,17 @@ const QueueCard: React.FC = () => {
               </table>
             </div>
           ))}
+
+        {completing && (
+          <DispositionDialog
+            patientId={completing}
+            busy={complete.state.status === 'loading'}
+            onCancel={() => setCompleting(null)}
+            onConfirm={(disposition, note) =>
+              void onComplete(completing, disposition, note)
+            }
+          />
+        )}
       </div>
     </Card>
   )

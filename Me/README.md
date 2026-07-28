@@ -420,6 +420,42 @@ everywhere, `src/e2eSelectors.test.tsx` asserts the same accessible names in
 jsdom on every push — so a renamed label breaks a test that actually runs,
 rather than rotting silently in a spec nobody executes.
 
+## Triage: escalation evidence and outcomes
+
+The queue records *why* a patient was escalated and *what happened to them* —
+not just that something was done.
+
+```bash
+# Escalate with the evidence behind the decision
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"patient_id":"MRN-123","acuity":1,"dept":"ED",
+       "reason":"Rising NEWS2 with new confusion",
+       "news2_score":9,"news2_band":"high","red_flag":true}' \
+  http://localhost:8082/queue
+
+# Close it with what actually happened
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"disposition":"admitted"}' \
+  http://localhost:8082/queue/MRN-123/complete
+
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:8082/queue/stats?dept=ED&since_hours=24"
+```
+
+`disposition` is one of `admitted`, `discharged`, `transferred`,
+`left_without_being_seen`, `deceased`, `other`. The last two require a note.
+A **reason is mandatory at acuity ≤ 2** — requiring one everywhere would just
+train people to type "." to get past the field.
+
+`GET /queue/stats` returns counts by disposition, the LWBS rate and
+median/p90 time to completion, so the ward gets something back for the extra
+keystrokes. Empty windows report `null` percentiles rather than `0`: "nothing
+completed" and "everything completed instantly" are different facts.
+
+Completion is **one-way** — re-completing returns 409 and leaves the original
+disposition and clinician intact. Correcting one is a separate, deliberate
+action. See `docs/design/closing-the-clinical-loop.md` for the full rationale.
+
 ## Chart assistant (grounded Q&A)
 
 `POST /assist/ask` answers questions about one patient's chart with citations:

@@ -10,6 +10,9 @@
 import type {
   AssistAnswer,
   AuditAccessorsResponse,
+  Disposition,
+  QueueHistory,
+  QueueStats,
   AuditSearchParams,
   AuditSearchResponse,
   Bed,
@@ -471,9 +474,16 @@ export const api = {
     })
   },
 
-  /** Mark a triage entry completed. */
+  /**
+   * Close a triage entry with what actually happened to the patient.
+   *
+   * `disposition` is required by the API: "completed" alone could not
+   * distinguish an admission from a patient who left unseen.
+   */
   completeQueue(
     patientId: string,
+    disposition: Disposition,
+    dispositionNote?: string | null,
     _token?: string | null,
     signal?: AbortSignal,
     idempotencyKey?: string,
@@ -482,10 +492,42 @@ export const api = {
       `${BASE.patientFlow}/queue/${encodeURIComponent(patientId)}/complete`,
       {
         method: 'POST',
+        body: {
+          disposition,
+          ...(dispositionNote ? { disposition_note: dispositionNote } : {}),
+        },
         signal,
         idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
       },
     )
+  },
+
+  /** Every queue entry for a patient, newest first. */
+  queueHistory(
+    patientId: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<QueueHistory> {
+    return request<QueueHistory>(
+      `${BASE.patientFlow}/queue/${encodeURIComponent(patientId)}/history`,
+      { signal },
+    )
+  },
+
+  /** Counts by disposition, LWBS rate and time-to-completion percentiles. */
+  queueStats(
+    dept?: string | null,
+    sinceHours?: number,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<QueueStats> {
+    return request<QueueStats>(`${BASE.patientFlow}/queue/stats`, {
+      params: {
+        ...(dept ? { dept } : {}),
+        ...(sinceHours ? { since_hours: sinceHours } : {}),
+      },
+      signal,
+    })
   },
 
   /** Full NEWS2 assessment with a per-parameter breakdown. */

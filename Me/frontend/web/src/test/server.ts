@@ -521,12 +521,17 @@ export const handlers = [
     })
   }),
 
-  http.post(/\/flow\/queue\/[^/]+\/complete\/?$/, ({ request }) => {
+  http.post(/\/flow\/queue\/[^/]+\/complete\/?$/, async ({ request }) => {
     const denied = requireAuth(request)
     if (denied) return denied
     const parts = new URL(request.url).pathname.split('/').filter(Boolean)
     // .../queue/:id/complete
     const patientId = parts[parts.length - 2]
+    // Completion now records what happened; echo it back like the API does.
+    const body = (await request.json().catch(() => ({}))) as {
+      disposition?: string
+      disposition_note?: string
+    }
     return HttpResponse.json({
       ok: true,
       item: {
@@ -534,6 +539,10 @@ export const handlers = [
         acuity: 2,
         dept: 'ED',
         status: 'completed',
+        disposition: body.disposition ?? 'discharged',
+        ...(body.disposition_note ? { disposition_note: body.disposition_note } : {}),
+        completed_by: 'test.user',
+        time_to_completion_seconds: 120,
       },
     })
   }),

@@ -1,6 +1,8 @@
 # Design: closing the clinical loop
 
-**Status:** proposed — not implemented. Written for review before any code.
+**Status:** implemented (backend `ab0c820`, UI following). Kept as the
+rationale record — the *why* behind the decisions, which the code cannot
+state for itself.
 
 ## The problem
 

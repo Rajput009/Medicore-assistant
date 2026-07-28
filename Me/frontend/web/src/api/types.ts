@@ -19,6 +19,46 @@ export type Bed = {
   patient_id?: string | null
 }
 
+/** What happened to a patient. Closed set — see the backend DISPOSITIONS. */
+export const DISPOSITIONS = [
+  'admitted',
+  'discharged',
+  'transferred',
+  'left_without_being_seen',
+  'deceased',
+  'other',
+] as const
+export type Disposition = (typeof DISPOSITIONS)[number]
+
+/** Dispositions that say nothing on their own and require a note. */
+export const DISPOSITIONS_REQUIRING_NOTE: readonly Disposition[] = [
+  'left_without_being_seen',
+  'other',
+]
+
+/** Human labels; the wire values stay machine-readable. */
+export const DISPOSITION_LABELS: Record<Disposition, string> = {
+  admitted: 'Admitted',
+  discharged: 'Discharged',
+  transferred: 'Transferred',
+  left_without_being_seen: 'Left without being seen',
+  deceased: 'Deceased',
+  other: 'Other',
+}
+
+/** A reason is mandatory at this acuity or more urgent. Mirrors the API. */
+export const REASON_REQUIRED_AT_ACUITY = 2
+export const MIN_REASON_LENGTH = 10
+
+export type VitalsSnapshot = {
+  respiratory_rate?: number
+  spo2?: number
+  temperature?: number
+  systolic_bp?: number
+  pulse?: number
+  consciousness?: string
+}
+
 export type QueueItem = {
   patient_id: string
   acuity: number
@@ -28,6 +68,39 @@ export type QueueItem = {
   created_by?: string
   claimed_by?: string
   claimed_at?: string
+
+  /** Why this patient was escalated, and the evidence behind it. */
+  reason?: string
+  news2_score?: number
+  news2_band?: string
+  red_flag?: boolean
+  vitals_snapshot?: VitalsSnapshot
+
+  /** What happened, recorded at completion. */
+  disposition?: Disposition
+  disposition_note?: string
+  completed_by?: string
+  completed_at?: string
+  time_to_completion_seconds?: number
+}
+
+export type QueueStats = {
+  dept: string | null
+  since: string
+  window_hours: number
+  completed: number
+  waiting: number
+  by_disposition: Record<string, number>
+  left_without_being_seen_rate: number
+  /** null when nothing completed in the window — not the same as zero. */
+  median_seconds: number | null
+  p90_seconds: number | null
+}
+
+export type QueueHistory = {
+  patient_id: string
+  entries: QueueItem[]
+  count: number
 }
 
 export type QueueListResponse = {

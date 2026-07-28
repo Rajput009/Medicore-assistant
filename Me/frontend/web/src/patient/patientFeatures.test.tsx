@@ -267,23 +267,46 @@ describe('Worklist actions (API wiring)', () => {
     expect(res.item.status).toBe('in_progress')
   })
 
-  it('completeQueue posts the patient id path', async () => {
+  it('completeQueue posts the patient id path and the disposition', async () => {
     let completedId: string | null = null
+    let sent: Record<string, unknown> = {}
     server.use(
-      http.post(/\/flow\/queue\/[^/]+\/complete/, ({ request }) => {
+      http.post(/\/flow\/queue\/[^/]+\/complete/, async ({ request }) => {
         const parts = new URL(request.url).pathname.split('/').filter(Boolean)
         completedId = parts[parts.length - 2] ?? null
+        sent = (await request.json()) as Record<string, unknown>
         return HttpResponse.json({
           ok: true,
-          item: { patient_id: completedId, acuity: 2, dept: 'ED', status: 'completed' },
+          item: {
+            patient_id: completedId,
+            acuity: 2,
+            dept: 'ED',
+            status: 'completed',
+            disposition: sent.disposition,
+          },
         })
       }),
     )
     document.cookie = 'medicore_session=test-session; path=/'
     const { api } = await import('../api/client')
-    const res = await api.completeQueue('pat-me')
+    const res = await api.completeQueue('pat-me', 'admitted')
     expect(completedId).toBe('pat-me')
+    expect(sent.disposition).toBe('admitted')
     expect(res.item.status).toBe('completed')
+  })
+
+  it('completeQueue omits an empty note rather than sending null', async () => {
+    let sent: Record<string, unknown> = {}
+    server.use(
+      http.post(/\/flow\/queue\/[^/]+\/complete/, async ({ request }) => {
+        sent = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ ok: true, item: { patient_id: 'p', acuity: 2, dept: 'ED' } })
+      }),
+    )
+    document.cookie = 'medicore_session=test-session; path=/'
+    const { api } = await import('../api/client')
+    await api.completeQueue('pat-me', 'discharged', null)
+    expect(sent).not.toHaveProperty('disposition_note')
   })
 
   it('waitingDepartments lists unique depts', () => {
