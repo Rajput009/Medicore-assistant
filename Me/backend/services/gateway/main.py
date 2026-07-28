@@ -7,11 +7,13 @@ Postgres-backed response cache.
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 
+from backend.common import audit_store
 from backend.common.app import create_service_app
 from backend.common.cache import (
     close_pool,
@@ -37,6 +39,14 @@ from backend.common.idempotency import (
 from backend.common.idempotency import (
     store as idem_store,
 )
+from backend.common.middleware import (
+    audit_reference,
+    note_audit_patient,
+    note_audit_patients,
+    patient_id_from_resource,
+    set_audit_sink,
+)
+from backend.services.gateway import assist
 from backend.services.gateway.auth import User, admin_only, clinician_or_admin
 from backend.services.gateway.auth_middleware import JWTAuthMiddleware
 from backend.services.gateway.observations import (
@@ -81,9 +91,27 @@ async def lifespan(app: FastAPI):
             "cache initialisation failed; serving without cache",
             extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
         )
+
+    if settings.audit_index_enabled:
+        try:
+            await audit_store.start()
+            # Only register the sink once the writer is actually running,
+            # so records are never handed to a dead queue.
+            set_audit_sink(audit_store.submit)
+        except Exception as exc:
+            # The log stream still carries every audit record; only the
+            # searchable index is unavailable. That is a degradation to
+            # report, not a reason to refuse clinical traffic.
+            logger.warning(
+                "audit index unavailable; audit trail remains in the log stream",
+                extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+            )
+
     try:
         yield
     finally:
+        set_audit_sink(None)
+        await audit_store.stop()
         await stop_janitor()
         await fhir.aclose()
         await close_pool()
@@ -118,14 +146,29 @@ def health() -> Health:
 
 @app.get("/ready", tags=["ops"])
 async def ready(response: Response) -> dict[str, Any]:
-    """Readiness: verifies the cache database before accepting traffic."""
+    """Readiness: verifies the cache database before accepting traffic.
+
+    The audit index is reported but deliberately does **not** affect
+    readiness: the log stream remains the system of record, so a stalled index
+    is a searchability degradation, not a reason to pull a healthy pod out of
+    the load balancer. This endpoint is unauthenticated, so it reports a bare
+    status word — the counters live behind admin auth on /audit/stats.
+    """
+    audit_state = "disabled"
+    if settings.audit_index_enabled:
+        audit_state = "ok" if audit_store.stats()["running"] else "degraded"
+
     try:
         await cache_ping()
     except Exception:
         logger.warning("readiness check failed", exc_info=True)
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "degraded", "cache": "unavailable"}
-    return {"status": "ok", "cache": "ok"}
+        return {
+            "status": "degraded",
+            "cache": "unavailable",
+            "audit_index": audit_state,
+        }
+    return {"status": "ok", "cache": "ok", "audit_index": audit_state}
 
 
 @app.get("/secure")
@@ -217,10 +260,12 @@ def _validate_id(resource_id: str) -> str:
     return resource_id
 
 
-async def _read(resource: str, resource_id: str) -> dict[str, Any]:
+async def _read(
+    resource: str, resource_id: str, request: Request | None = None
+) -> dict[str, Any]:
     _validate_id(resource_id)
     try:
-        return await fhir.read(resource, resource_id)
+        result = await fhir.read(resource, resource_id)
     except FHIRError as exc:
         # Preserve upstream 404s instead of masking everything as a 502.
         if exc.status_code == 404:
@@ -243,12 +288,45 @@ async def _read(resource: str, resource_id: str) -> dict[str, Any]:
             detail="Upstream clinical data service unavailable",
         ) from exc
 
+    # Attribute the access to the patient the resource belongs to. Reading an
+    # Observation is an access to that patient's record, but only the resource
+    # body knows whose. Without this the audit trail records an opaque
+    # observation id that no patient-scoped search will ever match.
+    if request is not None:
+        note_audit_patient(request, patient_id_from_resource(result))
+    return result
 
-async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
+
+def _patients_in_bundle(bundle: Any) -> list[str]:
+    """Every distinct patient a search bundle disclosed.
+
+    A search filtered by name or date range returns a set of patients, and
+    each is a disclosure that belongs in that person's accounting. Without
+    this the audit trail records the query shape only, so a broad search is
+    invisible in every affected patient's trail.
+    """
+    if not isinstance(bundle, dict):
+        return []
+    found: list[str] = []
+    for entry in bundle.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        pid = patient_id_from_resource(entry.get("resource"))
+        if pid and pid not in found:
+            found.append(pid)
+    return found
+
+
+async def _search(
+    resource: str, params: dict[str, str], request: Request | None = None
+) -> dict[str, Any]:
     ttl = CACHE_TTL.get(resource, 300)
     try:
         cached = await get_cached(resource, params, max_age_seconds=ttl)
         if cached is not None:
+            # A cache hit is still a disclosure to this caller.
+            if request is not None:
+                note_audit_patients(request, _patients_in_bundle(cached))
             return cached
     except Exception:
         # A cache outage must not take the read path down with it.
@@ -274,6 +352,9 @@ async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
         await set_cached(resource, params, resp)
     except Exception:
         pass
+
+    if request is not None:
+        note_audit_patients(request, _patients_in_bundle(resp))
     return resp
 
 
@@ -291,92 +372,92 @@ async def _search(resource: str, params: dict[str, str]) -> dict[str, Any]:
 async def search_patients(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Patient", _clean_params(request))
+    return await _search("Patient", _clean_params(request), request)
 
 
 @app.get("/fhir/patient/{patient_id}")
 async def get_patient(
-    patient_id: str, user: User = Depends(clinician_or_admin)
+    patient_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Patient", patient_id)
+    return await _read("Patient", patient_id, request)
 
 
 # Kept for backwards compatibility with earlier docs/clients.
 @app.get("/fhir/patient/{patient_id}/protected")
 async def get_patient_protected(
-    patient_id: str, user: User = Depends(clinician_or_admin)
+    patient_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Patient", patient_id)
+    return await _read("Patient", patient_id, request)
 
 
 @app.get("/fhir/encounter/search")
 async def search_encounters(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Encounter", _clean_params(request))
+    return await _search("Encounter", _clean_params(request), request)
 
 
 @app.get("/fhir/encounter/{encounter_id}")
 async def get_encounter(
-    encounter_id: str, user: User = Depends(clinician_or_admin)
+    encounter_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Encounter", encounter_id)
+    return await _read("Encounter", encounter_id, request)
 
 
 @app.get("/fhir/observation/search")
 async def search_observations(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Observation", _clean_params(request))
+    return await _search("Observation", _clean_params(request), request)
 
 
 @app.get("/fhir/observation/{obs_id}")
 async def get_observation(
-    obs_id: str, user: User = Depends(clinician_or_admin)
+    obs_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Observation", obs_id)
+    return await _read("Observation", obs_id, request)
 
 
 @app.get("/fhir/allergyintolerance/search")
 async def search_allergies(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("AllergyIntolerance", _clean_params(request))
+    return await _search("AllergyIntolerance", _clean_params(request), request)
 
 
 @app.get("/fhir/allergyintolerance/{allergy_id}")
 async def get_allergy(
-    allergy_id: str, user: User = Depends(clinician_or_admin)
+    allergy_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("AllergyIntolerance", allergy_id)
+    return await _read("AllergyIntolerance", allergy_id, request)
 
 
 @app.get("/fhir/condition/search")
 async def search_conditions(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("Condition", _clean_params(request))
+    return await _search("Condition", _clean_params(request), request)
 
 
 @app.get("/fhir/condition/{condition_id}")
 async def get_condition(
-    condition_id: str, user: User = Depends(clinician_or_admin)
+    condition_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("Condition", condition_id)
+    return await _read("Condition", condition_id, request)
 
 
 @app.get("/fhir/medicationrequest/search")
 async def search_medication_requests(
     request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _search("MedicationRequest", _clean_params(request))
+    return await _search("MedicationRequest", _clean_params(request), request)
 
 
 @app.get("/fhir/medicationrequest/{med_id}")
 async def get_medication_request(
-    med_id: str, user: User = Depends(clinician_or_admin)
+    med_id: str, request: Request, user: User = Depends(clinician_or_admin)
 ) -> dict[str, Any]:
-    return await _read("MedicationRequest", med_id)
+    return await _read("MedicationRequest", med_id, request)
 
 
 # --------------------------------------------------------------------------
@@ -546,4 +627,323 @@ async def admin_invalidate_cache(
         "resource": canonical,
         "patient": patient,
         "deleted": deleted,
+    }
+
+
+# --------------------------------------------------------------------------
+# Admin audit search — "who viewed MRN-X?"
+#
+# HIPAA 164.308(a)(1)(ii)(D) requires regular review of information system
+# activity, and 164.528 gives patients a right to an accounting of
+# disclosures. Both need the audit trail to be *queryable*, not merely
+# written. These endpoints are admin-only: the ability to see who looked at
+# whom is itself sensitive, and every query here is captured by the same audit
+# middleware, so investigating the investigators works too.
+# --------------------------------------------------------------------------
+
+# Only these outcomes exist in the index; anything else is a client mistake
+# worth reporting rather than an empty result set that looks like "no access".
+_AUDIT_OUTCOMES = frozenset({"success", "failure", "denied", "error"})
+
+# Bounds the most expensive query shape (a wide time range with no filters).
+MAX_AUDIT_WINDOW_DAYS = 366
+DEFAULT_AUDIT_WINDOW_DAYS = 30
+
+
+def _audit_window(
+    since: datetime | None, until: datetime | None
+) -> tuple[datetime, datetime]:
+    """Resolve and validate the reporting window.
+
+    Defaults to the last 30 days. An unbounded default would make the common
+    case a full-table scan as the index grows.
+    """
+    now = datetime.now(UTC)
+    resolved_until = until or now
+    resolved_since = since or (resolved_until - timedelta(days=DEFAULT_AUDIT_WINDOW_DAYS))
+
+    # Naive datetimes are ambiguous; assume UTC rather than guessing local.
+    if resolved_since.tzinfo is None:
+        resolved_since = resolved_since.replace(tzinfo=UTC)
+    if resolved_until.tzinfo is None:
+        resolved_until = resolved_until.replace(tzinfo=UTC)
+
+    if resolved_since > resolved_until:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'since' must be earlier than 'until'",
+        )
+    if resolved_until - resolved_since > timedelta(days=MAX_AUDIT_WINDOW_DAYS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Time range must not exceed {MAX_AUDIT_WINDOW_DAYS} days",
+        )
+    return resolved_since, resolved_until
+
+
+def _audit_unavailable(exc: Exception) -> HTTPException:
+    logger.warning(
+        "audit search failed",
+        extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
+    )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Audit index temporarily unavailable",
+    )
+
+
+@app.get("/audit/search", tags=["audit"])
+async def audit_search(
+    patient: str | None = Query(
+        default=None,
+        max_length=64,
+        description="Patient/resource identifier, e.g. MRN-123. Hashed before "
+        "matching, exactly as the audit writer hashed it.",
+    ),
+    actor: str | None = Query(default=None, max_length=256),
+    outcome: str | None = Query(default=None, max_length=32),
+    resource_type: str | None = Query(default=None, max_length=64),
+    service: str | None = Query(default=None, max_length=64),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    break_glass: bool | None = Query(
+        default=None,
+        description="True to review only emergency overrides.",
+    ),
+    limit: int = Query(default=50, ge=1, le=audit_store.MAX_SEARCH_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(admin_only),
+) -> dict[str, Any]:
+    """Search the audit trail.
+
+    ``patient`` accepts the *raw* identifier a human knows (an MRN) and hashes
+    it with the deployment's audit salt before matching. Callers therefore
+    never need to know the pseudonymisation scheme, and no raw identifier is
+    written anywhere as a result of searching.
+    """
+    if outcome and outcome not in _AUDIT_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"outcome must be one of: {', '.join(sorted(_AUDIT_OUTCOMES))}",
+        )
+
+    resolved_since, resolved_until = _audit_window(since, until)
+    subject_ref = audit_reference(patient.strip()) if patient and patient.strip() else None
+
+    try:
+        result = await audit_store.search(
+            subject_ref=subject_ref,
+            actor=actor.strip() if actor else None,
+            outcome=outcome,
+            resource_type=resource_type.strip() if resource_type else None,
+            service=service.strip() if service else None,
+            since=resolved_since,
+            until=resolved_until,
+            break_glass=break_glass,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        raise _audit_unavailable(exc) from exc
+
+    # Echo the resolved window so a caller relying on defaults knows exactly
+    # what was searched, and the pseudonym so results can be cross-referenced
+    # against the raw log stream.
+    result["since"] = resolved_since.isoformat()
+    result["until"] = resolved_until.isoformat()
+    result["subject_ref"] = subject_ref
+    return result
+
+
+@app.get("/audit/patient/{patient_id}/accessors", tags=["audit"])
+async def audit_patient_accessors(
+    patient_id: str,
+    limit: int = Query(default=50, ge=1, le=audit_store.MAX_SEARCH_LIMIT),
+    user: User = Depends(admin_only),
+) -> dict[str, Any]:
+    """Who accessed this patient's record, most recent first.
+
+    The summarised form of the same question: one row per clinician with an
+    access count and first/last timestamps, which is what a privacy
+    investigation starts from.
+    """
+    _validate_id(patient_id)
+    subject_ref = audit_reference(patient_id)
+    try:
+        accessors = await audit_store.actors_for_subject(subject_ref, limit=limit)
+    except Exception as exc:
+        raise _audit_unavailable(exc) from exc
+    return {
+        "patient_ref": subject_ref,
+        "accessors": accessors,
+        "count": len(accessors),
+    }
+
+
+@app.get("/audit/stats", tags=["audit"])
+async def audit_stats(user: User = Depends(admin_only)) -> dict[str, Any]:
+    """Audit index health.
+
+    ``dropped`` and ``failed`` are non-zero only when audit records did not
+    reach the index. Both should be alerted on: the log stream still has the
+    records, but the searchable trail is incomplete until they are backfilled.
+    """
+    return {
+        "enabled": settings.audit_index_enabled,
+        "retention_days": settings.audit_retention_days,
+        **audit_store.stats(),
+    }
+
+
+# --------------------------------------------------------------------------
+# Grounded chart Q&A (Tier 4)
+#
+# The assistant answers questions about *this* patient using only resources
+# the caller could already have fetched themselves. Three properties make it
+# safe enough to put in front of a clinician:
+#
+#   1. Retrieval goes through the same `_search` helper as every other read,
+#      so ward scope, RBAC, the response cache and the audit trail all apply
+#      unchanged. There is no privileged side channel — an assistant that can
+#      see more than its user is a data-exfiltration tool with a chat box.
+#   2. Every finding carries citations to the resources it came from, and
+#      `assist.validate_answer` rejects any that does not.
+#   3. A retrieval failure is reported as a failure, never as an absence.
+#      "Allergy list unavailable" and "no allergies" are different clinical
+#      statements and must never render alike.
+#
+# It is read-only by construction: this endpoint performs no writes and gives
+# no advice. See backend/services/gateway/assist.py.
+# --------------------------------------------------------------------------
+
+
+class AssistQuestion(BaseModel):
+    patient_id: str = Field(..., min_length=1, max_length=64)
+    question: str = Field(..., min_length=1, max_length=assist.MAX_QUESTION_LENGTH)
+
+
+async def _assist_search(
+    resource: str, params: dict[str, str], request: Request, evidence: assist.Evidence, key: str
+) -> list[dict[str, Any]]:
+    """Fetch one resource type for the assistant, recording failure explicitly.
+
+    A swallowed exception here would surface to the clinician as "nothing
+    recorded", which is the single most dangerous output this feature could
+    produce. Failure is tracked so the answer can say so.
+    """
+    try:
+        bundle = await _search(resource, params, request)
+    except Exception:
+        logger.warning(
+            "assist retrieval failed",
+            extra={"resource": resource, "evidence_key": key},
+        )
+        evidence.failed.add(key)
+        return []
+    entries = bundle.get("entry") if isinstance(bundle, dict) else None
+    resources: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if isinstance(entry, dict) and isinstance(entry.get("resource"), dict):
+            resources.append(entry["resource"])
+    return resources
+
+
+@app.post("/assist/ask", tags=["assist"])
+async def assist_ask(
+    payload: AssistQuestion,
+    request: Request,
+    user: User = Depends(clinician_or_admin),
+) -> dict[str, Any]:
+    """Answer a question about one patient's chart, with citations.
+
+    Refuses rather than guesses: an unrecognised question, or one asking for a
+    clinical decision, returns `answered: false` with an explanation instead of
+    an answer to a question nobody asked.
+    """
+    _validate_id(payload.patient_id)
+    question = assist.normalise_question(payload.question)
+
+    # Attribute the request to the patient it is about, before any retrieval.
+    # The audit middleware derives its target from the path and query string,
+    # and this endpoint carries the patient in the body — so without this an
+    # assistant query is recorded without saying whose chart was asked about.
+    # Set even on the refusal paths: asking a question about a named patient
+    # is itself an access worth recording, and it is the one signal that would
+    # reveal someone probing charts they have no reason to open.
+    note_audit_patient(request, payload.patient_id)
+
+    # Asking the assistant to decide something is out of scope by design.
+    # Answering with a medication list could be read as endorsement.
+    if assist.requests_advice(question):
+        answer = assist.validate_answer(assist.advice_refusal())
+        return {"patient_id": payload.patient_id, "retrieved": {}, **answer.as_dict()}
+
+    intents = assist.classify(question)
+    if not intents:
+        answer = assist.validate_answer(assist.unsupported_answer(question))
+        return {"patient_id": payload.patient_id, "retrieved": {}, **answer.as_dict()}
+
+    # Fetch only what the question needs. Retrieving the whole chart for every
+    # question would turn one narrow question into a broad disclosure — and
+    # the audit trail would (correctly) record it as such.
+    evidence = assist.Evidence()
+    base = {"patient": payload.patient_id, "_count": "50"}
+
+    if "allergies" in intents:
+        evidence.allergies = await _assist_search(
+            "AllergyIntolerance", dict(base), request, evidence, "allergies"
+        )
+    if "medications" in intents:
+        evidence.medications = await _assist_search(
+            "MedicationRequest", dict(base), request, evidence, "medications"
+        )
+    if "problems" in intents:
+        evidence.conditions = await _assist_search(
+            "Condition", dict(base), request, evidence, "conditions"
+        )
+    if "observations" in intents:
+        evidence.observations = await _assist_search(
+            "Observation", dict(base), request, evidence, "observations"
+        )
+    if "encounters" in intents:
+        evidence.encounters = await _assist_search(
+            "Encounter", dict(base), request, evidence, "encounters"
+        )
+
+    answer = assist.answer_question(question, evidence)
+
+    return {
+        "patient_id": payload.patient_id,
+        # What was actually looked at, so a clinician can judge the answer's
+        # basis rather than trusting it.
+        "retrieved": {
+            "allergies": len(evidence.allergies),
+            "medications": len(evidence.medications),
+            "conditions": len(evidence.conditions),
+            "observations": len(evidence.observations),
+            "encounters": len(evidence.encounters),
+            "failed": sorted(evidence.failed),
+        },
+        **answer.as_dict(),
+    }
+
+
+@app.get("/assist/capabilities", tags=["assist"])
+async def assist_capabilities(
+    user: User = Depends(clinician_or_admin),
+) -> dict[str, Any]:
+    """What the assistant can and cannot do.
+
+    Published rather than buried in documentation: a clinician deciding
+    whether to trust an answer needs to know the assistant is extractive and
+    read-only, not a model forming an opinion.
+    """
+    return {
+        "topics": list(assist.SUPPORTED_TOPICS),
+        "grounding": "answers are extracted from this patient's FHIR records only",
+        "citations": "every finding cites the resources it was taken from",
+        "writes": False,
+        "gives_advice": False,
+        "model_backed": False,
+        "disclaimer": assist.DISCLAIMER,
     }

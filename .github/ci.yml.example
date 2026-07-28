@@ -1,5 +1,18 @@
-# Copy to .github/workflows/ci.yml once the repo app has the "workflows" permission.
-# (GitHub Apps cannot push workflow files without that scope.)
+# ⚠️  THIS FILE IS NOT RUNNING. It is an example, not an installed workflow.
+#
+# Until it is copied to .github/workflows/ci.yml, no gate in this repository
+# is enforced on push or pull request: `gh pr checks` reports "no checks
+# reported", and every "all green" claim rests on someone having run the
+# suite locally. Agents and CI apps cannot install it themselves — pushing a
+# file under .github/workflows/ requires the "workflows" token scope.
+#
+# To turn it on (one commit, from a normal user account):
+#
+#     git mv .github/ci.yml.example .github/workflows/ci.yml
+#     git commit -m "Enable CI" && git push
+#
+# Until then, `cd Me && make verify` runs the same eight gates locally and is
+# the only reproducible check available.
 #
 name: CI
 
@@ -37,8 +50,10 @@ jobs:
         run: ruff check backend
 
       - name: Dependency audit
-        run: |
-          if [ -f scripts/audit_python.sh ]; then bash scripts/audit_python.sh; else pip-audit --progress-spinner=off || true; fi
+        # Blocking. Exceptions live in scripts/audit_python.sh with a written
+        # reason and a guard test, so an accepted risk cannot become a
+        # forgotten one.
+        run: bash scripts/audit_python.sh
 
       - name: Test
         env:
@@ -64,9 +79,11 @@ jobs:
         working-directory: Me/frontend/web
         run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
-      - name: npm audit (high+)
-        working-directory: Me/frontend/web
-        run: npm audit --audit-level=high || true
+      - name: Dependency audit
+        # Blocking for *runtime* dependencies only; dev-tool advisories are
+        # printed but do not fail the build (vite/esbuild never ship to a
+        # browser). Exceptions are documented in scripts/audit_node.sh.
+        run: bash scripts/audit_node.sh
 
       - name: Typecheck (app)
         working-directory: Me/frontend/web

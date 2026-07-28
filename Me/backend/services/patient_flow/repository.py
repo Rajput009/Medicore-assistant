@@ -11,7 +11,8 @@ query, serialising all concurrent requests behind the slowest one.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import math
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
@@ -33,6 +34,20 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _percentile(values: list[float], pct: int) -> float | None:
+    """Nearest-rank percentile. None for an empty series.
+
+    Returning None rather than 0 matters: "no completions yet" and "everything
+    completed instantly" are different facts, and a dashboard showing 0
+    minutes for an empty window would be actively misleading.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(pct / 100 * len(ordered)))
+    return round(ordered[min(rank, len(ordered)) - 1], 3)
+
+
 def _strip_id(doc: dict[str, Any]) -> dict[str, Any]:
     """Drop Mongo's ObjectId, which is not JSON-serialisable.
 
@@ -50,6 +65,7 @@ class PatientFlowRepository:
         self.db = db
         self.beds = db.beds
         self.queue = db.triage_queue
+        self.handoffs = db.handoff_notes
 
     # -- schema ------------------------------------------------------------
 
@@ -67,6 +83,12 @@ class PatientFlowRepository:
             [("status", ASCENDING), ("acuity", ASCENDING), ("created_at", ASCENDING)]
         )
         await self.queue.create_index([("dept", ASCENDING), ("status", ASCENDING)])
+        # Handoff notes are append-only and read newest-first per patient.
+        await self.handoffs.create_index(
+            [("patient_id", ASCENDING), ("created_at", DESCENDING)]
+        )
+        # Retention sweeps delete by age across all patients.
+        await self.handoffs.create_index([("created_at", ASCENDING)])
 
     async def seed_beds(self, beds: list[dict[str, Any]]) -> int:
         """Insert any missing beds. Existing rows are left untouched.
@@ -152,9 +174,26 @@ class PatientFlowRepository:
     # -- triage queue ------------------------------------------------------
 
     async def enqueue(
-        self, patient_id: str, acuity: int, dept: str, created_by: str
+        self,
+        patient_id: str,
+        acuity: int,
+        dept: str,
+        created_by: str,
+        *,
+        reason: str | None = None,
+        news2_score: int | None = None,
+        news2_band: str | None = None,
+        red_flag: bool | None = None,
+        vitals_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        doc = {
+        """Add a patient to the triage queue, with the evidence for it.
+
+        The clinical evidence is *snapshotted*, not referenced. A later
+        correction to an Observation must not silently rewrite the
+        justification for a decision already taken — the record has to show
+        what was known at the time.
+        """
+        doc: dict[str, Any] = {
             "patient_id": patient_id,
             "acuity": acuity,
             "dept": dept,
@@ -162,6 +201,20 @@ class PatientFlowRepository:
             "created_at": utcnow(),
             "created_by": created_by,
         }
+        # Only store evidence that was actually supplied. Writing explicit
+        # nulls would make "no NEWS2 was taken" indistinguishable from
+        # "NEWS2 was taken and we lost it".
+        if reason:
+            doc["reason"] = reason
+        if news2_score is not None:
+            doc["news2_score"] = news2_score
+        if news2_band:
+            doc["news2_band"] = news2_band
+        if red_flag is not None:
+            doc["red_flag"] = red_flag
+        if vitals_snapshot:
+            doc["vitals_snapshot"] = vitals_snapshot
+
         try:
             await self.queue.insert_one(dict(doc))
         except DuplicateKeyError as exc:
@@ -208,16 +261,113 @@ class PatientFlowRepository:
         )
         return _strip_id(doc) if doc is not None else None
 
-    async def complete(self, patient_id: str) -> dict[str, Any]:
+    async def complete(
+        self,
+        patient_id: str,
+        *,
+        disposition: str,
+        completed_by: str,
+        disposition_note: str | None = None,
+    ) -> dict[str, Any]:
+        """Close a queue entry with a record of what actually happened.
+
+        Completion is one-way. The filter excludes already-completed entries,
+        so re-completing raises rather than silently overwriting a
+        disposition — a recorded outcome must not be quietly changed after
+        the fact. Correcting one is a separate, explicit action.
+
+        ``time_to_completion_seconds`` is derived server-side from the stored
+        ``created_at`` rather than accepted from the caller, so the number
+        cannot be massaged by a client.
+        """
+        completed_at = utcnow()
+        update: dict[str, Any] = {
+            "status": "completed",
+            "completed_at": completed_at,
+            "disposition": disposition,
+            "completed_by": completed_by,
+        }
+        if disposition_note:
+            update["disposition_note"] = disposition_note
+
         doc = await self.queue.find_one_and_update(
             {"patient_id": patient_id, "status": {"$ne": "completed"}},
-            {"$set": {"status": "completed", "completed_at": utcnow()}},
+            {"$set": update},
             sort=[("created_at", DESCENDING)],
             return_document=ReturnDocument.AFTER,
         )
         if doc is None:
+            # Distinguish "never existed" from "already closed": the second is
+            # a conflict the caller can act on, the first is a mistake.
+            if await self.queue.count_documents({"patient_id": patient_id}, limit=1):
+                raise ConflictError(patient_id)
             raise NotFoundError(patient_id)
+
+        created_at = doc.get("created_at")
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            elapsed = (completed_at - created_at).total_seconds()
+            # Clock skew between replicas could otherwise produce a negative
+            # duration, which would poison any median computed from it.
+            doc["time_to_completion_seconds"] = round(max(0.0, elapsed), 3)
+
         return _strip_id(doc)
+
+    async def queue_history(self, patient_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Every queue entry for a patient, newest first."""
+        cursor = (
+            self.queue.find({"patient_id": patient_id}, {"_id": 0})
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        return [doc async for doc in cursor]
+
+    async def queue_stats(
+        self, dept: str | None = None, since: datetime | None = None
+    ) -> dict[str, Any]:
+        """Counts by disposition and time-to-completion percentiles.
+
+        This is what the ward gets back for the extra typing at completion.
+        Computed from the stored documents rather than a running counter, so
+        it cannot drift out of step with the records themselves.
+        """
+        query: dict[str, Any] = {"status": "completed"}
+        if dept:
+            query["dept"] = dept
+        if since:
+            query["created_at"] = {"$gte": since}
+
+        by_disposition: dict[str, int] = {}
+        durations: list[float] = []
+        total = 0
+
+        async for doc in self.queue.find(query, {"_id": 0}):
+            total += 1
+            key = str(doc.get("disposition") or "unrecorded")
+            by_disposition[key] = by_disposition.get(key, 0) + 1
+            created_at, completed_at = doc.get("created_at"), doc.get("completed_at")
+            if isinstance(created_at, datetime) and isinstance(completed_at, datetime):
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=UTC)
+                if completed_at.tzinfo is None:
+                    completed_at = completed_at.replace(tzinfo=UTC)
+                durations.append(max(0.0, (completed_at - created_at).total_seconds()))
+
+        waiting_query: dict[str, Any] = {"status": "waiting"}
+        if dept:
+            waiting_query["dept"] = dept
+
+        lwbs = by_disposition.get("left_without_being_seen", 0)
+        return {
+            "completed": total,
+            "waiting": await self.queue.count_documents(waiting_query),
+            "by_disposition": by_disposition,
+            # The headline safety number for an emergency department.
+            "left_without_being_seen_rate": round(lwbs / total, 4) if total else 0.0,
+            "median_seconds": _percentile(durations, 50),
+            "p90_seconds": _percentile(durations, 90),
+        }
 
     async def ping(self) -> None:
         """Raise if the database is not reachable."""
@@ -240,3 +390,65 @@ def create_client() -> AsyncIOMotorClient:
         retryWrites=True,
         tz_aware=True,
     )
+
+    # -- handoff notes -----------------------------------------------------
+    #
+    # Shift-handoff SBAR notes. Deliberately **append-only**: a handoff note
+    # is a contemporaneous clinical communication, and the question "what was
+    # I told at 07:00?" must stay answerable after someone edits it at 09:00.
+    # An update-in-place model would silently destroy that.
+    #
+    # These are *not* the record of truth — that is the hospital EHR. They are
+    # working notes that survive the shift, which is exactly the gap
+    # sessionStorage left: a clinician who closed the tab lost the handoff
+    # they had just written.
+
+    async def add_handoff(
+        self,
+        patient_id: str,
+        text: str,
+        author: str,
+        *,
+        encounter_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a new version of the handoff note for ``patient_id``."""
+        doc = {
+            "patient_id": patient_id,
+            "text": text,
+            "author": author,
+            "encounter_id": encounter_id,
+            "created_at": utcnow(),
+        }
+        await self.handoffs.insert_one(doc)
+        return _strip_id(doc)
+
+    async def latest_handoff(self, patient_id: str) -> dict[str, Any] | None:
+        """The current note: newest version wins."""
+        doc = await self.handoffs.find_one(
+            {"patient_id": patient_id}, sort=[("created_at", DESCENDING)]
+        )
+        return _strip_id(doc) if doc else None
+
+    async def handoff_history(
+        self, patient_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Every version, newest first — the audit view of the note."""
+        cursor = (
+            self.handoffs.find({"patient_id": patient_id})
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        return [_strip_id(doc) async for doc in cursor]
+
+    async def purge_handoffs(self, older_than_days: int) -> int:
+        """Delete notes past the retention window; 0 disables purging.
+
+        Working notes are not the medical record, so they are not kept for the
+        six years the audit trail is. Retaining PHI longer than it is useful
+        is its own risk.
+        """
+        if older_than_days <= 0:
+            return 0
+        cutoff = utcnow() - timedelta(days=older_than_days)
+        result = await self.handoffs.delete_many({"created_at": {"$lt": cutoff}})
+        return int(result.deleted_count)

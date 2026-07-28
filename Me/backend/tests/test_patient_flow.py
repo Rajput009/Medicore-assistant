@@ -178,12 +178,27 @@ class TestBedConcurrency:
 
 
 class TestQueue:
-    def _add(self, client, pid, acuity, dept="ED"):
-        return client.post(
-            "/queue",
-            json={"patient_id": pid, "acuity": acuity, "dept": dept},
-            headers=auth(),
-        )
+    def _add(self, client, pid, acuity, dept="ED", reason=None):
+        """Enqueue a patient.
+
+        Supplies a reason automatically for urgent acuities: the API requires
+        one at acuity <= 2, so tests about ordering or conflicts should not
+        have to restate it.
+        """
+        body = {"patient_id": pid, "acuity": acuity, "dept": dept}
+        if reason is not None:
+            body["reason"] = reason
+        elif acuity <= 2:
+            body["reason"] = "Test escalation with a substantive reason"
+        return client.post("/queue", json=body, headers=auth())
+
+    @staticmethod
+    def _complete(client, pid, disposition="discharged", note=None, **kw):
+        """Complete a queue entry. Disposition is required by the API."""
+        body = {"disposition": disposition}
+        if note is not None:
+            body["disposition_note"] = note
+        return client.post(f"/queue/{pid}/complete", json=body, headers=auth(), **kw)
 
     def test_enqueue_and_list(self, app_and_repo):
         client, _ = app_and_repo
@@ -210,7 +225,7 @@ class TestQueue:
     def test_requeue_allowed_after_completion(self, app_and_repo):
         client, _ = app_and_repo
         self._add(client, "MRN-1", 3)
-        client.post("/queue/MRN-1/complete", headers=auth())
+        self._complete(client, "MRN-1")
         assert self._add(client, "MRN-1", 2).status_code == 201
 
     def test_total_reflects_full_queue_not_the_page(self, app_and_repo):
@@ -270,7 +285,7 @@ class TestQueue:
 
     def test_complete_unknown_patient(self, app_and_repo):
         client, _ = app_and_repo
-        assert client.post("/queue/MRN-nope/complete", headers=auth()).status_code == 404
+        assert self._complete(client, "MRN-nope").status_code == 404
 
     def test_claimed_patient_leaves_the_waiting_list(self, app_and_repo):
         client, _ = app_and_repo

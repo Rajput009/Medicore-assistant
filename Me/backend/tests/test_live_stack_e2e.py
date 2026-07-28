@@ -79,10 +79,31 @@ class _FhirHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    # An Observation belonging to patient 123, so the audit trail's patient
+    # attribution (a resource that is not itself a Patient) can be exercised.
+    observations = {
+        "obs-1": {
+            "resourceType": "Observation",
+            "id": "obs-1",
+            "status": "final",
+            "subject": {"reference": "Patient/123"},
+            "code": {"text": "Heart rate"},
+            "valueQuantity": {"value": 88, "unit": "/min"},
+        }
+    }
+
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path.startswith("/oauth2/token"):
             self._json(405, {"error": "use POST"})
+            return
+        if path.startswith("/fhir/Observation/"):
+            oid = path.rsplit("/", 1)[-1]
+            doc = self.observations.get(oid)
+            if not doc:
+                self._json(404, {"resourceType": "OperationOutcome", "issue": []})
+                return
+            self._json(200, doc)
             return
         if path.startswith("/fhir/Patient/"):
             pid = path.rsplit("/", 1)[-1]
@@ -213,6 +234,13 @@ def live_stack():
             "FHIR_CLIENT_SECRET": "e2e-secret-not-a-placeholder",
             "PYTHONPATH": str(ROOT.resolve()),
             "BED_LAYOUT": "A:2,ICU:1",
+            # Every request in this module arrives from 127.0.0.1, so the whole
+            # module shares one rate-limit bucket in each worker process. The
+            # default 120/min would make an unrelated test fail with 429 purely
+            # because tests were added earlier in the file. Rate limiting itself
+            # is covered by test_hardening / test_multi_replica_redis.
+            "RATE_LIMIT_PER_MINUTE": "10000",
+            "LOGIN_RATE_LIMIT_PER_MINUTE": "10000",
         }
     )
 
@@ -285,12 +313,16 @@ uvicorn.run(pf.app, host="127.0.0.1", port={FLOW_PORT}, log_level="warning")
         "flow": f"http://127.0.0.1:{FLOW_PORT}",
     }
 
-    for name, proc in procs:
+    for _name, proc in procs:
         proc.send_signal(signal.SIGTERM)
     for name, proc in procs:
         try:
             proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
+            # Name the worker that would not shut down: a SIGTERM that is
+            # ignored usually means a lifespan hook is wedged, and without
+            # this the only symptom is a slow, silent teardown.
+            print(f"worker {name!r} ignored SIGTERM; killing")
             proc.kill()
     fhir_server.shutdown()
     try:
@@ -319,7 +351,18 @@ class TestLiveStackHealth:
     def test_gateway_ready_hits_real_postgres(self, live_stack):
         code, _, body = _http("GET", f"{live_stack['gateway']}/ready")
         assert code == 200
-        assert body == {"status": "ok", "cache": "ok"}
+        assert body["status"] == "ok"
+        assert body["cache"] == "ok"
+
+    def test_gateway_ready_reports_the_audit_index(self, live_stack):
+        """The audit writer starts against the same real Postgres.
+
+        Asserted separately from cache readiness because the index must never
+        be able to fail the probe: the log stream is the system of record.
+        """
+        code, _, body = _http("GET", f"{live_stack['gateway']}/ready")
+        assert code == 200
+        assert body["audit_index"] == "ok"
 
     def test_patient_flow_ready_with_mongomock(self, live_stack):
         code, _, body = _http("GET", f"{live_stack['flow']}/ready")
@@ -398,7 +441,7 @@ class TestLiveClinicalWorkflow:
             "POST",
             f"{live_stack['flow']}/queue",
             token=token,
-            body={"patient_id": "MRN-LIVE-1", "acuity": 1, "dept": "ED"},
+            body={"patient_id": "MRN-LIVE-1", "acuity": 1, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
         )
         assert code == 201
         assert enq["ok"] is True
@@ -408,7 +451,7 @@ class TestLiveClinicalWorkflow:
             "POST",
             f"{live_stack['flow']}/queue",
             token=token,
-            body={"patient_id": "MRN-LIVE-1", "acuity": 2, "dept": "ED"},
+            body={"patient_id": "MRN-LIVE-1", "acuity": 2, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
         )
         assert code == 409
 
@@ -444,9 +487,14 @@ class TestLiveClinicalWorkflow:
             "POST",
             f"{live_stack['flow']}/queue/MRN-LIVE-1/complete",
             token=token,
+            body={"disposition": "admitted"},
         )
         assert code == 200
         assert done["item"]["status"] == "completed"
+        # The loop is closed: what happened, who decided, and how long it took.
+        assert done["item"]["disposition"] == "admitted"
+        assert done["item"]["completed_by"]
+        assert done["item"]["time_to_completion_seconds"] >= 0
 
     def test_anonymous_clinical_calls_are_rejected(self, live_stack):
         code, _, _ = _http("GET", f"{live_stack['flow']}/beds")
@@ -520,6 +568,352 @@ class TestLiveGatewayFhirAndCache:
             token=token,
         )
         assert code == 403
+
+
+class TestLiveAuditSearch:
+    """The full loop: a real FHIR read, indexed by a real background writer
+    into real Postgres, then found by a real admin search over HTTP.
+
+    Every layer that could silently break the trail is in play here — the
+    async queue, the batch INSERT, the ``text[]`` columns, and the requirement
+    that the search endpoint hashes an MRN exactly as the middleware did.
+    """
+
+    def _admin_token(self) -> str:
+        from datetime import UTC, datetime, timedelta
+
+        from jose import jwt
+
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "sub": "audit.admin",
+                "roles": ["admin"],
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=15)).timestamp()),
+                "jti": "audit-admin-e2e-jti",
+                "token_use": "access",
+            },
+            "test-secret-at-least-32-chars-long!!",
+            algorithm="HS256",
+        )
+
+    def _search(self, live_stack, query: str, token: str, *, expect: int = 1):
+        """Poll the index: writes are batched, so they are not instant."""
+        deadline = time.time() + 6.0
+        body: Any = None
+        while time.time() < deadline:
+            code, _, body = _http(
+                "GET", f"{live_stack['gateway']}/audit/search?{query}", token=token
+            )
+            assert code == 200, body
+            if body["total"] >= expect:
+                return body
+            time.sleep(0.25)
+        return body
+
+    def test_a_chart_read_becomes_searchable(self, live_stack):
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.audited", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        code, _, _ = _http(
+            "GET", f"{live_stack['gateway']}/fhir/patient/123", token=clinician
+        )
+        assert code == 200
+
+        admin = self._admin_token()
+        body = self._search(live_stack, "patient=123", admin)
+        assert body["total"] >= 1
+        assert any(item["actor_sub"] == "dr.audited" for item in body["items"])
+        # The response identifies the record by hash, never by raw MRN.
+        assert body["subject_ref"].startswith("sha256:")
+
+    def test_an_observation_read_is_findable_under_its_patient(self, live_stack):
+        """SECURITY.md R11: reading a non-Patient resource is an access to
+        that patient's record and must appear in their trail, not only under
+        an opaque observation id."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.obs", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        code, _, obs = _http(
+            "GET", f"{live_stack['gateway']}/fhir/observation/obs-1", token=clinician
+        )
+        assert code == 200
+        assert obs["resourceType"] == "Observation"
+
+        admin = self._admin_token()
+        # Searching by the *patient* must surface the observation read.
+        body = self._search(live_stack, "patient=123&actor=dr.obs", admin)
+        assert body["total"] >= 1
+        assert any(
+            item["path"] == "/fhir/observation/{id}" for item in body["items"]
+        ), body["items"]
+
+    def test_a_patient_found_by_search_is_findable_in_the_index(self, live_stack):
+        """SECURITY.md R12, end to end: a search discloses the patients it
+        returned, and each must be findable afterwards even though the query
+        was not filtered by any of them."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.searcher", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        # Filtered by name, not by patient id — the R12 case.
+        code, _, bundle = _http(
+            "GET",
+            f"{live_stack['gateway']}/fhir/patient/search?name=Ada",
+            token=clinician,
+        )
+        assert code == 200
+        assert bundle["entry"][0]["resource"]["id"] == "123"
+
+        admin = self._admin_token()
+        # Patient 123 was never named in the query, only in the results.
+        body = self._search(live_stack, "patient=123&actor=dr.searcher", admin)
+        assert body["total"] >= 1
+        event = body["items"][0]
+        assert event["path"] == "/fhir/patient/search"
+        assert event["subject_count"] >= 1
+
+    def test_accessor_summary_names_the_clinician(self, live_stack):
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.summary", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+        for _ in range(2):
+            _http("GET", f"{live_stack['gateway']}/fhir/patient/123", token=clinician)
+
+        admin = self._admin_token()
+        # Wait for the writer to drain before summarising.
+        self._search(live_stack, "actor=dr.summary", admin, expect=2)
+
+        code, _, body = _http(
+            "GET",
+            f"{live_stack['gateway']}/audit/patient/123/accessors",
+            token=admin,
+        )
+        assert code == 200
+        rows = {row["actor_sub"]: row for row in body["accessors"]}
+        assert "dr.summary" in rows
+        assert rows["dr.summary"]["accesses"] >= 2
+
+    def test_denied_access_is_recorded_as_denied(self, live_stack):
+        """A refused attempt is the highest-signal row in an investigation."""
+        from datetime import UTC, datetime, timedelta
+
+        from jose import jwt
+
+        now = datetime.now(UTC)
+        viewer = jwt.encode(
+            {
+                "sub": "viewer.snoop",
+                "roles": ["viewer"],
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=15)).timestamp()),
+                "jti": "viewer-snoop-jti",
+                "token_use": "access",
+            },
+            "test-secret-at-least-32-chars-long!!",
+            algorithm="HS256",
+        )
+        code, _, _ = _http(
+            "GET", f"{live_stack['gateway']}/fhir/patient/123", token=viewer
+        )
+        assert code == 403
+
+        admin = self._admin_token()
+        body = self._search(live_stack, "actor=viewer.snoop&outcome=denied", admin)
+        assert body["total"] >= 1
+        assert all(item["outcome"] == "denied" for item in body["items"])
+
+    def _scoped_token(self, sub: str, wards: list[str]) -> str:
+        """A ward-scoped clinician token, signed like the live workers expect.
+
+        Demo login issues an unscoped token (which is unrestricted), so break-
+        glass can only be exercised with a genuinely scoped one.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from jose import jwt
+
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "sub": sub,
+                "roles": ["clinician"],
+                "wards": wards,
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=15)).timestamp()),
+                "jti": f"{sub}-bg-jti",
+                "token_use": "access",
+            },
+            "test-secret-at-least-32-chars-long!!",
+            algorithm="HS256",
+        )
+
+    def test_break_glass_override_is_recorded_and_reviewable(self, live_stack):
+        """End to end: a ward-A clinician is refused an ICU bed, declares an
+        emergency, gets through, and the override is findable afterwards by
+        someone reviewing overrides through the real index."""
+        from backend.common.breakglass import BREAK_GLASS_HEADER
+
+        reason = "Cardiac arrest in ICU bay 1, covering clinician unavailable"
+        scoped = self._scoped_token("dr.bg", ["A"])
+
+        # Refused without a declaration.
+        code, _, _ = _http(
+            "PATCH",
+            f"{live_stack['flow']}/beds/ICU-001",
+            token=scoped,
+            body={"occupied": True, "patient_id": "MRN-BG"},
+        )
+        assert code == 403, "ward scope was not enforced"
+
+        # Granted with one.
+        code, _, _ = _http(
+            "PATCH",
+            f"{live_stack['flow']}/beds/ICU-001",
+            token=scoped,
+            body={"occupied": True, "patient_id": "MRN-BG"},
+            headers={BREAK_GLASS_HEADER: reason},
+        )
+        assert code == 200, "break-glass did not grant access"
+
+        # And reviewable: patient-flow indexes into the same Postgres the
+        # gateway searches, so the override surfaces in the review query.
+        admin = self._admin_token()
+        deadline = time.time() + 6.0
+        found = None
+        while time.time() < deadline:
+            code, _, body = _http(
+                "GET",
+                f"{live_stack['gateway']}/audit/search?break_glass=true&actor=dr.bg",
+                token=admin,
+            )
+            assert code == 200, body
+            if body["total"] >= 1:
+                found = body
+                break
+            time.sleep(0.25)
+
+        assert found is not None, "break-glass override never reached the audit index"
+        event = found["items"][0]
+        assert event["break_glass"] is True
+        assert event["break_glass_reason"] == reason
+        assert event["service"] == "patient-flow"
+
+    def test_normal_access_is_absent_from_the_override_review(self, live_stack):
+        """The review query must not be diluted by routine access."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.routine", "password": "medicore-dev"},
+        )
+        _http("GET", f"{live_stack['flow']}/beds", token=login["access_token"])
+
+        admin = self._admin_token()
+        code, _, body = _http(
+            "GET",
+            f"{live_stack['gateway']}/audit/search?break_glass=true&limit=200",
+            token=admin,
+        )
+        assert code == 200
+        assert all(item["actor_sub"] != "dr.routine" for item in body["items"])
+
+    def test_a_clinician_cannot_search_the_audit_trail(self, live_stack):
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.curious", "password": "medicore-dev"},
+        )
+        code, _, _ = _http(
+            "GET",
+            f"{live_stack['gateway']}/audit/search",
+            token=login["access_token"],
+        )
+        assert code == 403
+
+    def test_audit_search_requires_authentication(self, live_stack):
+        code, _, _ = _http("GET", f"{live_stack['gateway']}/audit/search")
+        assert code == 401
+
+    def test_assistant_retrieval_is_audited_against_the_patient(self, live_stack):
+        """The assistant reads a chart, so it must land in that patient's
+        trail like any other access — a Q&A box is not an audit loophole."""
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.assist", "password": "medicore-dev"},
+        )
+        clinician = login["access_token"]
+
+        code, _, body = _http(
+            "POST",
+            f"{live_stack['gateway']}/assist/ask",
+            token=clinician,
+            body={"patient_id": "123", "question": "what allergies are recorded?"},
+        )
+        assert code == 200, body
+        # The stub FHIR server serves no AllergyIntolerance, so the honest
+        # answer is a caveat rather than a finding.
+        assert body["answered"] is False
+        assert body["caveats"]
+
+        admin = self._admin_token()
+        found = self._search(live_stack, "patient=123&actor=dr.assist", admin)
+        assert found["total"] >= 1, "assistant retrieval never reached the audit index"
+
+    def test_assistant_refuses_advice_over_the_wire(self, live_stack):
+        _, _, login = _http(
+            "POST",
+            f"{live_stack['auth']}/login",
+            body={"username": "dr.advice", "password": "medicore-dev"},
+        )
+        code, _, body = _http(
+            "POST",
+            f"{live_stack['gateway']}/assist/ask",
+            token=login["access_token"],
+            body={"patient_id": "123", "question": "should I give penicillin?"},
+        )
+        assert code == 200
+        assert body["answered"] is False
+        assert any("does not give clinical advice" in c for c in body["caveats"])
+
+    def test_stats_report_a_healthy_index(self, live_stack):
+        code, _, body = _http(
+            "GET", f"{live_stack['gateway']}/audit/stats", token=self._admin_token()
+        )
+        assert code == 200
+        assert body["enabled"] is True
+        assert body["running"] is True
+        # Nothing should have been lost in a quiet test run.
+        assert body["dropped"] == 0
+        assert body["failed"] == 0
+
+    def test_probe_traffic_is_not_indexed(self, live_stack):
+        """Readiness probes would otherwise dominate the table."""
+        for _ in range(3):
+            _http("GET", f"{live_stack['gateway']}/ready")
+        admin = self._admin_token()
+        code, _, body = _http(
+            "GET",
+            f"{live_stack['gateway']}/audit/search?limit=200",
+            token=admin,
+        )
+        assert code == 200
+        assert all(item["path"] != "/ready" for item in body["items"])
 
 
 class TestLiveLogoutRevocation:

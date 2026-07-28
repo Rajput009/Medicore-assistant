@@ -8,12 +8,22 @@
  */
 
 import type {
+  AssistAnswer,
+  AuditAccessorsResponse,
+  Disposition,
+  QueueHistory,
+  QueueStats,
+  AuditSearchParams,
+  AuditSearchResponse,
   Bed,
   BedUpdate,
   CacheInvalidationResponse,
   FhirBundle,
   FhirResource,
   FhirResourceType,
+  HandoffHistoryResponse,
+  HandoffNote,
+  HandoffResponse,
   Health,
   QueueItem,
   QueueListResponse,
@@ -296,6 +306,106 @@ export const api = {
     })
   },
 
+  /**
+   * Search the audit trail. Admin-only server-side.
+   *
+   * `patient` takes the raw identifier a human knows (an MRN); the gateway
+   * hashes it with the deployment's audit salt before matching, so the SPA
+   * never needs to know the pseudonymisation scheme.
+   */
+  auditSearch(
+    params: AuditSearchParams,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AuditSearchResponse> {
+    return request<AuditSearchResponse>(`${BASE.gateway}/audit/search`, {
+      // buildQuery drops blank values, so unset filters are simply absent.
+      params: { ...params },
+      signal,
+    })
+  },
+
+  /** Distinct clinicians who accessed a patient's record, newest first. */
+  auditAccessors(
+    patientId: string,
+    limit?: number,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AuditAccessorsResponse> {
+    return request<AuditAccessorsResponse>(
+      `${BASE.gateway}/audit/patient/${encodeURIComponent(patientId)}/accessors`,
+      { params: limit ? { limit } : {}, signal },
+    )
+  },
+
+  /** The current shift-handoff note for a patient, or null when none exists. */
+  getHandoff(
+    patientId: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<HandoffResponse> {
+    return request<HandoffResponse>(
+      `${BASE.patientFlow}/handoff/${encodeURIComponent(patientId)}`,
+      { signal },
+    )
+  },
+
+  /** Every version, newest first. Notes are append-only, never overwritten. */
+  getHandoffHistory(
+    patientId: string,
+    limit?: number,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<HandoffHistoryResponse> {
+    return request<HandoffHistoryResponse>(
+      `${BASE.patientFlow}/handoff/${encodeURIComponent(patientId)}/history`,
+      { params: limit ? { limit } : {}, signal },
+    )
+  },
+
+  /**
+   * Append a new version of the handoff note.
+   *
+   * The author is taken from the session server-side, never sent from here.
+   */
+  saveHandoff(
+    patientId: string,
+    text: string,
+    encounterId?: string | null,
+    _token?: string | null,
+    signal?: AbortSignal,
+    idempotencyKey?: string,
+  ): Promise<{ ok: boolean; note: HandoffNote }> {
+    return request<{ ok: boolean; note: HandoffNote }>(
+      `${BASE.patientFlow}/handoff/${encodeURIComponent(patientId)}`,
+      {
+        method: 'POST',
+        body: { text, ...(encounterId ? { encounter_id: encounterId } : {}) },
+        signal,
+        idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
+      },
+    )
+  },
+
+  /**
+   * Ask a grounded question about one patient's chart.
+   *
+   * Read-only and cited server-side; the caller sees only what they are
+   * already authorised to fetch themselves.
+   */
+  assistAsk(
+    patientId: string,
+    question: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<AssistAnswer> {
+    return request<AssistAnswer>(`${BASE.gateway}/assist/ask`, {
+      method: 'POST',
+      body: { patient_id: patientId, question },
+      signal,
+    })
+  },
+
   listBeds(ward: string | null, _token?: string | null, signal?: AbortSignal): Promise<Bed[]> {
     return request<Bed[]>(`${BASE.patientFlow}/beds`, {
       params: ward ? { ward } : {},
@@ -364,9 +474,16 @@ export const api = {
     })
   },
 
-  /** Mark a triage entry completed. */
+  /**
+   * Close a triage entry with what actually happened to the patient.
+   *
+   * `disposition` is required by the API: "completed" alone could not
+   * distinguish an admission from a patient who left unseen.
+   */
   completeQueue(
     patientId: string,
+    disposition: Disposition,
+    dispositionNote?: string | null,
     _token?: string | null,
     signal?: AbortSignal,
     idempotencyKey?: string,
@@ -375,10 +492,42 @@ export const api = {
       `${BASE.patientFlow}/queue/${encodeURIComponent(patientId)}/complete`,
       {
         method: 'POST',
+        body: {
+          disposition,
+          ...(dispositionNote ? { disposition_note: dispositionNote } : {}),
+        },
         signal,
         idempotencyKey: idempotencyKey ?? newIdempotencyKey(),
       },
     )
+  },
+
+  /** Every queue entry for a patient, newest first. */
+  queueHistory(
+    patientId: string,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<QueueHistory> {
+    return request<QueueHistory>(
+      `${BASE.patientFlow}/queue/${encodeURIComponent(patientId)}/history`,
+      { signal },
+    )
+  },
+
+  /** Counts by disposition, LWBS rate and time-to-completion percentiles. */
+  queueStats(
+    dept?: string | null,
+    sinceHours?: number,
+    _token?: string | null,
+    signal?: AbortSignal,
+  ): Promise<QueueStats> {
+    return request<QueueStats>(`${BASE.patientFlow}/queue/stats`, {
+      params: {
+        ...(dept ? { dept } : {}),
+        ...(sinceHours ? { since_hours: sinceHours } : {}),
+      },
+      signal,
+    })
   },
 
   /** Full NEWS2 assessment with a per-parameter breakdown. */

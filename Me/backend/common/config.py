@@ -117,6 +117,27 @@ class Settings(BaseSettings):
     # Dedicated salt; falls back to jwt_secret when unset.
     audit_log_salt: str = ""
 
+    # --- Queryable audit index ---
+    # Mirrors audit records into Postgres so "who viewed MRN-X?" is answerable
+    # without a log-aggregation round trip. Writes are queued and batched off
+    # the request path; see backend/common/audit_store.py.
+    audit_index_enabled: bool = True
+    # Bounded queue: an unbounded one would trade a counted drop for an OOM.
+    audit_index_queue_size: int = 5000
+    audit_index_batch_size: int = 200
+    audit_index_flush_interval_seconds: float = 1.0
+    # HIPAA 164.316(b)(2) requires six years of documentation retention.
+    # 0 disables purging entirely (retain forever / handled externally).
+    audit_retention_days: int = 2555
+    audit_purge_interval_seconds: int = 86_400
+
+    # --- Break-glass (emergency scope override) ---
+    # Lets an in-scope clinician reach a patient outside their ward/department
+    # in an emergency, with a mandatory reason recorded at WARNING and indexed
+    # for review. Widens scope only — never role. Set false to disable, in
+    # which case the header is rejected rather than ignored.
+    break_glass_enabled: bool = True
+
     # --- Abuse protection ---
     rate_limit_per_minute: int = 120
     # Login is the credential-stuffing target, so it gets a tighter budget.

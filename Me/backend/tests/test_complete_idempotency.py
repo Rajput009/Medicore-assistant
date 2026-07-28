@@ -16,6 +16,9 @@ from backend.common.idempotency import reset_idempotency_store
 from backend.common.security import create_access_token
 from backend.tests.fakes import FakePatientFlowRepository
 
+# Completion now records what happened to the patient.
+_DISPOSITION = {"disposition": "discharged"}
+
 
 def _headers(key: str | None = None) -> dict[str, str]:
     token = create_access_token("dr.smith", roles=["clinician"])
@@ -50,7 +53,13 @@ def flow():
 def _enqueue(client: TestClient, patient_id: str = "MRN-77") -> None:
     r = client.post(
         "/queue",
-        json={"patient_id": patient_id, "acuity": 2, "dept": "ED"},
+        json={
+            "patient_id": patient_id,
+            "acuity": 2,
+            "dept": "ED",
+            # Required at acuity <= 2.
+            "reason": "Chest pain with abnormal observations",
+        },
         headers=_headers("seed-enqueue-" + patient_id),
     )
     assert r.status_code == 201, r.text
@@ -61,11 +70,11 @@ class TestCompleteIdempotency:
         client, _ = flow
         _enqueue(client)
 
-        first = client.post("/queue/MRN-77/complete", headers=_headers("done-1"))
+        first = client.post("/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers("done-1"))
         assert first.status_code == 200
 
         # The lost-response scenario: identical request, same key.
-        second = client.post("/queue/MRN-77/complete", headers=_headers("done-1"))
+        second = client.post("/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers("done-1"))
         assert second.status_code == 200
         assert second.json() == first.json()
 
@@ -74,21 +83,34 @@ class TestCompleteIdempotency:
         client, _ = flow
         _enqueue(client)
 
-        assert client.post("/queue/MRN-77/complete", headers=_headers()).status_code == 200
-        assert client.post("/queue/MRN-77/complete", headers=_headers()).status_code == 404
+        assert (
+            client.post(
+                "/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers()
+            ).status_code
+            == 200
+        )
+        # 409, not 404: the entry exists and is already closed. Reporting
+        # "not found" sent the clinician looking for a vanished patient.
+        assert (
+            client.post(
+                "/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers()
+            ).status_code
+            == 409
+        )
 
     def test_a_different_key_is_a_new_intent(self, flow):
         client, _ = flow
         _enqueue(client)
 
         assert (
-            client.post("/queue/MRN-77/complete", headers=_headers("done-1")).status_code
+            client.post("/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers("done-1")).status_code
             == 200
         )
-        # Genuinely separate intent: the entry really is gone now.
+        # Genuinely separate intent, so no replay — and the entry is already
+        # closed, which is a conflict rather than a missing patient.
         assert (
-            client.post("/queue/MRN-77/complete", headers=_headers("done-2")).status_code
-            == 404
+            client.post("/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers("done-2")).status_code
+            == 409
         )
 
     def test_keys_do_not_leak_across_patients(self, flow):
@@ -96,14 +118,14 @@ class TestCompleteIdempotency:
         _enqueue(client, "MRN-77")
         _enqueue(client, "MRN-88")
 
-        first = client.post("/queue/MRN-77/complete", headers=_headers("shared"))
+        first = client.post("/queue/MRN-77/complete", json=_DISPOSITION, headers=_headers("shared"))
         assert first.status_code == 200
 
         # Same key, different route: must not replay MRN-77's response.
-        second = client.post("/queue/MRN-88/complete", headers=_headers("shared"))
+        second = client.post("/queue/MRN-88/complete", json=_DISPOSITION, headers=_headers("shared"))
         assert second.status_code == 200
         assert second.json()["item"]["patient_id"] == "MRN-88"
 
     def test_completion_still_requires_authentication(self, flow):
         client, _ = flow
-        assert client.post("/queue/MRN-77/complete").status_code == 401
+        assert client.post("/queue/MRN-77/complete", json=_DISPOSITION).status_code == 401

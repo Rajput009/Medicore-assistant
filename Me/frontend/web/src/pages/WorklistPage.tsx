@@ -7,9 +7,11 @@ import { Link } from 'react-router-dom'
 
 import { api } from '../api/client'
 import { retryWithIdempotency } from '../api/retry'
-import type { Bed, QueueItem } from '../api/types'
+import type { Bed, Disposition, QueueItem } from '../api/types'
+import { DISPOSITION_LABELS } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { useAsyncData } from '../hooks/useAsync'
+import { DispositionDialog } from '../patient/DispositionDialog'
 import { PatientLink } from '../patient/PatientChartDrawer'
 import { loadRecentPatients, type RecentPatient } from '../patient/recentPatients'
 import { acuityTone } from './PatientFlowPage'
@@ -58,6 +60,8 @@ export const WorklistPage: React.FC = () => {
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionOk, setActionOk] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // Which patient's disposition prompt is open, if any.
+  const [completing, setCompleting] = useState<string | null>(null)
   const [retryNotice, setRetryNotice] = useState<string | null>(null)
   const [recent, setRecent] = useState<RecentPatient[]>(() => loadRecentPatients())
 
@@ -126,21 +130,28 @@ export const WorklistPage: React.FC = () => {
     }
   }
 
-  const onComplete = async (patientId: string) => {
+  const onComplete = async (
+    patientId: string,
+    disposition: Disposition,
+    note: string | null,
+  ) => {
     setActionError(null)
     setActionOk(null)
     setRetryNotice(null)
     setBusy(true)
     try {
       await retryWithIdempotency(
-        (key) => api.completeQueue(patientId, null, undefined, key),
+        (key) => api.completeQueue(patientId, disposition, note, null, undefined, key),
         {
           onRetry: ({ attempt }) =>
             setRetryNotice(`Connection problem — retrying (attempt ${attempt + 1})…`),
         },
       )
       setRetryNotice(null)
-      setActionOk(`Completed ${patientId}.`)
+      setCompleting(null)
+      setActionOk(
+        `Completed ${patientId} — ${DISPOSITION_LABELS[disposition].toLowerCase()}.`,
+      )
       reload()
     } catch (err) {
       setRetryNotice(null)
@@ -244,11 +255,23 @@ export const WorklistPage: React.FC = () => {
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() => void onComplete(q.patient_id)}
+                      onClick={() =>
+                        setCompleting(completing === q.patient_id ? null : q.patient_id)
+                      }
                     >
                       Complete
                     </button>
                   </div>
+                  {completing === q.patient_id && (
+                    <DispositionDialog
+                      patientId={q.patient_id}
+                      busy={busy}
+                      onCancel={() => setCompleting(null)}
+                      onConfirm={(disposition, note) =>
+                        void onComplete(q.patient_id, disposition, note)
+                      }
+                    />
+                  )}
                 </div>
               ))
             )}

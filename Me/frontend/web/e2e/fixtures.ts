@@ -73,8 +73,278 @@ export async function stubBackend(page: Page): Promise<void> {
     json(r, { resourceType: 'Patient', id: 'p1', active: true }),
   )
 
+  // --- Chart context: the drawer fetches these five in parallel ----------
+  // AllergyIntolerance is deliberately populated: "allergy list failed to
+  // load" vs "no allergies" is the distinction the UI must never blur, and a
+  // spec cannot exercise it against an empty stub.
+  await page.route('**/api/fhir/allergyintolerance/**', (r) => {
+    if (unauthorized(r)) return
+    return json(r, {
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'AllergyIntolerance',
+            id: 'a1',
+            code: { text: 'Penicillin' },
+            criticality: 'high',
+            clinicalStatus: { coding: [{ code: 'active' }] },
+            reaction: [{ manifestation: [{ text: 'anaphylaxis' }] }],
+          },
+        },
+      ],
+    })
+  })
+
+  await page.route('**/api/fhir/condition/**', (r) => {
+    if (unauthorized(r)) return
+    return json(r, {
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Condition',
+            id: 'c1',
+            code: { text: 'Type 2 diabetes' },
+            clinicalStatus: { coding: [{ code: 'active' }] },
+          },
+        },
+      ],
+    })
+  })
+
+  await page.route('**/api/fhir/medicationrequest/**', (r) => {
+    if (unauthorized(r)) return
+    return json(r, {
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'MedicationRequest',
+            id: 'm1',
+            status: 'active',
+            medicationCodeableConcept: { text: 'Metformin 500mg' },
+          },
+        },
+      ],
+    })
+  })
+
+  await page.route('**/api/fhir/encounter/**', (r) => {
+    if (unauthorized(r)) return
+    return json(r, {
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Encounter',
+            id: 'enc-1',
+            status: 'in-progress',
+            class: { code: 'EMER' },
+          },
+        },
+      ],
+    })
+  })
+
+  await page.route(/\/api\/fhir\/observation(\/search)?(\?.*)?$/, (r) => {
+    if (unauthorized(r)) return
+    if (r.request().method() === 'POST') {
+      return json(r, { ok: true, created: [{ id: 'obs-new', code: 'pulse' }], count: 1 }, 201)
+    }
+    return json(r, {
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Observation',
+            id: 'o1',
+            code: { text: 'Potassium' },
+            valueQuantity: { value: 5.4, unit: 'mmol/L' },
+            effectiveDateTime: '2026-07-20T08:00:00Z',
+          },
+        },
+      ],
+    })
+  })
+
+  // --- Handoff notes (append-only server-side) ---------------------------
+  await page.route(/\/flow\/handoff\/[^/]+\/history/, (r) => {
+    if (unauthorized(r)) return
+    return json(r, { patient_id: 'p1', versions: [], count: 0 })
+  })
+
+  await page.route(/\/flow\/handoff\/[^/?]+$/, async (route) => {
+    if (unauthorized(route)) return
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as { text?: string }
+      return json(
+        route,
+        {
+          ok: true,
+          note: {
+            patient_id: 'p1',
+            text: body?.text ?? '',
+            // Author comes from the session server-side, never the body.
+            author: 'e2e.user',
+            encounter_id: null,
+            created_at: new Date().toISOString(),
+          },
+        },
+        201,
+      )
+    }
+    return json(route, {
+      patient_id: 'p1',
+      note: {
+        patient_id: 'p1',
+        text: 'S - Situation: stored handoff from the previous shift',
+        author: 'dr.night',
+        encounter_id: null,
+        created_at: new Date(Date.now() - 3600_000).toISOString(),
+      },
+    })
+  })
+
+  // --- Chart assistant (Tier 4) ------------------------------------------
+  // Mirrors the gateway's three response shapes: a cited answer, an advice
+  // refusal, and a retrieval failure reported as a failure.
+  await page.route('**/api/assist/ask', async (route) => {
+    if (unauthorized(route)) return
+    const body = route.request().postDataJSON() as { question?: string }
+    const question = (body?.question ?? '').toLowerCase()
+    const disclaimer =
+      'Assembled from this patient\u2019s recorded data. It is not a diagnosis.'
+
+    if (/should i|can i|recommend|is it safe/.test(question)) {
+      return json(route, {
+        patient_id: 'p1',
+        intents: [],
+        findings: [],
+        caveats: [
+          'This assistant reports recorded data; it does not give clinical advice or recommend treatment.',
+        ],
+        answered: false,
+        disclaimer,
+        retrieved: {},
+      })
+    }
+
+    if (question.includes('wifi')) {
+      return json(route, {
+        patient_id: 'p1',
+        intents: [],
+        findings: [],
+        caveats: ['This question was not understood, so nothing was looked up.'],
+        answered: false,
+        disclaimer,
+        retrieved: {},
+      })
+    }
+
+    return json(route, {
+      patient_id: 'p1',
+      intents: ['allergies'],
+      findings: [
+        {
+          text: 'Allergy: Penicillin (high criticality) [active] \u2014 reaction: anaphylaxis',
+          critical: true,
+          citations: [
+            {
+              resource_type: 'AllergyIntolerance',
+              resource_id: 'a1',
+              label: 'Penicillin',
+              recorded: '2026-07-01T09:00:00Z',
+            },
+          ],
+        },
+      ],
+      caveats: [],
+      answered: true,
+      disclaimer,
+      retrieved: { allergies: 1, failed: [] },
+    })
+  })
+
+  await page.route('**/api/assist/capabilities', (r) => {
+    if (unauthorized(r)) return
+    return json(r, {
+      topics: ['allergies', 'medications'],
+      writes: false,
+      gives_advice: false,
+      model_backed: false,
+      disclaimer: 'Not a diagnosis.',
+    })
+  })
+
   await page.route('**/api/cache/**', (r) =>
     json(r, { status: 'ok', resource: 'Patient', patient: null, deleted: 3 }),
+  )
+
+  // Audit index. Mirrors the gateway: the response carries only the hashed
+  // reference, never the raw identifier the caller searched for.
+  await page.route(/\/api\/audit\/search/, (r) => {
+    const now = new Date().toISOString()
+    return json(r, {
+      items: [
+        {
+          ts: now,
+          request_id: 'e2e-1',
+          service: 'gateway',
+          actor_sub: 'dr.smith',
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 200,
+          outcome: 'success',
+          resource_type: 'patient',
+          resource_ref: 'sha256:0123456789abcdef',
+          client_ip: '203.0.113.7',
+        },
+        {
+          ts: now,
+          request_id: 'e2e-2',
+          service: 'gateway',
+          actor_sub: 'dr.snoop',
+          method: 'GET',
+          path: '/fhir/patient/{id}',
+          status: 403,
+          outcome: 'denied',
+          resource_type: 'patient',
+          resource_ref: 'sha256:0123456789abcdef',
+          client_ip: '198.51.100.4',
+        },
+      ],
+      count: 2,
+      total: 2,
+      limit: 25,
+      offset: 0,
+      since: new Date(Date.now() - 30 * 86400_000).toISOString(),
+      until: now,
+      subject_ref: 'sha256:0123456789abcdef',
+    })
+  })
+
+  await page.route(/\/api\/audit\/patient\/[^/]+\/accessors/, (r) =>
+    json(r, {
+      patient_ref: 'sha256:0123456789abcdef',
+      accessors: [
+        {
+          actor_sub: 'dr.smith',
+          accesses: 4,
+          denied: 0,
+          first_access: new Date(Date.now() - 3 * 86400_000).toISOString(),
+          last_access: new Date().toISOString(),
+        },
+        {
+          actor_sub: 'dr.snoop',
+          accesses: 1,
+          denied: 1,
+          first_access: new Date(Date.now() - 86400_000).toISOString(),
+          last_access: new Date(Date.now() - 86400_000).toISOString(),
+        },
+      ],
+      count: 2,
+    }),
   )
 
   await page.route('**/flow/beds', (r) => {

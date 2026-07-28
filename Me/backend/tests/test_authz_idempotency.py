@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from backend.common.deps import Principal, normalise_roles
+from backend.common.deps import Principal
 from backend.common.errors import public_detail
 from backend.common.idempotency import reset_idempotency_store
 from backend.common.security import create_access_token
@@ -46,8 +46,6 @@ class TestPrincipalScope:
         assert p.can_access_patient("P9", assigned=None) is True
 
     def test_wards_parsed_from_token_claims(self):
-        from backend.common.deps import get_principal
-        from starlette.requests import Request
 
         token = create_access_token("u", roles=["clinician"])
         # Rebuild token with wards claim.
@@ -72,11 +70,13 @@ class TestPrincipalScope:
             settings.jwt_secret,
             algorithm="HS256",
         )
-        scope = {"type": "http", "asgi": {"version": "3.0"}, "headers": [], "query_string": b""}
-        # Use TestClient path instead.
-        from backend.common import deps
-        from fastapi import FastAPI
+        # Driven through a real request rather than a hand-built ASGI scope:
+        # get_principal reads the Authorization header and writes to
+        # request.state, so the dependency-injection path is the thing worth
+        # exercising.
         from fastapi import Depends
+
+        from backend.common import deps
 
         app = FastAPI()
 
@@ -141,7 +141,7 @@ class TestIdempotencyFlow:
         }
         r1 = client.post(
             "/queue",
-            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED"},
+            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers,
         )
         assert r1.status_code == 201
@@ -149,7 +149,7 @@ class TestIdempotencyFlow:
 
         r2 = client.post(
             "/queue",
-            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED"},
+            json={"patient_id": "MRN-1", "acuity": 2, "dept": "ED", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers,
         )
         assert r2.status_code == 201
@@ -189,7 +189,7 @@ class TestIdempotencyFlow:
         }
         r = client.post(
             "/queue",
-            json={"patient_id": "MRN-2", "acuity": 1, "dept": "OR"},
+            json={"patient_id": "MRN-2", "acuity": 1, "dept": "OR", "reason": "Deteriorating observations requiring urgent review"},
             headers=headers,
         )
         assert r.status_code == 403

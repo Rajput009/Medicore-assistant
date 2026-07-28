@@ -156,6 +156,15 @@ identifiers are pseudonymised with a salted HMAC: stable enough to correlate
 accesses, but the log stream carries no raw PHI. Denied attempts are recorded
 with `outcome: denied`.
 
+**Audit search.** Records are additionally indexed in Postgres so that
+question can actually be *asked*, not just answered in principle by grepping a
+log archive. Admins get `GET /audit/search` and
+`GET /audit/patient/{id}/accessors`. Indexing is deliberately best-effort: a
+bounded queue drained by a background batch writer, because a clinical request
+must never wait on — or fail because of — an audit write. Records lost to a
+full queue or a database outage are counted and surfaced on `/audit/stats`
+rather than silently discarded.
+
 **Edge hardening.** Security headers on every response (including
 `Cache-Control: no-store`, so PHI is never written to a shared cache),
 per-caller rate limiting, and a request body cap. These duplicate what a
@@ -315,6 +324,169 @@ Example:
 ```bash
 curl -X DELETE -H "Authorization: Bearer <admin_token>" "http://localhost:8080/cache/Observation?patient=123"
 ```
+
+## Audit Search (Admin-only)
+
+Answers "who viewed MRN-X?" from the queryable audit index. Pass the raw
+identifier — the gateway hashes it with the deployment's audit salt before
+matching, so you never need to know the pseudonymisation scheme and no raw id
+is written as a result of searching.
+
+- `GET /audit/patient/{id}/accessors` → one row per clinician: access count,
+  denied count, first/last access. Where an investigation starts.
+- `GET /audit/search` → the individual events. Filters: `patient`, `actor`,
+  `outcome` (`success|failure|denied|error`), `resource_type`, `service`,
+  `since`, `until`, `limit`, `offset`. Defaults to the last 30 days; the
+  window is capped at 366 days.
+- `GET /audit/stats` → index health. **Alert on `dropped` and `failed`**: they
+  are non-zero only when audit records did not reach the index, meaning the
+  searchable trail is incomplete (the log stream still has them).
+
+```bash
+# Who opened this chart?
+curl -H "Authorization: Bearer <admin_token>" \
+  "http://localhost:8080/audit/patient/MRN-000123/accessors"
+
+# Every refused attempt against that chart in the last week
+curl -H "Authorization: Bearer <admin_token>" \
+  "http://localhost:8080/audit/search?patient=MRN-000123&outcome=denied&since=2026-07-20T00:00:00Z"
+```
+
+Both are also available in the console under **Administration**.
+
+## Break-glass (emergency access)
+
+A clinician scoped to ward A who finds a ward-B patient arresting needs the
+chart *now*. Send a reason and the scope check is overridden:
+
+```bash
+curl -X PATCH -H "Authorization: Bearer <clinician_token>" \
+  -H "X-Break-Glass-Reason: Cardiac arrest in ICU bay 4, covering clinician unavailable" \
+  -H "Content-Type: application/json" \
+  -d '{"occupied": true, "patient_id": "MRN-123"}' \
+  "http://localhost:8082/beds/ICU-001"
+```
+
+It widens **scope, never role** — a `viewer` stays a viewer, and nobody
+becomes `admin`. The reason is mandatory and must be substantive; a trivial
+one is rejected (400) rather than accepted and logged. List endpoints refuse
+it, so an override cannot become cross-ward browsing.
+
+Every use is logged at WARNING and flagged in the audit index. Review with
+`GET /audit/search?break_glass=true` or the **Emergency overrides only**
+filter in the console; the per-patient accessor summary counts overrides per
+clinician. See SECURITY.md for the full rationale.
+
+## Handoff notes (SBAR)
+
+Shift-handoff notes are persisted server-side by patient-flow:
+
+- `GET /handoff/{patient_id}` — the current note (or `null`)
+- `GET /handoff/{patient_id}/history` — every version, newest first
+- `POST /handoff/{patient_id}` — append a new version
+
+**Append-only.** A note is a contemporaneous clinical communication, so "what
+was I told at 07:00?" must stay answerable after someone edits it at 09:00.
+Saving supersedes; it never overwrites.
+
+**Not the record of truth.** These are working notes that survive the shift —
+the hospital EHR remains authoritative. That is why they live in MediCore's own
+storage rather than being written to a FHIR `Communication`: unverified free
+text should not land in the legal record, and the gateway's only FHIR write is
+deliberately narrow (coded Observations) so what was written is always
+auditable. Promoting a note into the EHR is a separate, explicit action.
+
+The author is taken from the verified session, never from the request body.
+Reads and writes are audited against the patient like any other PHI access,
+and the note text itself is never logged.
+
+## Verifying a change
+
+```bash
+cd Me && make verify     # all eight gates: lint, both audits, tests, typecheck, build
+```
+
+**CI is not currently enforced.** `.github/ci.yml.example` has never been
+installed as `.github/workflows/ci.yml`, so `gh pr checks` reports "no checks
+reported" and nothing runs automatically on push. Enabling it is one commit
+from an account with the `workflows` token scope — see the header of that
+file. Until then `make verify` is the only reproducible check, and "the tests
+pass" means someone ran it, not that the branch is green.
+
+Browser end-to-end tests are **not** part of `make verify`: they need
+`npx playwright install chromium`, which some sandboxes cannot reach. Run
+`make test-e2e` where a browser is available. Because those specs cannot run
+everywhere, `src/e2eSelectors.test.tsx` asserts the same accessible names in
+jsdom on every push — so a renamed label breaks a test that actually runs,
+rather than rotting silently in a spec nobody executes.
+
+## Triage: escalation evidence and outcomes
+
+The queue records *why* a patient was escalated and *what happened to them* —
+not just that something was done.
+
+```bash
+# Escalate with the evidence behind the decision
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"patient_id":"MRN-123","acuity":1,"dept":"ED",
+       "reason":"Rising NEWS2 with new confusion",
+       "news2_score":9,"news2_band":"high","red_flag":true}' \
+  http://localhost:8082/queue
+
+# Close it with what actually happened
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"disposition":"admitted"}' \
+  http://localhost:8082/queue/MRN-123/complete
+
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:8082/queue/stats?dept=ED&since_hours=24"
+```
+
+`disposition` is one of `admitted`, `discharged`, `transferred`,
+`left_without_being_seen`, `deceased`, `other`. The last two require a note.
+A **reason is mandatory at acuity ≤ 2** — requiring one everywhere would just
+train people to type "." to get past the field.
+
+`GET /queue/stats` returns counts by disposition, the LWBS rate and
+median/p90 time to completion, so the ward gets something back for the extra
+keystrokes. Empty windows report `null` percentiles rather than `0`: "nothing
+completed" and "everything completed instantly" are different facts.
+
+Completion is **one-way** — re-completing returns 409 and leaves the original
+disposition and clinician intact. Correcting one is a separate, deliberate
+action. See `docs/design/closing-the-clinical-loop.md` for the full rationale.
+
+## Chart assistant (grounded Q&A)
+
+`POST /assist/ask` answers questions about one patient's chart with citations:
+
+```bash
+curl -X POST -H "Authorization: Bearer <clinician_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"patient_id": "MRN-123", "question": "what allergies are recorded?"}' \
+  "http://localhost:8080/assist/ask"
+```
+
+Every finding names the resources it came from, and an uncited claim is
+rejected server-side rather than displayed. `GET /assist/capabilities`
+publishes what it can and cannot do.
+
+**It calls no model, deliberately.** No LLM is configured and egress is
+default-deny; routing PHI to a third-party model needs a BAA and an egress
+change. The default answerer copies values out of retrieved FHIR resources, so
+it cannot invent a result. `AnswerComposer` is the seam where a model-backed
+implementation drops in — and `validate_answer` holds it to the same
+citation requirement.
+
+Three refusals are worth knowing about:
+
+- **Advice** — "should I give penicillin?" is refused *before* retrieval, so
+  an out-of-scope question never becomes a disclosure.
+- **Unrecognised questions** — refused with the list of answerable topics,
+  rather than guessed at and answered wrongly.
+- **Failed lookups** — reported as failures. "Allergy list could not be
+  retrieved" is never rendered as "no allergies", which is the single most
+  dangerous thing this feature could say.
 
 ## Clinical workflow notes
 

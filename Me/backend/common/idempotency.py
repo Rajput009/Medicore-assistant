@@ -99,6 +99,12 @@ def store(principal: str, route: str, key: str, status_code: int, body: Any) -> 
     # "2026-07-27 20:11:10+00:00" while FastAPI emits ISO-8601 with a "T" —
     # a retry would then hand the caller a different timestamp format than
     # the original, which any client parsing dates would choke on.
+    # Encode the way the route itself does. These handlers return plain dicts
+    # (no response_model), so FastAPI serialises them with jsonable_encoder;
+    # matching it here keeps a replay byte-identical to the response the
+    # client missed. A route that later adopts a response_model would be
+    # serialised by pydantic instead ("...Z" rather than "...+00:00"), so
+    # that change must come with a matching change here.
     ck_body = jsonable_encoder(body)
     payload = json.dumps({"status": status_code, "body": ck_body}, default=str)
     client = get_redis()

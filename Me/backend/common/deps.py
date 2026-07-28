@@ -157,7 +157,7 @@ def get_principal(
     if not sub:
         raise _unauthorized("Invalid token")
 
-    return Principal(
+    principal = Principal(
         sub=str(sub),
         roles=normalise_roles(claims.get("roles")),
         claims=claims,
@@ -167,21 +167,90 @@ def get_principal(
         ),
     )
 
+    # Publish the caller for the audit middleware. Services without the
+    # gateway's JWT middleware (patient-flow, cds) authenticate purely through
+    # this dependency, so without this their audit records carry no actor —
+    # "who claimed this patient?" would be unanswerable for every route they
+    # own. The middleware reads request.state after the handler returns.
+    try:
+        request.state.principal = principal
+    except Exception:  # pragma: no cover - state is always assignable
+        pass
 
-def require_ward_access(ward: str | None, principal: Principal) -> None:
-    if not principal.can_access_ward(ward):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorised for this ward",
-        )
+    return principal
 
 
-def require_department_access(dept: str | None, principal: Principal) -> None:
-    if not principal.can_access_department(dept):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorised for this department",
-        )
+def _break_glass_or_deny(
+    request: Request | None,
+    principal: Principal,
+    *,
+    scope_type: str,
+    scope_value: str | None,
+    detail: str,
+) -> None:
+    """Allow an out-of-scope access only under a valid break-glass declaration.
+
+    Break-glass widens *scope*, never role: the role check has already run and
+    is not revisited here. See backend/common/breakglass.py.
+    """
+    from .breakglass import BreakGlassError, parse_declaration, record_override
+    from .config import settings
+
+    if request is not None:
+        try:
+            declaration = parse_declaration(
+                request, enabled=settings.break_glass_enabled
+            )
+        except BreakGlassError as exc:
+            # The caller tried to declare an emergency and got it wrong. Tell
+            # them, rather than returning a 403 they cannot account for.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
+        if declaration is not None:
+            record_override(
+                request,
+                declaration,
+                subject=principal.sub,
+                scope_type=scope_type,
+                scope_value=scope_value,
+            )
+            return
+
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+def require_ward_access(
+    ward: str | None, principal: Principal, request: Request | None = None
+) -> None:
+    """Enforce ward scope.
+
+    Pass ``request`` to allow an emergency override; without it the check is
+    strict, so a caller cannot gain break-glass by accident.
+    """
+    if principal.can_access_ward(ward):
+        return
+    _break_glass_or_deny(
+        request,
+        principal,
+        scope_type="ward",
+        scope_value=ward,
+        detail="Not authorised for this ward",
+    )
+
+
+def require_department_access(
+    dept: str | None, principal: Principal, request: Request | None = None
+) -> None:
+    if principal.can_access_department(dept):
+        return
+    _break_glass_or_deny(
+        request,
+        principal,
+        scope_type="department",
+        scope_value=dept,
+        detail="Not authorised for this department",
+    )
 
 
 def requires_roles(*required: str):
